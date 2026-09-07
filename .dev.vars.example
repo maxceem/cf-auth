@@ -1,0 +1,21 @@
+# Copy to `.dev.vars` in your Worker (never commit the real file).
+# In production set these with `wrangler secret put <NAME>`.
+
+# Required. Signs better-auth sessions and the current-organization cookie.
+# Generate with: openssl rand -base64 32
+AUTH_SECRET=""
+
+# Optional. Signs only the current-organization cookie; falls back to AUTH_SECRET.
+# AUTH_COOKIE_SECRET=""
+
+# Public origin of your app. Required in production for OAuth redirects and
+# cookie/CSRF checks. Locally this is usually your dev server origin.
+APP_URL="http://localhost:8787"
+
+# Optional. Comma-separated extra origins allowed to call the auth endpoints
+# (e.g. a separate Vite dev server).
+# AUTH_TRUSTED_ORIGINS="http://localhost:5173"
+
+# Optional. Omit both to disable the Google social provider.
+# GOOGLE_CLIENT_ID=""
+# GOOGLE_CLIENT_SECRET=""

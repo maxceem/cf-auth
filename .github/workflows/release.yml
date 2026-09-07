@@ -1,0 +1,47 @@
+# Publishes the packed tarball as a GitHub Release asset, so consumers can
+# depend on a prebuilt artifact without a registry and without running this
+# package's build during their own install.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # A tag that disagrees with the manifest would publish an asset whose
+      # filename promises a version the package does not claim.
+      - name: Check the tag matches package.json
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          declared="$(node -p 'require("./package.json").version')"
+          if [ "$tagged" != "$declared" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $declared" >&2
+            exit 1
+          fi
+
+      # typecheck, test, and build dist/ — the tarball ships the build output,
+      # so a release that cannot build must not produce an asset.
+      - run: pnpm check
+
+      # npm does not create the destination directory itself.
+      - run: mkdir -p packed && npm pack --pack-destination packed
+
+      - name: Upload the tarball to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" packed/*.tgz --generate-notes

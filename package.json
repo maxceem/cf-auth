@@ -1,0 +1,81 @@
+{
+  "name": "@maxceem/cf-auth",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Authentication, organization tenancy, and API keys for Cloudflare Workers using Better Auth, Hono, D1, and Drizzle ORM.",
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "author": "Maksym Mykhailenko",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maxceem/cf-auth.git"
+  },
+  "homepage": "https://github.com/maxceem/cf-auth#readme",
+  "bugs": {
+    "url": "https://github.com/maxceem/cf-auth/issues"
+  },
+  "keywords": [
+    "authentication",
+    "better-auth",
+    "cloudflare-workers",
+    "d1",
+    "drizzle-orm",
+    "hono",
+    "multi-tenant",
+    "organizations"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "src",
+    "drizzle",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./schema": {
+      "types": "./dist/schema.d.ts",
+      "import": "./dist/schema.js",
+      "default": "./dist/schema.js"
+    },
+    "./drizzle/*": "./drizzle/*",
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "prepare": "pnpm build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:generate": "drizzle-kit generate --config drizzle.config.ts",
+    "check": "pnpm typecheck && pnpm test && pnpm build"
+  },
+  "peerDependencies": {
+    "@better-auth/drizzle-adapter": "^1.6.9",
+    "better-auth": "^1.6.9",
+    "drizzle-orm": "^0.45.2",
+    "hono": "^4.12.8"
+  },
+  "devDependencies": {
+    "@better-auth/drizzle-adapter": "1.6.9",
+    "@cloudflare/workers-types": "4.20260518.1",
+    "@libsql/client": "0.17.4",
+    "@types/node": "^24.10.1",
+    "better-auth": "1.6.9",
+    "drizzle-kit": "0.31.10",
+    "drizzle-orm": "0.45.2",
+    "hono": "4.12.8",
+    "typescript": "5.9.3",
+    "vitest": "4.1.0"
+  },
+  "packageManager": "pnpm@11.24.0"
+}
