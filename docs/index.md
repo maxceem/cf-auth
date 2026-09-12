@@ -421,6 +421,51 @@ If `onEvent` fails it never breaks sign-in. The error goes to `onError`.
 
 ---
 
+## Testing your own app
+
+Signing in costs a password hash. That cost is the point — it is what makes a
+stolen hash expensive to crack — but a test that only needs *an authenticated
+caller* pays it for nothing, and on Workers better-auth falls back to a pure-JS
+scrypt that costs seconds rather than milliseconds. A suite that signs up a
+handful of users spends most of its time there.
+
+`@maxceem/cf-auth/testing` mints the session instead:
+
+```ts
+import { createTestSessions } from "@maxceem/cf-auth/testing";
+
+const sessions = createTestSessions(cfAuth);
+
+// A user, the organization provisioned for them, and a session.
+const { cookie, userId, organizationId } = await sessions.operator();
+
+// Or a session for a user you already have.
+const existing = await sessions.cookieFor(userId);
+
+const response = await app.request("/api/me", { headers: { Cookie: cookie } });
+```
+
+`operator()` creates a distinct user each call, so tests needing separate
+tenants stay independent of one another. The token is random per call and signed
+with the instance's own secret — nothing here is a fixed credential, and nothing
+outlives the test that asked for it.
+
+It takes your `CfAuth` instance rather than configuration of its own, so the
+cookie name and tables come from the same resolved config your app runs on and
+cannot drift from it.
+
+**This is not a way in.** Minting a session needs write access to the auth
+database, which is what the sign-up route already has — a caller able to reach
+these could write the same rows itself. All it skips is the password check. It
+lives behind its own subpath so your application code never imports it and your
+bundler never sees it; if you want that guaranteed, assert that nothing under
+`src/` imports `@maxceem/cf-auth/testing`.
+
+Keep at least one test that signs in for real. These helpers deliberately do not
+exercise the password path, so something still has to.
+
+---
+
 ## Environment
 
 | Variable | Needed | What it is for |

@@ -59,6 +59,19 @@ app.get("/api/things", (c) => {
 You also add the package's tables to your own drizzle schema and migrate them
 with your normal pipeline — the package never runs migrations itself.
 
+## Testing
+
+Tests that just need an authenticated caller should not pay for a password hash.
+`@maxceem/cf-auth/testing` mints a session directly:
+
+```ts
+import { createTestSessions } from "@maxceem/cf-auth/testing";
+
+const { cookie, organizationId } = await createTestSessions(cfAuth).operator();
+```
+
+See [the documentation](./docs/index.md#testing-your-own-app).
+
 ## Documentation
 
 [`docs/index.md`](docs/index.md) covers setup and migrations, the options,
