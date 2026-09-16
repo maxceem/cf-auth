@@ -5,6 +5,21 @@ const toHexByte = (byte: number) => byte.toString(16).padStart(2, "0");
 
 const toHex = (bytes: Uint8Array) => Array.from(bytes, toHexByte).join("");
 
+const base62RejectionThreshold = 256 - (256 % base62Alphabet.length);
+
+const randomBase62 = (length: number) => {
+  let result = "";
+  while (result.length < length) {
+    const bytes = crypto.getRandomValues(new Uint8Array(length - result.length + 8));
+    for (const byte of bytes) {
+      if (byte >= base62RejectionThreshold) continue;
+      result += base62Alphabet[byte % base62Alphabet.length];
+      if (result.length === length) break;
+    }
+  }
+  return result;
+};
+
 /**
  * A stable UUIDv5-shaped identifier derived from `value`.
  *
@@ -25,34 +40,6 @@ export const deterministicUuid = async (value: string): Promise<string> => {
     toHex(bytes.slice(8, 10)),
     toHex(bytes.slice(10, 16)),
   ].join("-");
-};
-
-// 256 is not a multiple of 62, so a plain `byte % 62` would over-represent the
-// first 256 % 62 = 8 characters. Reject bytes at or above the largest multiple
-// of 62 instead, giving a uniform distribution.
-const base62RejectionThreshold = 256 - (256 % base62Alphabet.length);
-
-const randomBase62 = (length: number) => {
-  let result = "";
-
-  while (result.length < length) {
-    // Over-draw slightly so the common case needs a single getRandomValues call.
-    const bytes = crypto.getRandomValues(new Uint8Array(length - result.length + 8));
-
-    for (const byte of bytes) {
-      if (byte >= base62RejectionThreshold) {
-        continue;
-      }
-
-      result += base62Alphabet[byte % base62Alphabet.length];
-
-      if (result.length === length) {
-        break;
-      }
-    }
-  }
-
-  return result;
 };
 
 /**
@@ -91,7 +78,7 @@ export interface GeneratedApiKeyToken {
   tokenHint: string;
 }
 
-/** Generates `<prefix>_<48 random base62 chars>` plus its storage hash. */
+/** Generates a prefixed token with 48 uniformly distributed base62 characters. */
 export const generateApiKeyToken = async (
   tokenPrefix: string,
   entropyLength = 48,

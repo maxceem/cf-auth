@@ -59,9 +59,7 @@ export const createAuthMiddleware = (
 ) => {
   const { auth, service, currentOrganizationCookie } = deps;
 
-  return <E extends Env = CfAuthEnv>(
-    options: AuthMiddlewareOptions = {},
-  ): MiddlewareHandler<E> => {
+  return <E extends Env = CfAuthEnv>(options: AuthMiddlewareOptions = {}): MiddlewareHandler<E> => {
     const apiKeysEnabled = options.apiKeys ?? config.apiKeys.enabled;
     const syncCookie = options.syncCurrentOrganizationCookie ?? true;
 
@@ -98,7 +96,7 @@ export const createAuthMiddleware = (
 
       const honoContext = c as unknown as Context<CfAuthEnv>;
       const currentOrganizationId = await currentOrganizationCookie.read(honoContext);
-      const resolved = await service.getAuthState(session.user.id, currentOrganizationId);
+      const resolved = await service.getAuthState(session.session.id, currentOrganizationId);
       const state = resolved
         ? await service.ensureDefaultOrganization(resolved)
         : createEmptyAuthState();
@@ -133,7 +131,12 @@ export const requireUser = (state: AuthState): AuthUser => {
     throw unauthorized();
   }
 
-  if (!state.user) {
+  if (
+    !state.user ||
+    state.user.kind !== "human" ||
+    state.assurance !== "interactive" ||
+    state.credentialType !== "session"
+  ) {
     throw sessionRequired();
   }
 
@@ -149,7 +152,7 @@ export interface RequireOrganizationResult {
 
 /**
  * Throws 401 when unauthenticated and 403 when no organization is selected.
- * Accepts both session and API-key callers; `user` is `null` for API keys.
+ * Accepts session and API-key callers; both resolve the owning user identity.
  */
 export const requireOrganization = (
   state: AuthState,

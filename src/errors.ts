@@ -37,6 +37,15 @@ export const sessionRequired = (
   message = "This endpoint requires a user session; API key credentials are not accepted",
 ) => new CfAuthError("session_required", message, 403);
 
+/**
+ * The organization exists, but its provisional deadline has passed, so nothing
+ * may act inside it. Distinct from {@link forbidden}: no role or credential
+ * change would help.
+ */
+export const organizationExpired = (
+  message = "This organization's deadline has passed",
+) => new CfAuthError("organization_expired", message, 403);
+
 export const validationError = (message: string) =>
   new CfAuthError("validation_error", message, 422);
 

@@ -9,6 +9,7 @@ describe("session resolution", () => {
 
     expect(state).toEqual({
       authenticated: false,
+      assurance: null,
       credentialType: null,
       source: null,
       actor: null,
@@ -21,7 +22,10 @@ describe("session resolution", () => {
 
   it("resolves user, organization, role and source from the session cookie", async () => {
     const harness = await createTestAuth();
-    await harness.signUp({ email: "session@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "session@example.com",
+      password: "correct-horse-battery",
+    });
 
     const state = await harness.me();
 
@@ -30,6 +34,8 @@ describe("session resolution", () => {
     expect(state.source).toBe("web");
     expect(state.actor).toEqual({
       type: "user",
+      kind: "human",
+      credentialId: expect.any(String),
       id: state.user!.id,
       actionSource: "web",
     });
@@ -41,12 +47,18 @@ describe("session resolution", () => {
 
   it("authenticates a fresh sign-in with email and password", async () => {
     const harness = await createTestAuth();
-    await harness.signUp({ email: "login@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "login@example.com",
+      password: "correct-horse-battery",
+    });
 
     harness.jar.clear();
     expect((await harness.me()).authenticated).toBe(false);
 
-    await harness.signIn({ email: "login@example.com", password: "correct-horse-battery" });
+    await harness.signIn({
+      email: "login@example.com",
+      password: "correct-horse-battery",
+    });
     const state = await harness.me();
 
     expect(state.authenticated).toBe(true);
@@ -56,7 +68,10 @@ describe("session resolution", () => {
 
   it("rejects a wrong password", async () => {
     const harness = await createTestAuth();
-    await harness.signUp({ email: "wrong@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "wrong@example.com",
+      password: "correct-horse-battery",
+    });
     harness.jar.clear();
 
     const response = await harness.request(`${harness.cfAuth.basePath}/sign-in/email`, {
@@ -69,7 +84,10 @@ describe("session resolution", () => {
 
   it("clears the session on sign-out", async () => {
     const harness = await createTestAuth();
-    await harness.signUp({ email: "bye@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "bye@example.com",
+      password: "correct-horse-battery",
+    });
     expect((await harness.me()).authenticated).toBe(true);
 
     await harness.request(`${harness.cfAuth.basePath}/sign-out`, { json: {} });
@@ -79,7 +97,10 @@ describe("session resolution", () => {
 
   it("derives cookie names from the configured prefix, not a hard-coded app name", async () => {
     const harness = await createTestAuth({ appName: "Acme App" });
-    await harness.signUp({ email: "prefix@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "prefix@example.com",
+      password: "correct-horse-battery",
+    });
     await harness.me();
 
     expect(harness.cfAuth.config.cookies.prefix).toBe("acme_app");
@@ -118,7 +139,10 @@ describe("session resolution", () => {
 
   it("exposes the raw better-auth fetch handler", async () => {
     const harness = await createTestAuth();
-    await harness.signUp({ email: "raw@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "raw@example.com",
+      password: "correct-horse-battery",
+    });
 
     const response = await harness.cfAuth.handler(
       new Request(`${testBaseUrl}${harness.cfAuth.basePath}/get-session`, {
@@ -127,7 +151,9 @@ describe("session resolution", () => {
     );
 
     expect(response.ok).toBe(true);
-    const body = (await response.json()) as { user?: { email?: string } } | null;
+    const body = (await response.json()) as {
+      user?: { email?: string };
+    } | null;
     expect(body?.user?.email).toBe("raw@example.com");
   });
 });

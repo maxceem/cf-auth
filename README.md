@@ -6,7 +6,7 @@ multi-tenant part that every one of these apps ends up writing again:
 
 - Email and password sign-in, plus Google if you want it.
 - **Organizations** with `owner`, `admin` and `member` roles, and a default one
-  made for every new user.
+  made for each human signup; email-less service identities share memberships.
 - Hono middleware that works out who is calling, from a session cookie **or** an
   API key.
 - A signed cookie that remembers which organization the user picked.
@@ -35,12 +35,15 @@ const app = new Hono<AppEnv>();
 
 app.use("*", async (c, next) => {
   // Workers give you a fresh `env` per request, so build auth per request.
-  c.set("cfAuth", createCfAuth({
-    appName: "Acme App",
-    d1: c.env.DB,
-    secret: c.env.AUTH_SECRET,
-    baseUrl: c.env.APP_URL,
-  }));
+  c.set(
+    "cfAuth",
+    createCfAuth({
+      appName: "Acme App",
+      d1: c.env.DB,
+      secret: c.env.AUTH_SECRET,
+      baseUrl: c.env.APP_URL,
+    }),
+  );
   await next();
 });
 
@@ -67,7 +70,7 @@ Tests that just need an authenticated caller should not pay for a password hash.
 ```ts
 import { createTestSessions } from "@maxceem/cf-auth/testing";
 
-const { cookie, organizationId } = await createTestSessions(cfAuth).operator();
+const { cookie, organizationId } = await createTestSessions(cfAuth).human();
 ```
 
 See [the documentation](./docs/index.md#testing-your-own-app).

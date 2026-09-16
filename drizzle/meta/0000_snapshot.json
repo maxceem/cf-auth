@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "8f8b9701-a5ce-4d54-84f8-9a6d881a1b56",
+  "id": "0587b3ed-37e4-4a87-84dd-735b3febf7ec",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "user_account": {
@@ -145,6 +145,13 @@
           "notNull": true,
           "autoincrement": false
         },
+        "user_id": {
+          "name": "user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
         "organization_id": {
           "name": "organization_id",
           "type": "text",
@@ -170,19 +177,34 @@
           "name": "token_hint",
           "type": "text",
           "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "enabled": {
+          "name": "enabled",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": true
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "integer",
+          "primaryKey": false,
           "notNull": false,
           "autoincrement": false
         },
         "created_at": {
           "name": "created_at",
-          "type": "text",
+          "type": "integer",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
         },
         "revoked_at": {
           "name": "revoked_at",
-          "type": "text",
+          "type": "integer",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
@@ -196,6 +218,13 @@
           ],
           "isUnique": true
         },
+        "idx_api_key_user_id": {
+          "name": "idx_api_key_user_id",
+          "columns": [
+            "user_id"
+          ],
+          "isUnique": false
+        },
         "idx_api_key_organization_id": {
           "name": "idx_api_key_organization_id",
           "columns": [
@@ -205,6 +234,19 @@
         }
       },
       "foreignKeys": {
+        "api_key_user_id_user_id_fk": {
+          "name": "api_key_user_id_user_id_fk",
+          "tableFrom": "api_key",
+          "tableTo": "user",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
         "api_key_organization_id_organization_id_fk": {
           "name": "api_key_organization_id_organization_id_fk",
           "tableFrom": "api_key",
@@ -238,6 +280,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true,
+          "autoincrement": false
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
           "autoincrement": false
         },
         "created_by_user_id": {
@@ -509,8 +558,16 @@
           "name": "email",
           "type": "text",
           "primaryKey": false,
-          "notNull": true,
+          "notNull": false,
           "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'human'"
         },
         "email_verified": {
           "name": "email_verified",
@@ -554,7 +611,12 @@
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
-      "checkConstraints": {}
+      "checkConstraints": {
+        "user_kind_email_check": {
+          "name": "user_kind_email_check",
+          "value": "(\"user\".\"kind\" = 'human' and \"user\".\"email\" is not null) or (\"user\".\"kind\" = 'service' and \"user\".\"email\" is null)"
+        }
+      }
     },
     "verification": {
       "name": "verification",

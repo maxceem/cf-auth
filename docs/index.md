@@ -40,7 +40,10 @@ type Bindings = {
   GOOGLE_CLIENT_SECRET?: string;
 };
 
-type AppEnv = { Bindings: Bindings; Variables: CfAuthVariables & { cfAuth: CfAuth } };
+type AppEnv = {
+  Bindings: Bindings;
+  Variables: CfAuthVariables & { cfAuth: CfAuth };
+};
 
 const app = new Hono<AppEnv>();
 
@@ -52,7 +55,12 @@ app.use("*", async (c, next) => {
     baseUrl: c.env.APP_URL,
     apiKeys: { enabled: true, tokenPrefix: "sk_live_" },
     ...(c.env.GOOGLE_CLIENT_ID && c.env.GOOGLE_CLIENT_SECRET
-      ? { google: { clientId: c.env.GOOGLE_CLIENT_ID, clientSecret: c.env.GOOGLE_CLIENT_SECRET } }
+      ? {
+          google: {
+            clientId: c.env.GOOGLE_CLIENT_ID,
+            clientSecret: c.env.GOOGLE_CLIENT_SECRET,
+          },
+        }
       : {}),
   });
 
@@ -83,13 +91,13 @@ export default app;
 
 Under `basePath`, which is `/api/auth` unless you change it:
 
-| Method | Path | Body / purpose |
-| --- | --- | --- |
-| `POST` | `/api/auth/sign-up/email` | `{ email, password, name }` |
-| `POST` | `/api/auth/sign-in/email` | `{ email, password }` |
-| `POST` | `/api/auth/sign-out` | clears the session |
-| `GET` | `/api/auth/get-session` | the current session |
-| `GET` | `/api/auth/sign-in/social?provider=google` | starts Google sign-in |
+| Method | Path                                       | Body / purpose              |
+| ------ | ------------------------------------------ | --------------------------- |
+| `POST` | `/api/auth/sign-up/email`                  | `{ email, password, name }` |
+| `POST` | `/api/auth/sign-in/email`                  | `{ email, password }`       |
+| `POST` | `/api/auth/sign-out`                       | clears the session          |
+| `GET`  | `/api/auth/get-session`                    | the current session         |
+| `GET`  | `/api/auth/sign-in/social?provider=google` | starts Google sign-in       |
 
 You can also call these from your own code with `cfAuth.auth.api.*` when you
 want to wrap them in your own routes. Remember to pass better-auth's
@@ -108,8 +116,13 @@ import { cfAuthTables } from "@maxceem/cf-auth/schema";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 export const {
-  user, session, account, verification,
-  organization, organizationUser, apiKey,
+  user,
+  session,
+  account,
+  verification,
+  organization,
+  organizationUser,
+  apiKey,
 } = cfAuthTables;
 
 // Your own tables use `organization.id` as the tenant key.
@@ -160,19 +173,20 @@ createCfAuth({ /* ... */, tables: authTables });
 The full list is typed, so your editor will show you the rest — these are the
 ones worth knowing about.
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `appName` | — | **Required.** Also where the default cookie prefix comes from. |
-| `d1` / `db` | — | **Required.** A D1 binding, or a drizzle instance you built yourself. Pass one, not both. |
-| `secret` | — | **Required.** Signs sessions. |
-| `baseUrl` | — | Your public address. Needed in production for Google sign-in. |
-| `basePath` | `"/api/auth"` | Where the sign-in endpoints live. |
-| `disableSignUp` | `false` | Turns away new users while existing ones can still sign in. |
-| `google` | — | `{ clientId, clientSecret }`. Leave it out to turn Google off. |
-| `apiKeys` | off | `{ enabled: true, tokenPrefix: "sk_live_" }`. |
-| `organizations.defaultOrganizationName` | `"My Organization"` | A string, or a function of the user. |
-| `cookies.prefix` | from `appName` | See below. |
-| `onEvent` | — | Called for sign-ups and key changes. See [Audit events](#audit-events). |
+| Option                                  | Default             | What it does                                                                              |
+| --------------------------------------- | ------------------- | ----------------------------------------------------------------------------------------- |
+| `appName`                               | —                   | **Required.** Also where the default cookie prefix comes from.                            |
+| `d1` / `db`                             | —                   | **Required.** A D1 binding, or a drizzle instance you built yourself. Pass one, not both. |
+| `secret`                                | —                   | **Required.** Signs sessions.                                                             |
+| `baseUrl`                               | —                   | Your public address. Needed in production for Google sign-in.                             |
+| `basePath`                              | `"/api/auth"`       | Where the sign-in endpoints live.                                                         |
+| `disableSignUp`                         | `false`             | Turns away new users while existing ones can still sign in.                               |
+| `userHooks.beforeCreate`                | —                   | Runs an application hook immediately before a new human identity is persisted.            |
+| `google`                                | —                   | `{ clientId, clientSecret }`. Leave it out to turn Google off.                            |
+| `apiKeys`                               | off                 | `{ enabled: true, tokenPrefix: "sk_live_" }`.                                             |
+| `organizations.defaultOrganizationName` | `"My Organization"` | A string, or a function of the user.                                                      |
+| `cookies.prefix`                        | from `appName`      | See below.                                                                                |
+| `onEvent`                               | —                   | Called for sign-ups and key changes. See [Audit events](#audit-events).                   |
 
 ### Cookie names
 
@@ -224,7 +238,7 @@ interface AuthState {
   credentialType: "session" | "apiKey" | null;
   source: "web" | "api" | "cli" | "mcp" | "system" | null;
   actor: AuthActor | null;
-  user: AuthUser | null;          // null when an API key is used
+  user: AuthUser | null; // populated for sessions and keys
   memberships: OrganizationMembership[];
   organization: OrganizationSummary | null;
   role: "owner" | "admin" | "member" | null;
@@ -249,19 +263,19 @@ import {
   isCfAuthError,
 } from "@maxceem/cf-auth";
 
-requireUser(state);                       // a signed-in person only
-requireOrganization(state);               // a person or an API key
-requireOrganization(state, "admin");      // and the role must be admin or above
-requireOrganizationManager(state);        // and they must be owner or admin
+requireUser(state); // a signed-in person only
+requireOrganization(state); // a person or an API key
+requireOrganization(state, "admin"); // and the role must be admin or above
+requireOrganizationManager(state); // and they must be owner or admin
 ```
 
 `requireUser` tells "nobody is here" apart from "wrong kind of caller":
 
-| Caller | Result |
-| --- | --- |
-| Nobody | `401 unauthorized` |
-| A valid API key | `403 session_required` |
-| A signed-in person | returns the user |
+| Caller             | Result                 |
+| ------------------ | ---------------------- |
+| Nobody             | `401 unauthorized`     |
+| A valid API key    | `403 session_required` |
+| A signed-in person | returns the user       |
 
 The 403 is on purpose. A machine client that gets a 401 will usually retry or
 fetch a new credential, and no API key will ever be accepted on a
@@ -273,7 +287,10 @@ once:
 ```ts
 app.onError((error, c) => {
   if (isCfAuthError(error)) {
-    return c.json({ error: { code: error.code, message: error.message } }, error.status);
+    return c.json(
+      { error: { code: error.code, message: error.message } },
+      error.status,
+    );
   }
   return c.json({ error: { code: "internal_error" } }, 500);
 });
@@ -291,13 +308,27 @@ nobody is left without one.
 ```ts
 const { service } = cfAuth;
 
-await service.listOrganizations(userId);
+await service.listOrganizations(state); // session callers only
 await service.createOrganization(userId, "Second Org");
-await service.selectOrganization(userId, orgId);          // 403 if not a member
-await service.listOrganizationMembers(actorId, orgId);    // owner or admin only
-await service.addOrganizationMember({ actorUserId, organizationId, userId, role: "member" });
-await service.updateOrganizationMemberRole({ actorUserId, organizationId, userId, role: "admin" });
-await service.removeOrganizationMember({ actorUserId, organizationId, userId });
+await service.selectOrganization(state, orgId); // 403 if not a member
+await service.listOrganizationMembers({ actor: state, organizationId }); // owner or admin
+await service.addOrganizationMember({
+  actor: state,
+  organizationId,
+  userId,
+  role: "member",
+});
+await service.updateOrganizationMemberRole({
+  actor: state,
+  organizationId,
+  userId,
+  role: "admin",
+});
+await service.removeOrganizationMember({
+  actor: state,
+  organizationId,
+  userId,
+});
 ```
 
 ### What each role may do
@@ -305,12 +336,12 @@ await service.removeOrganizationMember({ actorUserId, organizationId, userId });
 `owner` is above `admin`, which is above `member`. Owners and admins both manage
 members, but **an admin can never reach owner level**:
 
-| Action | Who may do it |
-| --- | --- |
+| Action                                       | Who may do it      |
+| -------------------------------------------- | ------------------ |
 | Add, remove or re-role a `member` or `admin` | `owner` or `admin` |
-| Add someone as an `owner` | `owner` |
-| Demote or remove an `owner` | `owner` |
-| List members | `owner` or `admin` |
+| Add someone as an `owner`                    | `owner`            |
+| Demote or remove an `owner`                  | `owner`            |
+| List members                                 | `owner` or `admin` |
 
 An organization must always keep at least one owner. Removing or demoting the
 last one fails with `409 last_owner`, and the check happens inside the write
@@ -324,42 +355,79 @@ billing dependency.
 
 ## API keys
 
-Turn them on with `apiKeys: { enabled: true }`. A token is your prefix plus 48
-random characters. Only a hash of it is stored, so the real token is shown once
-and can never be looked up again.
+Turn them on with `apiKeys: { enabled: true }`. cf-auth generates each key from
+secure random bytes and persists only its SHA-256 hash and display hint. Each
+credential belongs to a human or service identity and is bound to one organization.
 
 ```ts
 const key = await cfAuth.service.createApiKey({
   organizationId,
-  actorUserId,
+  actor: state,
   name: "CI pipeline",
 });
-key.plaintext; // "sk_live_..." — show it once
-
-await cfAuth.service.listApiKeys({ organizationId, actorUserId });
-await cfAuth.service.revokeApiKey({ organizationId, actorUserId, apiKeyId });
+// Securely deliver key.plaintext once; never include it in logs.
+await cfAuth.service.listApiKeys({ organizationId, actor: state });
+await cfAuth.service.revokeApiKey({ organizationId, actor: state, apiKeyId });
 ```
 
-**`actorUserId` decides whether the call is allowed — it is not just a note for
-your logs.** A key acts as `owner` inside its organization, so making one is a
-manager-level act:
+Creation and revocation require an owner/admin; listing requires membership.
+Session and API-key callers use the same membership role. Keys never acquire
+browser assurance, including keys belonging to a human. Applications expose
+their own authorized management routes around these server methods when needed.
 
-| Method | The actor must be |
-| --- | --- |
-| `createApiKey` | `owner` or `admin` |
-| `revokeApiKey` | `owner` or `admin` |
-| `listApiKeys` | any member (they only get names, never tokens) |
+For a deployment-authorized bootstrap or approved claim exchange, server code
+can call `createServiceIdentity({ name, id? })`, create its organization/membership,
+and call `issueServiceApiKey({ userId, organizationId, name, expiresAt?, enabled? })`.
+This trusted primitive is not an unrestricted management endpoint. Services have
+`kind: "service"`, null email, and no password/Google accounts or sessions.
 
-Anything else throws `403 forbidden`. This matters because routes usually read
-`organizationId` from the request. Without the check, any signed-in user could
-make an owner-level key for somebody else's organization.
+Pass `enabled: false` when the key must not authenticate until the exchange that
+ordered it has committed, then call `enableServiceApiKey({ apiKeyId,
+organizationId })` once it has. Enabling answers with the key as it stands
+rather than raising, so a key revoked in the meantime stays revoked and says so;
+`revokeServiceApiKey({ apiKeyId, organizationId })` retires one from the same
+trusted side. Every `ApiKeySummary` carries `enabled`, so a key still waiting is
+visible in `listApiKeys` instead of looking live.
 
-Callers send `Authorization: Bearer sk_live_...`. They can add `X-Client: cli`
-or `X-Client: mcp` to set `state.source`, so you can tell those apart from
-normal API traffic. A key belongs to exactly one organization. Revoking one
-stops it working straight away.
+Callers send `Authorization: Bearer <key>`. `X-Client: cli` or `mcp` is telemetry
+only. Every request resolves the owning identity and current active membership;
+role changes and membership removal take effect immediately. Authorization uses
+the current membership role; cf-auth does not add a second granular permission
+system. Expiry and revocation affect credentials, not the identity or account.
+`tokenHint` contains the token's last four characters for safe display.
 
-When API keys are off, bearer headers are ignored and the key methods throw.
+`verification` keeps Better Auth's ordinary schema and is reserved for Better
+Auth. Applications that implement browser handoffs or idempotency receipts own
+that state in their own tables.
+
+### Provisional organizations
+
+An organization may carry an `expiresAt` deadline: it exists provisionally,
+usually because a machine identity created it and no person has taken it over
+yet. Past that instant nothing acts inside it — an API key for it stops
+authenticating, and a session resolves its other memberships instead. The
+organization is still listed in `memberships`, so a client can name it and
+explain why it is unavailable.
+
+`claimOrganization` is how a person takes one over:
+
+```ts
+await cfAuth.service.claimOrganization({
+  actor: c.get("authState"), // an interactive human session
+  organizationId,
+  provisioning: {
+    userId: serviceIdentityId,
+    credentialId: bootstrapKeyId,
+    revokeAccess: false, // true also retires that identity's keys and membership
+  },
+});
+```
+
+It promotes the person to `owner` and clears the deadline in one transaction,
+and refuses when somebody else already owns the organization, when the deadline
+has passed, or when the provisioning credential is no longer live. Repeating a
+claim that already landed settles on the same membership rather than failing,
+so a caller that lost its answer can simply ask again.
 
 ---
 
@@ -372,8 +440,8 @@ choice survives page loads.
 const cookie = cfAuth.currentOrganizationCookie;
 
 await cookie.write(c, organizationId); // after they switch
-await cookie.read(c);                  // string | null
-cookie.clear(c);                       // on sign-out
+await cookie.read(c); // string | null
+cookie.clear(c); // on sign-out
 ```
 
 It is signed, not encrypted, because an organization id is not a secret. Signing
@@ -386,8 +454,10 @@ A switch route usually looks like this:
 
 ```ts
 app.post("/api/organizations/:id/select", async (c) => {
-  const user = requireUser(c.get("authState"));
-  const state = await cfAuth.service.selectOrganization(user.id, c.req.param("id"));
+  const state = await cfAuth.service.selectOrganization(
+    c.get("authState"),
+    c.req.param("id"),
+  );
   await cfAuth.currentOrganizationCookie.write(c, state.organization!.id);
   return c.json(state);
 });
@@ -407,10 +477,10 @@ createCfAuth({
   // ...
   onEvent: async (event) => {
     switch (event.type) {
-      case "user.signup":          // { userId, email }
+      case "user.signup": // { userId, email }
       case "organization.created": // { userId, organizationId, role, name }
-      case "api_key.created":      // { actorUserId, organizationId, apiKeyId, name }
-      case "api_key.revoked":      // { actorUserId, organizationId, apiKeyId, name }
+      case "api_key.created": // { actorUserId, organizationId, apiKeyId, name }
+      case "api_key.revoked": // { actorUserId, organizationId, apiKeyId, name }
         await writeAuditLog(event);
     }
   },
@@ -424,8 +494,8 @@ If `onEvent` fails it never breaks sign-in. The error goes to `onError`.
 ## Testing your own app
 
 Signing in costs a password hash. That cost is the point — it is what makes a
-stolen hash expensive to crack — but a test that only needs *an authenticated
-caller* pays it for nothing, and on Workers better-auth falls back to a pure-JS
+stolen hash expensive to crack — but a test that only needs _an authenticated
+caller_ pays it for nothing, and on Workers better-auth falls back to a pure-JS
 scrypt that costs seconds rather than milliseconds. A suite that signs up a
 handful of users spends most of its time there.
 
@@ -437,7 +507,7 @@ import { createTestSessions } from "@maxceem/cf-auth/testing";
 const sessions = createTestSessions(cfAuth);
 
 // A user, the organization provisioned for them, and a session.
-const { cookie, userId, organizationId } = await sessions.operator();
+const { cookie, userId, organizationId } = await sessions.human();
 
 // Or a session for a user you already have.
 const existing = await sessions.cookieFor(userId);
@@ -445,7 +515,7 @@ const existing = await sessions.cookieFor(userId);
 const response = await app.request("/api/me", { headers: { Cookie: cookie } });
 ```
 
-`operator()` creates a distinct user each call, so tests needing separate
+`human()` creates a distinct user each call, so tests needing separate
 tenants stay independent of one another. The token is random per call and signed
 with the instance's own secret — nothing here is a fixed credential, and nothing
 outlives the test that asked for it.
@@ -468,15 +538,15 @@ exercise the password path, so something still has to.
 
 ## Environment
 
-| Variable | Needed | What it is for |
-| --- | --- | --- |
-| `AUTH_SECRET` | yes | Signs sessions and cookies. Make one with `openssl rand -base64 32`. |
-| `AUTH_COOKIE_SECRET` | no | A separate secret for the organization cookie. |
-| `APP_URL` | in production | Your public address. Needed for Google sign-in and CSRF checks. |
-| `AUTH_TRUSTED_ORIGINS` | no | Other addresses allowed to call the auth endpoints, like a Vite dev server. |
-| `GOOGLE_CLIENT_ID` | no | Leave both out to turn Google sign-in off. |
-| `GOOGLE_CLIENT_SECRET` | no | |
-| `OAUTH_PROXY_SECRET` | no | Shared by production and your preview environments. Keep it different from `AUTH_SECRET`. |
+| Variable               | Needed        | What it is for                                                                            |
+| ---------------------- | ------------- | ----------------------------------------------------------------------------------------- |
+| `AUTH_SECRET`          | yes           | Signs sessions and cookies. Make one with `openssl rand -base64 32`.                      |
+| `AUTH_COOKIE_SECRET`   | no            | A separate secret for the organization cookie.                                            |
+| `APP_URL`              | in production | Your public address. Needed for Google sign-in and CSRF checks.                           |
+| `AUTH_TRUSTED_ORIGINS` | no            | Other addresses allowed to call the auth endpoints, like a Vite dev server.               |
+| `GOOGLE_CLIENT_ID`     | no            | Leave both out to turn Google sign-in off.                                                |
+| `GOOGLE_CLIENT_SECRET` | no            |                                                                                           |
+| `OAUTH_PROXY_SECRET`   | no            | Shared by production and your preview environments. Keep it different from `AUTH_SECRET`. |
 
 Put these in `.dev.vars` on your machine (it is gitignored) and use
 `wrangler secret put AUTH_SECRET` in production. `APP_URL` is fine as a plain
@@ -487,8 +557,8 @@ Your Worker needs a D1 binding:
 ```jsonc
 {
   "d1_databases": [
-    { "binding": "DB", "database_name": "my-app", "database_id": "..." }
-  ]
+    { "binding": "DB", "database_name": "my-app", "database_id": "..." },
+  ],
 }
 ```
 

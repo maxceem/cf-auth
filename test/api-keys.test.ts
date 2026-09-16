@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { hashApiKeyToken } from "../src/crypto.js";
 import { createTestAuth, type TestAuth } from "./helpers.js";
 
@@ -17,11 +17,11 @@ describe("api key authentication", () => {
 
     const apiKey = await harness.cfAuth.service.createApiKey({
       organizationId,
-      actorUserId: user.id,
+      actor: await harness.actorFor(user.id),
       name: "CI",
     });
 
-    expect(apiKey.plaintext).toMatch(/^key_[A-Za-z0-9]{48}$/);
+    expect(apiKey.plaintext).toMatch(/^key_[A-Za-z0-9_-]+$/);
     expect(apiKey.tokenHint).toBe(apiKey.plaintext.slice(-4));
 
     const state = await harness.me({
@@ -32,8 +32,14 @@ describe("api key authentication", () => {
     expect(state.authenticated).toBe(true);
     expect(state.credentialType).toBe("apiKey");
     expect(state.source).toBe("api");
-    expect(state.actor).toEqual({ type: "api_key", id: apiKey.id, actionSource: "api" });
-    expect(state.user).toBeNull();
+    expect(state.actor).toEqual({
+      type: "user",
+      id: user.id,
+      kind: "human",
+      credentialId: apiKey.id,
+      actionSource: "api",
+    });
+    expect(state.user?.id).toBe(user.id);
     expect(state.organization?.id).toBe(organizationId);
     expect(state.role).toBe("owner");
   });
@@ -44,7 +50,7 @@ describe("api key authentication", () => {
 
     const apiKey = await harness.cfAuth.service.createApiKey({
       organizationId,
-      actorUserId: user.id,
+      actor: await harness.actorFor(user.id),
       name: "CLI",
     });
 
@@ -55,7 +61,10 @@ describe("api key authentication", () => {
     ] as const) {
       const state = await harness.me({
         useJar: false,
-        headers: { Authorization: `Bearer ${apiKey.plaintext}`, "X-Client": header },
+        headers: {
+          Authorization: `Bearer ${apiKey.plaintext}`,
+          "X-Client": header,
+        },
       });
 
       expect(state.source).toBe(expected);
@@ -68,16 +77,22 @@ describe("api key authentication", () => {
 
     const apiKey = await harness.cfAuth.service.createApiKey({
       organizationId,
-      actorUserId: user.id,
+      actor: await harness.actorFor(user.id),
       name: "Hashed",
     });
 
-    const found = await harness.cfAuth.repository.findActiveApiKeyByHash(
-      await hashApiKeyToken(apiKey.plaintext),
-    );
+    const found = await harness.client.execute({
+      sql: "SELECT token_hash, token_hint FROM api_key WHERE id = ?",
+      args: [apiKey.id],
+    });
+    expect(found.rows[0]?.token_hash).toBe(await hashApiKeyToken(apiKey.plaintext));
+    expect(found.rows[0]?.token_hint).toBe(apiKey.plaintext.slice(-4));
+    expect(JSON.stringify(found.rows)).not.toContain(apiKey.plaintext);
 
-    expect(found?.id).toBe(apiKey.id);
-    const listed = await harness.cfAuth.service.listApiKeys({ organizationId, actorUserId: user.id });
+    const listed = await harness.cfAuth.service.listApiKeys({
+      organizationId,
+      actor: await harness.actorFor(user.id),
+    });
     expect(listed[0]?.tokenHint).toBe(apiKey.plaintext.slice(-4));
     expect(JSON.stringify(listed)).not.toContain(apiKey.plaintext);
   });
@@ -88,18 +103,22 @@ describe("api key authentication", () => {
 
     const apiKey = await harness.cfAuth.service.createApiKey({
       organizationId,
-      actorUserId: user.id,
+      actor: await harness.actorFor(user.id),
       name: "Doomed",
     });
 
     expect(
-      (await harness.me({ useJar: false, headers: { Authorization: "Bearer key_nope" } }))
-        .authenticated,
+      (
+        await harness.me({
+          useJar: false,
+          headers: { Authorization: "Bearer key_nope" },
+        })
+      ).authenticated,
     ).toBe(false);
 
     const revoked = await harness.cfAuth.service.revokeApiKey({
       organizationId,
-      actorUserId: user.id,
+      actor: await harness.actorFor(user.id),
       apiKeyId: apiKey.id,
     });
     expect(revoked?.revokedAt).not.toBeNull();
@@ -115,11 +134,53 @@ describe("api key authentication", () => {
       (
         await harness.cfAuth.service.revokeApiKey({
           organizationId,
-          actorUserId: user.id,
+          actor: await harness.actorFor(user.id),
           apiKeyId: apiKey.id,
         })
       )?.revokedAt,
     ).toBe(revoked?.revokedAt);
+  });
+
+  it("verifies without writing to the key row", async () => {
+    const harness = await createTestAuth();
+    const { user, organizationId } = await signUpOwner(harness, "read-only@example.com");
+    const apiKey = await harness.cfAuth.service.createApiKey({
+      organizationId,
+      actor: await harness.actorFor(user.id),
+      name: "Read only verification",
+    });
+    await harness.client.execute(`CREATE TRIGGER reject_api_key_update
+      BEFORE UPDATE ON api_key BEGIN SELECT RAISE(ABORT, 'verification wrote key'); END`);
+
+    expect(
+      (await harness.cfAuth.service.resolveApiKeyAuthState(apiKey.plaintext)).authenticated,
+    ).toBe(true);
+  });
+
+  it("rejects a key at its exact expiry boundary and retains the row", async () => {
+    const harness = await createTestAuth();
+    const { user, organizationId } = await signUpOwner(harness, "expiry@example.com");
+    const boundary = new Date("2030-01-02T03:04:05.000Z");
+    const apiKey = await harness.cfAuth.service.createApiKey({
+      organizationId,
+      actor: await harness.actorFor(user.id),
+      name: "Expiring",
+      expiresAt: boundary,
+    });
+
+    vi.useFakeTimers();
+    vi.setSystemTime(boundary);
+    try {
+      expect(
+        (await harness.cfAuth.service.resolveApiKeyAuthState(apiKey.plaintext)).authenticated,
+      ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(
+      (await harness.client.execute({ sql: "SELECT id FROM api_key WHERE id=?", args: [apiKey.id] }))
+        .rows,
+    ).toHaveLength(1);
   });
 
   it("emits api_key lifecycle events", async () => {
@@ -128,12 +189,12 @@ describe("api key authentication", () => {
 
     const apiKey = await harness.cfAuth.service.createApiKey({
       organizationId,
-      actorUserId: user.id,
+      actor: await harness.actorFor(user.id),
       name: "Audited",
     });
     await harness.cfAuth.service.revokeApiKey({
       organizationId,
-      actorUserId: user.id,
+      actor: await harness.actorFor(user.id),
       apiKeyId: apiKey.id,
     });
 
@@ -143,12 +204,14 @@ describe("api key authentication", () => {
   });
 
   it("uses the configured token prefix", async () => {
-    const harness = await createTestAuth({ apiKeys: { enabled: true, tokenPrefix: "sk_live_" } });
+    const harness = await createTestAuth({
+      apiKeys: { enabled: true, tokenPrefix: "sk_live_" },
+    });
     const { user, organizationId } = await signUpOwner(harness, "prefix-key@example.com");
 
     const apiKey = await harness.cfAuth.service.createApiKey({
       organizationId,
-      actorUserId: user.id,
+      actor: await harness.actorFor(user.id),
       name: "Prefixed",
     });
 
@@ -166,7 +229,7 @@ describe("api key authentication", () => {
     await expect(
       offHarness.cfAuth.service.createApiKey({
         organizationId,
-        actorUserId: user.id,
+        actor: await offHarness.actorFor(user.id),
         name: "Nope",
       }),
     ).rejects.toMatchObject({ code: "validation_error" });
@@ -184,7 +247,22 @@ describe("api key authentication", () => {
     const { user, organizationId } = await signUpOwner(harness, "noname@example.com");
 
     await expect(
-      harness.cfAuth.service.createApiKey({ organizationId, actorUserId: user.id, name: "  " }),
+      harness.cfAuth.service.createApiKey({
+        organizationId,
+        actor: await harness.actorFor(user.id),
+        name: "  ",
+      }),
     ).rejects.toMatchObject({ code: "validation_error", status: 422 });
+  });
+
+  it("rejects invalid and non-future expiry dates", async () => {
+    const harness = await createTestAuth();
+    const { user, organizationId } = await signUpOwner(harness, "bad-expiry@example.com");
+    const actor = await harness.actorFor(user.id);
+    for (const expiresAt of [new Date(Number.NaN), new Date(Date.now())]) {
+      await expect(
+        harness.cfAuth.service.createApiKey({ organizationId, actor, name: "Invalid", expiresAt }),
+      ).rejects.toMatchObject({ code: "validation_error", status: 422 });
+    }
   });
 });

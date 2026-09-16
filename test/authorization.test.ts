@@ -19,13 +19,13 @@ const createOrgWithRoles = async (harness: TestAuth, prefix: string) => {
   const organizationId = ownerOrg!.organization.id;
 
   await harness.cfAuth.service.addOrganizationMember({
-    actorUserId: owner.id,
+    actor: await harness.actorFor(owner.id),
     organizationId,
     userId: admin.id,
     role: "admin",
   });
   await harness.cfAuth.service.addOrganizationMember({
-    actorUserId: owner.id,
+    actor: await harness.actorFor(owner.id),
     organizationId,
     userId: member.id,
     role: "member",
@@ -41,7 +41,7 @@ describe("owner authority cannot be reached by an admin", () => {
 
     await expect(
       harness.cfAuth.service.addOrganizationMember({
-        actorUserId: admin.id,
+        actor: await harness.actorFor(admin.id),
         organizationId,
         userId: outsider.id,
         role: "owner",
@@ -56,7 +56,7 @@ describe("owner authority cannot be reached by an admin", () => {
     const { owner, outsider, organizationId } = await createOrgWithRoles(harness, "add-ok");
 
     const membership = await harness.cfAuth.service.addOrganizationMember({
-      actorUserId: owner.id,
+      actor: await harness.actorFor(owner.id),
       organizationId,
       userId: outsider.id,
       role: "owner",
@@ -71,7 +71,7 @@ describe("owner authority cannot be reached by an admin", () => {
 
     await expect(
       harness.cfAuth.service.updateOrganizationMemberRole({
-        actorUserId: admin.id,
+        actor: await harness.actorFor(admin.id),
         organizationId,
         userId: owner.id,
         role: "member",
@@ -89,7 +89,7 @@ describe("owner authority cannot be reached by an admin", () => {
 
     await expect(
       harness.cfAuth.service.removeOrganizationMember({
-        actorUserId: admin.id,
+        actor: await harness.actorFor(admin.id),
         organizationId,
         userId: owner.id,
       }),
@@ -104,7 +104,7 @@ describe("owner authority cannot be reached by an admin", () => {
 
     await expect(
       harness.cfAuth.service.addOrganizationMember({
-        actorUserId: member.id,
+        actor: await harness.actorFor(member.id),
         organizationId,
         userId: outsider.id,
         role: "member",
@@ -118,7 +118,7 @@ describe("owner authority cannot be reached by an admin", () => {
 
     await expect(
       harness.cfAuth.service.updateOrganizationMemberRole({
-        actorUserId: outsider.id,
+        actor: await harness.actorFor(outsider.id),
         organizationId,
         userId: member.id,
         role: "admin",
@@ -134,7 +134,7 @@ describe("last owner protection", () => {
 
     await expect(
       harness.cfAuth.service.updateOrganizationMemberRole({
-        actorUserId: owner.id,
+        actor: await harness.actorFor(owner.id),
         organizationId,
         userId: owner.id,
         role: "admin",
@@ -148,7 +148,7 @@ describe("last owner protection", () => {
 
     await expect(
       harness.cfAuth.service.removeOrganizationMember({
-        actorUserId: owner.id,
+        actor: await harness.actorFor(owner.id),
         organizationId,
         userId: owner.id,
       }),
@@ -160,14 +160,14 @@ describe("last owner protection", () => {
     const { owner, outsider, organizationId } = await createOrgWithRoles(harness, "second-owner");
 
     await harness.cfAuth.service.addOrganizationMember({
-      actorUserId: owner.id,
+      actor: await harness.actorFor(owner.id),
       organizationId,
       userId: outsider.id,
       role: "owner",
     });
 
     const removed = await harness.cfAuth.service.removeOrganizationMember({
-      actorUserId: owner.id,
+      actor: await harness.actorFor(owner.id),
       organizationId,
       userId: owner.id,
     });
@@ -185,7 +185,7 @@ describe("duplicate membership", () => {
 
     await expect(
       harness.cfAuth.service.addOrganizationMember({
-        actorUserId: owner.id,
+        actor: await harness.actorFor(owner.id),
         organizationId,
         userId: member.id,
         role: "member",
@@ -202,7 +202,7 @@ describe("api key authorization", () => {
     await expect(
       harness.cfAuth.service.createApiKey({
         organizationId,
-        actorUserId: outsider.id,
+        actor: await harness.actorFor(outsider.id),
         name: "Stolen",
       }),
     ).rejects.toMatchObject({ code: "forbidden", status: 403 });
@@ -217,7 +217,7 @@ describe("api key authorization", () => {
     await expect(
       harness.cfAuth.service.createApiKey({
         organizationId,
-        actorUserId: member.id,
+        actor: await harness.actorFor(member.id),
         name: "Escalation",
       }),
     ).rejects.toMatchObject({ code: "forbidden", status: 403 });
@@ -230,7 +230,7 @@ describe("api key authorization", () => {
     for (const actor of [owner, admin]) {
       const key = await harness.cfAuth.service.createApiKey({
         organizationId,
-        actorUserId: actor.id,
+        actor: await harness.actorFor(actor.id),
         name: `Key for ${actor.email}`,
       });
 
@@ -240,22 +240,28 @@ describe("api key authorization", () => {
 
   it("lets any member list keys but not outsiders", async () => {
     const harness = await createTestAuth();
-    const { owner, member, outsider, organizationId } = await createOrgWithRoles(harness, "key-list");
+    const { owner, member, outsider, organizationId } = await createOrgWithRoles(
+      harness,
+      "key-list",
+    );
 
     await harness.cfAuth.service.createApiKey({
       organizationId,
-      actorUserId: owner.id,
+      actor: await harness.actorFor(owner.id),
       name: "Listed",
     });
 
     const listed = await harness.cfAuth.service.listApiKeys({
       organizationId,
-      actorUserId: member.id,
+      actor: await harness.actorFor(member.id),
     });
     expect(listed).toHaveLength(1);
 
     await expect(
-      harness.cfAuth.service.listApiKeys({ organizationId, actorUserId: outsider.id }),
+      harness.cfAuth.service.listApiKeys({
+        organizationId,
+        actor: await harness.actorFor(outsider.id),
+      }),
     ).rejects.toMatchObject({ code: "forbidden" });
   });
 
@@ -268,7 +274,7 @@ describe("api key authorization", () => {
 
     const key = await harness.cfAuth.service.createApiKey({
       organizationId,
-      actorUserId: owner.id,
+      actor: await harness.actorFor(owner.id),
       name: "Target",
     });
 
@@ -276,12 +282,14 @@ describe("api key authorization", () => {
       await expect(
         harness.cfAuth.service.revokeApiKey({
           organizationId,
-          actorUserId: actor.id,
+          actor: await harness.actorFor(actor.id),
           apiKeyId: key.id,
         }),
       ).rejects.toMatchObject({ code: "forbidden" });
     }
 
-    expect((await harness.cfAuth.repository.findApiKeyById(key.id, organizationId))?.revokedAt).toBeNull();
+    expect(
+      (await harness.cfAuth.repository.findApiKeyById(key.id, organizationId))?.revokedAt,
+    ).toBeNull();
   });
 });

@@ -31,20 +31,36 @@ export const isApiKeyActionSource = (value: ActionSource): value is ApiKeyAction
 /** Which credential proved the caller's identity. */
 export type AuthCredentialType = "session" | "apiKey";
 
-export type AuthActor =
-  | { type: "user"; id: string; actionSource: "web" }
-  | { type: "api_key"; id: string; actionSource: ApiKeyActionSource };
+export type IdentityKind = "human" | "service";
+export type AuthActor = {
+  type: "user";
+  id: string;
+  kind: IdentityKind;
+  credentialId: string | null;
+  actionSource: ActionSource;
+};
 
 export interface AuthUser {
   id: string;
   name: string | null;
-  email: string;
+  email: string | null;
+  kind: IdentityKind;
   emailVerified: boolean;
   image: string | null;
   createdAt: string;
 }
 
+/** A live interactive session, as read back from the session table. */
+export interface AuthSession {
+  id: string;
+  userId: string;
+  expiresAt: string;
+}
+
 export interface OrganizationSummary {
+  /** True when the organization has a human owner membership. */
+  claimed: boolean;
+  expiresAt: string | null;
   id: string;
   name: string;
   createdAt: string;
@@ -71,6 +87,7 @@ export interface OrganizationMember extends AuthUser {
  */
 export interface AuthState {
   authenticated: boolean;
+  assurance: "interactive" | "credential" | null;
   credentialType: AuthCredentialType | null;
   /** Where the request came from (`web` for sessions, `api`/`cli`/`mcp` for API keys). */
   source: ActionSource | null;
@@ -86,22 +103,26 @@ export interface AuthState {
 export interface ApiKeySummary {
   id: string;
   organizationId: string;
+  userId: string;
+  expiresAt: string | null;
   name: string;
+  /** Last four token characters for safe display; never a credential. */
+  tokenHint: string;
   /**
-   * The last few characters of the token, kept for display so operators can
-   * match a key against the copy in their secret manager. Null for keys
-   * created before hints were recorded — the stored hash cannot recover one.
+   * Whether the key may authenticate at all.
+   *
+   * A key issued through {@link CfAuthService.issueServiceApiKey} with
+   * `enabled: false` waits here until the trusted exchange that ordered it
+   * commits and calls {@link CfAuthService.enableServiceApiKey}. Revoking sets
+   * this to `false` too, so `enabled && !revokedAt` is the live key.
    */
-  tokenHint: string | null;
+  enabled: boolean;
   createdAt: string;
   revokedAt: string | null;
 }
 
 export interface CreatedApiKey extends ApiKeySummary {
-  /**
-   * The only time the plaintext token is ever available. Only a SHA-256 hash
-   * is persisted, so this cannot be recovered later.
-   */
+  /** Returned only during issuance; only its SHA-256 hash is persisted. */
   plaintext: string;
 }
 
@@ -118,10 +139,43 @@ export type CfAuthEvent =
       role: OrganizationRole;
       name: string;
     }
-  | { type: "api_key.created"; actorUserId: string; organizationId: string; apiKeyId: string; name: string }
-  | { type: "api_key.revoked"; actorUserId: string; organizationId: string; apiKeyId: string; name: string };
+  | { type: "organization.claimed"; userId: string; organizationId: string }
+  | {
+      type: "api_key.created";
+      actorUserId: string;
+      organizationId: string;
+      apiKeyId: string;
+      name: string;
+    }
+  | {
+      type: "api_key.revoked";
+      actorUserId: string;
+      organizationId: string;
+      apiKeyId: string;
+      name: string;
+    };
 
-const roleRank: Record<OrganizationRole, number> = { owner: 3, admin: 2, member: 1 };
+const roleRank: Record<OrganizationRole, number> = {
+  owner: 3,
+  admin: 2,
+  member: 1,
+};
+
+/**
+ * True once an organization's provisional deadline has passed.
+ *
+ * `expiresAt` marks a tenant that exists only provisionally — a trial, or an
+ * account a person has not claimed yet. Past it, the organization is not
+ * somewhere anyone can act, whichever credential they hold, so both the API-key
+ * and the session paths refuse to resolve it as the current organization.
+ */
+export const isOrganizationExpired = (
+  organization: Pick<OrganizationSummary, "expiresAt"> | null | undefined,
+  now: number = Date.now(),
+): boolean => {
+  const expiresAt = organization?.expiresAt;
+  return expiresAt !== null && expiresAt !== undefined && Date.parse(expiresAt) <= now;
+};
 
 /** True when the role may administer the organization (owner or admin). */
 export const canManageOrganization = (role: OrganizationRole | null | undefined): boolean =>
@@ -136,6 +190,7 @@ export const hasRoleAtLeast = (
 /** An unauthenticated {@link AuthState}. Safe default for anonymous requests. */
 export const createEmptyAuthState = (): AuthState => ({
   authenticated: false,
+  assurance: null,
   credentialType: null,
   source: null,
   actor: null,

@@ -17,7 +17,7 @@ const createOrgWithTwoOwners = async (harness: TestAuth, prefix: string) => {
   const organizationId = membership!.organization.id;
 
   await harness.cfAuth.service.addOrganizationMember({
-    actorUserId: first.id,
+    actor: await harness.actorFor(first.id),
     organizationId,
     userId: second.id,
     role: "owner",
@@ -80,7 +80,7 @@ describe("last-owner guard is atomic", () => {
     const plain = await createUser(harness, "race-plain@example.com");
 
     await harness.cfAuth.service.addOrganizationMember({
-      actorUserId: first.id,
+      actor: await harness.actorFor(first.id),
       organizationId,
       userId: plain.id,
       role: "member",
@@ -104,13 +104,13 @@ describe("default organization re-provisioning", () => {
     const { first, second, organizationId } = await createOrgWithTwoOwners(harness, "reprovision");
 
     await harness.cfAuth.service.removeOrganizationMember({
-      actorUserId: second.id,
+      actor: await harness.actorFor(second.id),
       organizationId,
       userId: first.id,
     });
     expect(await harness.cfAuth.repository.listOrganizationsForUser(first.id)).toEqual([]);
 
-    const state = await harness.cfAuth.service.getAuthState(first.id, null);
+    const state = await harness.actorFor(first.id);
 
     // Two requests land at once; a random org id would produce two orgs.
     const healed = await Promise.all([
@@ -138,18 +138,18 @@ describe("default organization re-provisioning", () => {
 
       // Hand the org to someone else, then leave it.
       await harness.cfAuth.service.addOrganizationMember({
-        actorUserId: user.id,
+        actor: await harness.actorFor(user.id),
         organizationId,
         userId: keeper.id,
         role: "owner",
       });
       await harness.cfAuth.service.removeOrganizationMember({
-        actorUserId: keeper.id,
+        actor: await harness.actorFor(keeper.id),
         organizationId,
         userId: user.id,
       });
 
-      const state = await harness.cfAuth.service.getAuthState(user.id, null);
+      const state = await harness.actorFor(user.id);
       await harness.cfAuth.service.ensureDefaultOrganization(state!);
     }
 
@@ -172,7 +172,7 @@ describe("foreign key violations", () => {
 
     await expect(
       harness.cfAuth.service.addOrganizationMember({
-        actorUserId: owner.id,
+        actor: await harness.actorFor(owner.id),
         organizationId: membership!.organization.id,
         userId: "00000000-0000-0000-0000-00000000dead",
         role: "member",

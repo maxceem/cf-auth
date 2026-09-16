@@ -29,15 +29,18 @@ export {
   createEmptyAuthState,
   hasRoleAtLeast,
   isApiKeyActionSource,
+  isOrganizationExpired,
   organizationMemberStatuses,
   organizationRoles,
   type ActionSource,
   type ApiKeyActionSource,
   type ApiKeySummary,
   type AuthActor,
+  type AuthSession,
   type AuthCredentialType,
   type AuthState,
   type AuthUser,
+  type IdentityKind,
   type CfAuthEvent,
   type CreatedApiKey,
   type OrganizationMember,
@@ -53,6 +56,7 @@ export {
   forbidden,
   isCfAuthError,
   notFound,
+  organizationExpired,
   sessionRequired,
   unauthorized,
   validationError,
@@ -80,12 +84,14 @@ export {
   toApiKeyAuthState,
   toSessionAuthState,
   type CfAuthService,
+  type ClaimOrganizationInput,
+  type IssueIdentityApiKeyInput,
 } from "./service.js";
 
 export {
   createCfAuthRepository,
-  type ApiKeyAuthRecord,
   type CfAuthRepository,
+  type ClaimOrganizationWrite,
   type CfAuthRepositoryOptions,
   type EnsureDefaultOrganizationResult,
   type MembershipMutationResult,
@@ -97,11 +103,6 @@ export {
   type CfBetterAuth,
 } from "./better-auth.js";
 
-export {
-  deriveSecret,
-  generateApiKeyToken,
-  hashApiKeyToken,
-  type GeneratedApiKeyToken,
-} from "./crypto.js";
+export { deriveSecret } from "./crypto.js";
 
 export * from "./schema.js";

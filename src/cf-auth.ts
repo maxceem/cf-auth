@@ -2,11 +2,7 @@ import type { Env, Hono } from "hono";
 import { createBetterAuthInstance, type CfBetterAuth } from "./better-auth.js";
 import { resolveConfig, type CfAuthConfig, type ResolvedCfAuthConfig } from "./config.js";
 import { createCurrentOrganizationCookie, type CurrentOrganizationCookie } from "./cookies.js";
-import {
-  createAuthMiddleware,
-  type AuthMiddlewareOptions,
-  type CfAuthEnv,
-} from "./middleware.js";
+import { createAuthMiddleware, type AuthMiddlewareOptions, type CfAuthEnv } from "./middleware.js";
 import { createCfAuthRepository, type CfAuthRepository } from "./repository.js";
 import { createAuthService, type CfAuthService } from "./service.js";
 import type { MiddlewareHandler } from "hono";
@@ -30,9 +26,7 @@ export interface CfAuth {
   /** Raw fetch handler for better-auth's own endpoints. */
   handler(request: Request): Promise<Response>;
   /** Session/API-key resolution middleware. Sets `c.get("authState")`. */
-  middleware<E extends Env = CfAuthEnv>(
-    options?: AuthMiddlewareOptions,
-  ): MiddlewareHandler<E>;
+  middleware<E extends Env = CfAuthEnv>(options?: AuthMiddlewareOptions): MiddlewareHandler<E>;
   /** Convenience: mounts {@link CfAuth.handler} at {@link CfAuth.routePattern}. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   mount(app: Hono<any, any, any>): void;
@@ -79,6 +73,7 @@ export const createCfAuth = (config: CfAuthConfig): CfAuth => {
 
   const routePattern = `${resolved.basePath === "/" ? "" : resolved.basePath}/*`;
 
+  const handler = (request: Request): Promise<Response> => auth.handler(request);
   return {
     config: resolved,
     auth,
@@ -87,10 +82,10 @@ export const createCfAuth = (config: CfAuthConfig): CfAuth => {
     currentOrganizationCookie,
     basePath: resolved.basePath,
     routePattern,
-    handler: (request) => auth.handler(request),
+    handler,
     middleware,
     mount(app) {
-      app.all(routePattern, (c: { req: { raw: Request } }) => auth.handler(c.req.raw));
+      app.all(routePattern, (c: { req: { raw: Request } }) => handler(c.req.raw));
     },
   };
 };

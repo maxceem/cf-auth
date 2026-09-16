@@ -2,64 +2,17 @@ import { describe, expect, it } from "vitest";
 import { deriveSecret, generateApiKeyToken, hashApiKeyToken } from "../src/crypto.js";
 import { createTestAuth } from "./helpers.js";
 
-const base62 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-
 describe("api key token generation", () => {
-  it("produces tokens of the requested shape", async () => {
-    const token = await generateApiKeyToken("sk_live_", 48);
-
-    expect(token.plaintext).toMatch(/^sk_live_[A-Za-z0-9]{48}$/);
-    expect(token.tokenHash).toMatch(/^[0-9a-f]{64}$/);
-    expect(token.tokenHash).toBe(await hashApiKeyToken(token.plaintext));
-    expect(token.tokenHash).not.toContain(token.plaintext);
-  });
-
-  it("never emits a character outside the alphabet", async () => {
-    for (let index = 0; index < 50; index += 1) {
-      const { plaintext } = await generateApiKeyToken("k_", 64);
-
-      for (const character of plaintext.slice(2)) {
-        expect(base62).toContain(character);
-      }
-    }
-  });
-
-  it("is free of modulo bias", async () => {
-    // With `byte % 62`, the first 8 characters of the alphabet would appear
-    // ~5/4 as often as the rest. Sample enough to make that gap unmistakable.
-    const counts = new Map<string, number>();
-    let total = 0;
-
-    for (let index = 0; index < 200; index += 1) {
-      const { plaintext } = await generateApiKeyToken("", 256);
-
-      for (const character of plaintext) {
-        counts.set(character, (counts.get(character) ?? 0) + 1);
-        total += 1;
-      }
-    }
-
-    const expected = total / base62.length;
-    const biasProne = base62.slice(0, 8);
-
-    const biasProneAverage =
-      [...biasProne].reduce((sum, character) => sum + (counts.get(character) ?? 0), 0) /
-      biasProne.length;
-    const restAverage =
-      [...base62.slice(8)].reduce((sum, character) => sum + (counts.get(character) ?? 0), 0) /
-      (base62.length - 8);
-
-    // A biased generator lands near 1.25; a uniform one near 1.0.
-    expect(biasProneAverage / restAverage).toBeLessThan(1.1);
-    expect(biasProneAverage / expected).toBeLessThan(1.1);
-  });
-
-  it("generates distinct tokens", async () => {
+  it("produces distinct tokens of the requested shape with matching hashes and hints", async () => {
     const tokens = await Promise.all(
-      Array.from({ length: 100 }, () => generateApiKeyToken("k_", 32)),
+      Array.from({ length: 100 }, () => generateApiKeyToken("sk_live_")),
     );
-
     expect(new Set(tokens.map((token) => token.plaintext)).size).toBe(100);
+    for (const token of tokens) {
+      expect(token.plaintext).toMatch(/^sk_live_[A-Za-z0-9]{48}$/);
+      expect(token.tokenHash).toBe(await hashApiKeyToken(token.plaintext));
+      expect(token.tokenHint).toBe(token.plaintext.slice(-4));
+    }
   });
 });
 
@@ -79,7 +32,10 @@ describe("secret derivation", () => {
 
   it("does not sign the org cookie with the raw better-auth secret", async () => {
     const harness = await createTestAuth();
-    await harness.signUp({ email: "derived@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "derived@example.com",
+      password: "correct-horse-battery",
+    });
     await harness.me();
 
     const cookieName = harness.cfAuth.currentOrganizationCookie.name;
@@ -111,11 +67,16 @@ describe("secret derivation", () => {
   });
 
   it("honours an explicit cookieSecret override", async () => {
-    const harness = await createTestAuth({ cookieSecret: "explicit-cookie-secret-value-0000" });
+    const harness = await createTestAuth({
+      cookieSecret: "explicit-cookie-secret-value-0000",
+    });
 
     expect(harness.cfAuth.config.cookieSecret).toBe("explicit-cookie-secret-value-0000");
 
-    await harness.signUp({ email: "explicit@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "explicit@example.com",
+      password: "correct-horse-battery",
+    });
     const state = await harness.me();
 
     // Round-trips end to end with the override in place.

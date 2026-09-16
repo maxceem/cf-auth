@@ -15,15 +15,17 @@
  */
 import { makeSignature } from "better-auth/crypto";
 import type { CfAuth } from "./cf-auth.js";
-import type { AuthUser } from "./types.js";
+import type { AuthState, AuthUser } from "./types.js";
 
 /** A newly created user, their default organization, and a session for them. */
-export interface TestOperator {
+export interface TestHuman {
   userId: string;
   /** The organization auto-provisioned for the new user. */
   organizationId: string;
   /** Ready for a request's `Cookie:` header. */
   cookie: string;
+  /** The session behind {@link TestHuman.cookie}, for building an actor. */
+  sessionId: string;
   user: AuthUser;
 }
 
@@ -41,7 +43,17 @@ export interface TestSessions {
    * Each call creates a distinct user, so tests that need separate tenants stay
    * independent of one another.
    */
-  operator(input?: { email?: string; name?: string }): Promise<TestOperator>;
+  human(input?: { email?: string; name?: string }): Promise<TestHuman>;
+  /** A fresh session id for an existing user. */
+  sessionIdFor(userId: string): Promise<string>;
+  /**
+   * The {@link AuthState} a signed-in request for this user would resolve to.
+   *
+   * Service methods that act on someone's behalf take an actor rather than a
+   * user id, so a test that calls one directly needs a real session behind it —
+   * this mints one and resolves the state from it.
+   */
+  actorFor(userId: string, currentOrganizationId?: string | null): Promise<AuthState>;
 }
 
 /**
@@ -53,7 +65,7 @@ export interface TestSessions {
  */
 interface BetterAuthContext {
   internalAdapter: {
-    createSession(userId: string): Promise<{ token: string }>;
+    createSession(userId: string): Promise<{ id: string; token: string }>;
     createUser(user: { email: string; name: string; emailVerified: boolean }): Promise<AuthUser>;
   };
   authCookies: { sessionToken: { name: string } };
@@ -63,45 +75,71 @@ let counter = 0;
 
 export const createTestSessions = (cfAuth: CfAuth): TestSessions => {
   const context = async () =>
-    (await (cfAuth.auth as unknown as { $context: Promise<unknown> }).$context) as BetterAuthContext;
+    (await (cfAuth.auth as unknown as { $context: Promise<unknown> })
+      .$context) as BetterAuthContext;
 
-  const cookieFor = async (userId: string): Promise<string> => {
+  const sessionFor = async (userId: string): Promise<{ id: string; cookie: string }> => {
     const { internalAdapter, authCookies } = await context();
-    const { token } = await internalAdapter.createSession(userId);
+    const { id, token } = await internalAdapter.createSession(userId);
     // better-call signs cookies as `value.signature`, URL-encoded, and
     // better-auth's `makeSignature` is the same function it signs them with.
     // `signCookieValue` itself is not on better-call's `exports` map, so this
     // one line mirrors it; the round-trip test holds it to that.
-    const signed = encodeURIComponent(`${token}.${await makeSignature(token, cfAuth.config.secret)}`);
-    return `${authCookies.sessionToken.name}=${signed}`;
+    const signed = encodeURIComponent(
+      `${token}.${await makeSignature(token, cfAuth.config.secret)}`,
+    );
+    return { id, cookie: `${authCookies.sessionToken.name}=${signed}` };
   };
+
+  const cookieFor = async (userId: string): Promise<string> => (await sessionFor(userId)).cookie;
+
+  const sessionIdFor = async (userId: string): Promise<string> => (await sessionFor(userId)).id;
 
   return {
     cookieFor,
-    async operator(input = {}) {
+    sessionIdFor,
+    async actorFor(userId, currentOrganizationId = null) {
+      const state = await cfAuth.service.getAuthState(
+        await sessionIdFor(userId),
+        currentOrganizationId,
+      );
+
+      if (!state) {
+        throw new Error(`cf-auth/testing: no auth state for user ${userId}`);
+      }
+
+      return state;
+    },
+    async human(input = {}) {
       const { internalAdapter } = await context();
       const suffix = `${Date.now().toString(36)}-${(counter += 1)}`;
-      const email = input.email ?? `test-operator-${suffix}@example.test`;
+      const email = input.email ?? `test-human-${suffix}@example.test`;
       const name = input.name ?? email.split("@")[0]!;
-      const user = await internalAdapter.createUser({ email, name, emailVerified: true });
+      const user = await internalAdapter.createUser({
+        email,
+        name,
+        emailVerified: true,
+      });
 
       // Idempotent, and the same call better-auth's `user.create.after` hook
       // makes — so this works whether or not user creation ran the hook.
       await cfAuth.service.provisionNewUser(user);
-      const [membership] = await cfAuth.service.listOrganizations(user.id);
+      const [membership] = await cfAuth.repository.listOrganizationsForUser(user.id);
 
       if (!membership) {
         throw new Error(
           "cf-auth/testing: no organization was provisioned for the new user. " +
-            "`operator()` needs `organizations.autoProvisionDefaultOrganization`; " +
+            "`human()` needs `organizations.autoProvisionDefaultOrganization`; " +
             "use `cookieFor()` with your own organization otherwise.",
         );
       }
 
+      const session = await sessionFor(user.id);
       return {
         userId: user.id,
         organizationId: membership.organization.id,
-        cookie: await cookieFor(user.id),
+        cookie: session.cookie,
+        sessionId: session.id,
         user,
       };
     },

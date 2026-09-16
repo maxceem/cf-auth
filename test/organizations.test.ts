@@ -22,7 +22,7 @@ describe("organization membership and roles", () => {
     const organizationId = ownerOrg!.organization.id;
 
     await harness.cfAuth.service.addOrganizationMember({
-      actorUserId: owner.id,
+      actor: await harness.actorFor(owner.id),
       organizationId,
       userId: member.id,
       role: "member",
@@ -31,7 +31,10 @@ describe("organization membership and roles", () => {
     const membership = await harness.cfAuth.repository.findMembership(member.id, organizationId);
     expect(membership?.role).toBe("member");
 
-    const members = await harness.cfAuth.service.listOrganizationMembers(owner.id, organizationId);
+    const members = await harness.cfAuth.service.listOrganizationMembers({
+      actor: await harness.actorFor(owner.id),
+      organizationId,
+    });
     expect(members.map((entry) => entry.email).sort()).toEqual([
       "member@example.com",
       "owner@example.com",
@@ -46,7 +49,7 @@ describe("organization membership and roles", () => {
 
     const second = await harness.cfAuth.service.createOrganization(owner.id, "Second Org");
     const state = await harness.cfAuth.service.selectOrganization(
-      owner.id,
+      await harness.actorFor(owner.id),
       second.organization.id,
     );
 
@@ -55,7 +58,10 @@ describe("organization membership and roles", () => {
     expect(state.memberships).toHaveLength(2);
 
     await expect(
-      harness.cfAuth.service.selectOrganization(outsider.id, second.organization.id),
+      harness.cfAuth.service.selectOrganization(
+        await harness.actorFor(outsider.id),
+        second.organization.id,
+      ),
     ).rejects.toMatchObject({ code: "forbidden", status: 403 });
   });
 
@@ -63,7 +69,10 @@ describe("organization membership and roles", () => {
     const harness = await createTestAuth();
     const user = await createUser(harness, "fallback@example.com");
 
-    const state = await harness.cfAuth.service.getAuthState(user.id, "00000000-0000-0000-0000-000000000000");
+    const state = await harness.actorFor(
+      user.id,
+      "00000000-0000-0000-0000-000000000000",
+    );
 
     expect(state?.organization).not.toBeNull();
     expect(state?.role).toBe("owner");
@@ -78,14 +87,17 @@ describe("organization membership and roles", () => {
     const organizationId = ownerOrg!.organization.id;
 
     await harness.cfAuth.service.addOrganizationMember({
-      actorUserId: owner.id,
+      actor: await harness.actorFor(owner.id),
       organizationId,
       userId: member.id,
       role: "member",
     });
 
     await expect(
-      harness.cfAuth.service.listOrganizationMembers(member.id, organizationId),
+      harness.cfAuth.service.listOrganizationMembers({
+        actor: await harness.actorFor(member.id),
+        organizationId,
+      }),
     ).rejects.toBeInstanceOf(CfAuthError);
   });
 
@@ -99,13 +111,13 @@ describe("organization membership and roles", () => {
     const organizationId = ownerOrg!.organization.id;
 
     await harness.cfAuth.service.addOrganizationMember({
-      actorUserId: owner.id,
+      actor: await harness.actorFor(owner.id),
       organizationId,
       userId: admin.id,
       role: "admin",
     });
     await harness.cfAuth.service.addOrganizationMember({
-      actorUserId: owner.id,
+      actor: await harness.actorFor(owner.id),
       organizationId,
       userId: member.id,
       role: "member",
@@ -113,7 +125,7 @@ describe("organization membership and roles", () => {
 
     await expect(
       harness.cfAuth.service.updateOrganizationMemberRole({
-        actorUserId: admin.id,
+        actor: await harness.actorFor(admin.id),
         organizationId,
         userId: member.id,
         role: "owner",
@@ -121,7 +133,7 @@ describe("organization membership and roles", () => {
     ).rejects.toMatchObject({ code: "forbidden" });
 
     const promoted = await harness.cfAuth.service.updateOrganizationMemberRole({
-      actorUserId: admin.id,
+      actor: await harness.actorFor(admin.id),
       organizationId,
       userId: member.id,
       role: "admin",
@@ -138,14 +150,14 @@ describe("organization membership and roles", () => {
     const organizationId = ownerOrg!.organization.id;
 
     await harness.cfAuth.service.addOrganizationMember({
-      actorUserId: owner.id,
+      actor: await harness.actorFor(owner.id),
       organizationId,
       userId: member.id,
       role: "member",
     });
 
     const removed = await harness.cfAuth.service.removeOrganizationMember({
-      actorUserId: owner.id,
+      actor: await harness.actorFor(owner.id),
       organizationId,
       userId: member.id,
     });
@@ -156,7 +168,7 @@ describe("organization membership and roles", () => {
     // Removing someone who is not a member is a 404, matching role updates.
     await expect(
       harness.cfAuth.service.removeOrganizationMember({
-        actorUserId: owner.id,
+        actor: await harness.actorFor(owner.id),
         organizationId,
         userId: member.id,
       }),
@@ -186,9 +198,7 @@ describe("route guards", () => {
 
     expect(() => requireUser(state)).toThrow(CfAuthError);
     expect(() => requireUser(state)).toThrowError(expect.objectContaining({ status: 401 }));
-    expect(() => requireOrganization(state)).toThrowError(
-      expect.objectContaining({ status: 401 }),
-    );
+    expect(() => requireOrganization(state)).toThrowError(expect.objectContaining({ status: 401 }));
   });
 
   it("enforces a minimum role", async () => {
@@ -200,13 +210,16 @@ describe("route guards", () => {
     const organizationId = ownerOrg!.organization.id;
 
     await harness.cfAuth.service.addOrganizationMember({
-      actorUserId: owner.id,
+      actor: await harness.actorFor(owner.id),
       organizationId,
       userId: member.id,
       role: "member",
     });
 
-    const memberState = await harness.cfAuth.service.selectOrganization(member.id, organizationId);
+    const memberState = await harness.cfAuth.service.selectOrganization(
+      await harness.actorFor(member.id),
+      organizationId,
+    );
 
     expect(requireOrganization(memberState).role).toBe("member");
     expect(() => requireOrganization(memberState, "admin")).toThrowError(
@@ -216,7 +229,10 @@ describe("route guards", () => {
       expect.objectContaining({ status: 403 }),
     );
 
-    const ownerState = await harness.cfAuth.service.selectOrganization(owner.id, organizationId);
+    const ownerState = await harness.cfAuth.service.selectOrganization(
+      await harness.actorFor(owner.id),
+      organizationId,
+    );
     expect(requireOrganizationManager(ownerState).organization.id).toBe(organizationId);
   });
 });

@@ -36,7 +36,10 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
     {
       id: text("id").primaryKey(),
       name: text("name").notNull(),
-      email: text("email").notNull(),
+      email: text("email"),
+      kind: text("kind", { enum: ["human", "service"] })
+        .notNull()
+        .default("human"),
       emailVerified: integer("email_verified", { mode: "boolean" }).notNull().default(false),
       image: text("image"),
       createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
@@ -46,7 +49,13 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
     // lowercases on write, but a binary-collated index would still let a direct
     // insert (a seed script, an admin tool) create `A@x.com` alongside
     // `a@x.com` and silently split one person into two accounts.
-    (table) => [uniqueIndex(ix("idx_user_email")).on(sql`${table.email} COLLATE NOCASE`)],
+    (table) => [
+      uniqueIndex(ix("idx_user_email")).on(sql`${table.email} COLLATE NOCASE`),
+      check(
+        ix("user_kind_email_check"),
+        sql`(${table.kind} = 'human' and ${table.email} is not null) or (${table.kind} = 'service' and ${table.email} is null)`,
+      ),
+    ],
   );
 
   const session = sqliteTable(
@@ -81,8 +90,12 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
       accessToken: text("access_token"),
       refreshToken: text("refresh_token"),
       idToken: text("id_token"),
-      accessTokenExpiresAt: integer("access_token_expires_at", { mode: "timestamp_ms" }),
-      refreshTokenExpiresAt: integer("refresh_token_expires_at", { mode: "timestamp_ms" }),
+      accessTokenExpiresAt: integer("access_token_expires_at", {
+        mode: "timestamp_ms",
+      }),
+      refreshTokenExpiresAt: integer("refresh_token_expires_at", {
+        mode: "timestamp_ms",
+      }),
       scope: text("scope"),
       password: text("password"),
       createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
@@ -115,6 +128,7 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
   const organization = sqliteTable(t("organization"), {
     id: text("id").primaryKey(),
     name: text("name").notNull(),
+    expiresAt: text("expires_at"),
     createdByUserId: text("created_by_user_id")
       .notNull()
       .references(() => user.id),
@@ -155,23 +169,36 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
     t("api_key"),
     {
       id: text("id").primaryKey(),
+      userId: text("user_id")
+        .notNull()
+        .references(() => user.id, { onDelete: "cascade" }),
       organizationId: text("organization_id")
         .notNull()
         .references(() => organization.id, { onDelete: "cascade" }),
       name: text("name").notNull(),
       tokenHash: text("token_hash").notNull(),
-      // Nullable: keys minted before hints existed have no recoverable tail.
-      tokenHint: text("token_hint"),
-      createdAt: text("created_at").notNull(),
-      revokedAt: text("revoked_at"),
+      tokenHint: text("token_hint").notNull(),
+      enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+      expiresAt: integer("expires_at", { mode: "timestamp_ms" }),
+      createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+      revokedAt: integer("revoked_at", { mode: "timestamp_ms" }),
     },
     (table) => [
       uniqueIndex(ix("api_key_token_hash_unique")).on(table.tokenHash),
+      index(ix("idx_api_key_user_id")).on(table.userId),
       index(ix("idx_api_key_organization_id")).on(table.organizationId),
     ],
   );
 
-  return { user, session, account, verification, organization, organizationUser, apiKey };
+  return {
+    user,
+    session,
+    account,
+    verification,
+    organization,
+    organizationUser,
+    apiKey,
+  };
 };
 
 /**

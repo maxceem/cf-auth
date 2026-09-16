@@ -19,7 +19,7 @@ describe("requireUser vs API-key callers", () => {
 
     const key = await harness.cfAuth.service.createApiKey({
       organizationId,
-      actorUserId: user.id,
+      actor: await harness.actorFor(user.id),
       name: "Machine",
     });
 
@@ -28,12 +28,17 @@ describe("requireUser vs API-key callers", () => {
     app.get("/session-only", (c) => c.json(requireUser(c.get("authState"))));
     app.get("/either", (c) => c.json(requireOrganization(c.get("authState")).organization));
     app.onError((error, c) =>
-      c.json({ code: (error as { code?: string }).code }, (error as { status?: 200 }).status ?? 500),
+      c.json(
+        { code: (error as { code?: string }).code },
+        (error as { status?: 200 }).status ?? 500,
+      ),
     );
 
     const headers = { Authorization: `Bearer ${key.plaintext}` };
 
-    const sessionOnly = await app.request(`${testBaseUrl}/session-only`, { headers });
+    const sessionOnly = await app.request(`${testBaseUrl}/session-only`, {
+      headers,
+    });
     expect(sessionOnly.status).toBe(403);
     expect(await sessionOnly.json()).toEqual({ code: "session_required" });
 
@@ -56,7 +61,7 @@ describe("middleware options", () => {
 
     const key = await harness.cfAuth.service.createApiKey({
       organizationId: membership!.organization.id,
-      actorUserId: user.id,
+      actor: await harness.actorFor(user.id),
       name: "Ignored",
     });
 
@@ -69,15 +74,24 @@ describe("middleware options", () => {
     const headers = { Authorization: `Bearer ${key.plaintext}` };
 
     const closed = await (await app.request(`${testBaseUrl}/closed/me`, { headers })).json();
-    expect(closed).toMatchObject({ authenticated: false, credentialType: null });
+    expect(closed).toMatchObject({
+      authenticated: false,
+      credentialType: null,
+    });
 
     const open = await (await app.request(`${testBaseUrl}/open/me`, { headers })).json();
-    expect(open).toMatchObject({ authenticated: true, credentialType: "apiKey" });
+    expect(open).toMatchObject({
+      authenticated: true,
+      credentialType: "apiKey",
+    });
   });
 
   it("does not touch the cookie when syncCurrentOrganizationCookie is false", async () => {
     const harness = await createTestAuth();
-    await harness.signUp({ email: "nosync@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "nosync@example.com",
+      password: "correct-horse-battery",
+    });
     const cookieName = harness.cfAuth.currentOrganizationCookie.name;
 
     const app = new Hono<{ Variables: CfAuthVariables }>();
@@ -91,7 +105,10 @@ describe("middleware options", () => {
     const quiet = await app.request(`${testBaseUrl}/quiet/me`, { headers });
     expect(quiet.headers.get("set-cookie") ?? "").not.toContain(cookieName);
     // Auth state is still fully resolved; only the cookie write is suppressed.
-    expect(await quiet.json()).toMatchObject({ authenticated: true, role: "owner" });
+    expect(await quiet.json()).toMatchObject({
+      authenticated: true,
+      role: "owner",
+    });
 
     const loud = await app.request(`${testBaseUrl}/loud/me`, { headers });
     expect(loud.headers.get("set-cookie") ?? "").toContain(cookieName);
@@ -101,7 +118,10 @@ describe("middleware options", () => {
 describe("provisioning self-heal", () => {
   it("provisions a default organization on the next request when the signup hook did not", async () => {
     const harness = await createTestAuth();
-    await harness.signUp({ email: "selfheal@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "selfheal@example.com",
+      password: "correct-horse-battery",
+    });
 
     const user = await harness.cfAuth.repository.findUserByEmail("selfheal@example.com");
     const [provisioned] = await harness.cfAuth.repository.listOrganizationsForUser(user!.id);
@@ -133,13 +153,13 @@ describe("provisioning self-heal", () => {
 
     // Hand the org to a second owner, then leave it.
     await harness.cfAuth.service.addOrganizationMember({
-      actorUserId: removed.id,
+      actor: await harness.actorFor(removed.id),
       organizationId: defaultOrgId,
       userId: coOwner.id,
       role: "owner",
     });
     await harness.cfAuth.service.removeOrganizationMember({
-      actorUserId: coOwner.id,
+      actor: await harness.actorFor(coOwner.id),
       organizationId: defaultOrgId,
       userId: removed.id,
     });
@@ -147,7 +167,7 @@ describe("provisioning self-heal", () => {
     expect(await harness.cfAuth.repository.listOrganizationsForUser(removed.id)).toEqual([]);
 
     // Re-provisioning must NOT put them back into the org they left.
-    const state = await harness.cfAuth.service.getAuthState(removed.id, null);
+    const state = await harness.actorFor(removed.id);
     const healed = await harness.cfAuth.service.ensureDefaultOrganization(state!);
 
     expect(healed.organization).not.toBeNull();

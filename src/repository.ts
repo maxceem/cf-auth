@@ -1,4 +1,4 @@
-import { and, asc, count, eq, ne, or, sql } from "drizzle-orm";
+import { and, asc, count, eq, gt, isNull, ne, or, sql, type SQL } from "drizzle-orm";
 import { alias } from "drizzle-orm/sqlite-core";
 import type { CfAuthDatabase } from "./config.js";
 import { deterministicUuid } from "./crypto.js";
@@ -6,6 +6,7 @@ import { CfAuthError, conflict } from "./errors.js";
 import type { CfAuthTables } from "./schema.js";
 import type {
   ApiKeySummary,
+  AuthSession,
   AuthUser,
   OrganizationMember,
   OrganizationMembership,
@@ -106,14 +107,30 @@ const runAtomically = async (
   }
 };
 
-export interface ApiKeyAuthRecord extends ApiKeySummary {
-  organization: { id: string; name: string; createdAt: string };
-}
-
 export interface EnsureDefaultOrganizationResult {
   membership: OrganizationMembership;
   created: boolean;
 }
+
+/**
+ * The write behind {@link CfAuthRepository.claimOrganization}.
+ *
+ * `provisioning` describes the machine identity that created the organization:
+ * the claim only counts while that credential is still live, and `revokeAccess`
+ * decides whether it keeps its membership afterwards.
+ */
+export interface ClaimOrganizationWrite {
+  organizationId: string;
+  userId: string;
+  sessionId: string;
+  provisioning?: {
+    userId: string;
+    credentialId: string;
+    revokeAccess: boolean;
+  };
+}
+
+export type ApiKeyAuthRecord = ApiKeySummary;
 
 /**
  * All database access used by cf-auth, expressed as plain drizzle queries over
@@ -123,6 +140,13 @@ export interface EnsureDefaultOrganizationResult {
 export interface CfAuthRepository {
   findUserById(userId: string): Promise<AuthUser | null>;
   findUserByEmail(email: string): Promise<AuthUser | null>;
+  /**
+   * The session row behind a cookie, or null when it is unknown or expired.
+   *
+   * This is the evidence an interactive {@link AuthState} is built on: without
+   * it, a user id alone would be enough to mint one.
+   */
+  findActiveSession(sessionId: string, now: Date): Promise<AuthSession | null>;
 
   listOrganizationsForUser(userId: string): Promise<OrganizationMembership[]>;
   findMembership(userId: string, organizationId: string): Promise<OrganizationMembership | null>;
@@ -142,6 +166,17 @@ export interface CfAuthRepository {
     userId: string;
     name: string;
   }): Promise<OrganizationMembership>;
+  /**
+   * Hands an organization that no person owns yet to one, clearing the
+   * provisional deadline in the same transaction.
+   *
+   * Idempotent: every statement carries its own guard, so a repeated call
+   * settles on the same state and answers with the same membership. Returns
+   * null when the claim did not happen — the organization is already someone
+   * else's, its deadline has passed, the session is not live, or the
+   * provisioning credential is not.
+   */
+  claimOrganization(input: ClaimOrganizationWrite): Promise<OrganizationMembership | null>;
   ensureDefaultOrganizationWithOwner(input: {
     userId: string;
     name: string;
@@ -169,15 +204,28 @@ export interface CfAuthRepository {
   }): Promise<MembershipMutationResult>;
 
   createApiKey(input: {
+    userId: string;
     organizationId: string;
     name: string;
     tokenHash: string;
     tokenHint: string;
+    enabled: boolean;
+    expiresAt: Date | null;
   }): Promise<ApiKeySummary>;
   listApiKeys(organizationId: string): Promise<ApiKeySummary[]>;
+  /**
+   * Activates a key issued with `enabled: false`, and answers with the key as
+   * it stands afterwards — so a caller reads `enabled` rather than assuming.
+   *
+   * Refuses a key that has been revoked or has expired, and one whose
+   * organization is past its deadline, matching what
+   * {@link CfAuthRepository.findActiveApiKeyByHash} would accept. Null means no
+   * such key in this organization.
+   */
+  enableApiKey(apiKeyId: string, organizationId: string, now: Date): Promise<ApiKeySummary | null>;
   revokeApiKey(apiKeyId: string, organizationId: string): Promise<ApiKeySummary | null>;
   findApiKeyById(apiKeyId: string, organizationId: string): Promise<ApiKeySummary | null>;
-  findActiveApiKeyByHash(tokenHash: string): Promise<ApiKeyAuthRecord | null>;
+  findActiveApiKeyByHash(tokenHash: string, now: Date): Promise<ApiKeyAuthRecord | null>;
 }
 
 export const createCfAuthRepository = (
@@ -185,7 +233,7 @@ export const createCfAuthRepository = (
   tables: CfAuthTables,
   options: CfAuthRepositoryOptions = {},
 ): CfAuthRepository => {
-  const { user, organization, organizationUser, apiKey } = tables;
+  const { user, session, organization, organizationUser, apiKey } = tables;
 
   const onError =
     options.onError ??
@@ -195,6 +243,32 @@ export const createCfAuthRepository = (
 
   // Aliased so the guard subquery is unambiguous against the row being written.
   const ownerGuard = alias(organizationUser, "cf_auth_owner_guard");
+  const organizationGuard = alias(organization, "cf_auth_organization_guard");
+  const credentialGuard = alias(apiKey, "cf_auth_credential_guard");
+
+  /** Renders a guard subquery as `(select count(*) ...) = n`, ready to AND into a WHERE. */
+  const countIs = (query: { getSQL(): SQL }, expected: number) =>
+    sql`(${query}) = ${expected}`;
+
+  /**
+   * True while the organization is inside its provisional deadline.
+   *
+   * `expiresAt` is stored as an ISO-8601 instant, which sorts as text, so the
+   * comparison is the same one a timestamp column would make.
+   */
+  const organizationUsable = (organizationId: string, now: Date) =>
+    countIs(
+      db
+        .select({ value: count() })
+        .from(organizationGuard)
+        .where(
+          and(
+            eq(organizationGuard.id, organizationId),
+            or(isNull(organizationGuard.expiresAt), gt(organizationGuard.expiresAt, now.toISOString())),
+          ),
+        ),
+      1,
+    );
 
   /**
    * True when this organization would still have an owner after the target row
@@ -213,11 +287,32 @@ export const createCfAuthRepository = (
       .from(ownerGuard)
       .where(and(eq(ownerGuard.organizationId, organizationId), eq(ownerGuard.role, "owner")));
 
-    return or(ne(organizationUser.role, "owner"), sql`(${otherOwners}) > 1`);
+    const humanOwners = db
+      .select({ value: count() })
+      .from(ownerGuard)
+      .innerJoin(user, eq(user.id, ownerGuard.userId))
+      .where(
+        and(
+          eq(ownerGuard.organizationId, organizationId),
+          eq(ownerGuard.role, "owner"),
+          eq(user.kind, "human"),
+        ),
+      );
+    const targetKind = db
+      .select({ kind: user.kind })
+      .from(user)
+      .where(eq(user.id, organizationUser.userId));
+    return or(
+      ne(organizationUser.role, "owner"),
+      sql`CASE WHEN (${targetKind}) = 'human'
+      THEN (${humanOwners}) > 1
+      ELSE (${otherOwners}) > 1 END`,
+    );
   };
 
   const userColumns = {
     id: user.id,
+    kind: user.kind,
     name: user.name,
     email: user.email,
     emailVerified: user.emailVerified,
@@ -228,12 +323,14 @@ export const createCfAuthRepository = (
   const toAuthUser = (row: {
     id: string;
     name: string | null;
-    email: string;
+    email: string | null;
+    kind: "human" | "service";
     emailVerified: boolean;
     image: string | null;
     createdAt: Date | string | number;
   }): AuthUser => ({
     id: row.id,
+    kind: row.kind,
     name: row.name,
     email: row.email,
     emailVerified: Boolean(row.emailVerified),
@@ -248,6 +345,14 @@ export const createCfAuthRepository = (
     organizationId: organization.id,
     organizationName: organization.name,
     organizationCreatedAt: organization.createdAt,
+    claimed: sql<boolean>`EXISTS (
+      SELECT 1 FROM ${organizationUser} claimed_membership
+      JOIN ${user} claimed_user ON claimed_user.id = claimed_membership.user_id
+      WHERE claimed_membership.organization_id = ${organization.id}
+        AND claimed_membership.role = 'owner'
+        AND claimed_user.kind = 'human'
+    )`,
+    expiresAt: organization.expiresAt,
   };
 
   const toMembership = (row: {
@@ -257,11 +362,15 @@ export const createCfAuthRepository = (
     organizationId: string;
     organizationName: string;
     organizationCreatedAt: string;
+    claimed: boolean | number;
+    expiresAt: string | null;
   }): OrganizationMembership => ({
     role: row.role,
     status: row.status,
     joinedAt: row.joinedAt,
     organization: {
+      claimed: Boolean(row.claimed),
+      expiresAt: row.expiresAt,
       id: row.organizationId,
       name: row.organizationName,
       createdAt: row.organizationCreatedAt,
@@ -271,10 +380,36 @@ export const createCfAuthRepository = (
   const apiKeyColumns = {
     id: apiKey.id,
     organizationId: apiKey.organizationId,
+    userId: apiKey.userId,
     name: apiKey.name,
     tokenHint: apiKey.tokenHint,
+    enabled: apiKey.enabled,
     createdAt: apiKey.createdAt,
     revokedAt: apiKey.revokedAt,
+    expiresAt: apiKey.expiresAt,
+  };
+  const toApiKeySummary = (row: {
+    id: string;
+    organizationId: string;
+    userId: string;
+    name: string;
+    tokenHint: string;
+    enabled: boolean | number;
+    createdAt: Date;
+    revokedAt: Date | null;
+    expiresAt: Date | null;
+  }): ApiKeySummary => {
+    return {
+      id: row.id,
+      organizationId: row.organizationId,
+      userId: row.userId,
+      name: row.name,
+      tokenHint: row.tokenHint,
+      enabled: Boolean(row.enabled),
+      createdAt: toIso(row.createdAt),
+      expiresAt: row.expiresAt ? toIso(row.expiresAt) : null,
+      revokedAt: row.revokedAt ? toIso(row.revokedAt) : null,
+    };
   };
 
   const findMembership = async (userId: string, organizationId: string) => {
@@ -337,7 +472,15 @@ export const createCfAuthRepository = (
       role: "owner",
       status: "active",
       joinedAt: now,
-      organization: { id: organizationId, name: input.name, createdAt: now },
+      organization: {
+        id: organizationId,
+        name: input.name,
+        createdAt: now,
+        claimed:
+          (await db.select({ kind: user.kind }).from(user).where(eq(user.id, input.userId)).get())
+            ?.kind === "human",
+        expiresAt: null,
+      },
     };
   };
 
@@ -345,6 +488,15 @@ export const createCfAuthRepository = (
     async findUserById(userId) {
       const row = await db.select(userColumns).from(user).where(eq(user.id, userId)).get();
       return row ? toAuthUser(row) : null;
+    },
+
+    async findActiveSession(sessionId, now) {
+      const row = await db
+        .select({ id: session.id, userId: session.userId, expiresAt: session.expiresAt })
+        .from(session)
+        .where(and(eq(session.id, sessionId), gt(session.expiresAt, now)))
+        .get();
+      return row ? { id: row.id, userId: row.userId, expiresAt: toIso(row.expiresAt) } : null;
     },
 
     async findUserByEmail(email) {
@@ -406,6 +558,166 @@ export const createCfAuthRepository = (
 
     createOrganizationWithOwner,
 
+    async claimOrganization(input) {
+      const now = new Date();
+      const nowIso = now.toISOString();
+
+      // What lets a person take the organization over. Every part is checked
+      // inside the statements themselves rather than by a preceding read, so
+      // two people racing to claim the same organization cannot both pass.
+      const entry = and(
+        organizationUsable(input.organizationId, now),
+        // Nobody else has claimed it. Phrased as "no *other* human owner" so a
+        // repeat of a claim that already succeeded is a no-op, not a refusal.
+        countIs(
+          db
+            .select({ value: count() })
+            .from(ownerGuard)
+            .innerJoin(user, eq(user.id, ownerGuard.userId))
+            .where(
+              and(
+                eq(ownerGuard.organizationId, input.organizationId),
+                eq(ownerGuard.role, "owner"),
+                eq(user.kind, "human"),
+                ne(ownerGuard.userId, input.userId),
+              ),
+            ),
+          0,
+        ),
+        // The claimer's own session, re-read here rather than trusted from the
+        // caller: this is the one write that hands an organization to a person.
+        countIs(
+          db
+            .select({ value: count() })
+            .from(session)
+            .innerJoin(user, eq(user.id, session.userId))
+            .where(
+              and(
+                eq(session.id, input.sessionId),
+                eq(session.userId, input.userId),
+                gt(session.expiresAt, now),
+                eq(user.kind, "human"),
+              ),
+            ),
+          1,
+        ),
+        ...(input.provisioning
+          ? [
+              countIs(
+                db
+                  .select({ value: count() })
+                  .from(credentialGuard)
+                  .where(
+                    and(
+                      eq(credentialGuard.id, input.provisioning.credentialId),
+                      eq(credentialGuard.userId, input.provisioning.userId),
+                      eq(credentialGuard.organizationId, input.organizationId),
+                      eq(credentialGuard.enabled, true),
+                      isNull(credentialGuard.revokedAt),
+                      or(isNull(credentialGuard.expiresAt), gt(credentialGuard.expiresAt, now)),
+                    ),
+                  ),
+                1,
+              ),
+            ]
+          : []),
+      )!;
+
+      // Everything after the promotion keys off the promotion itself, not off
+      // `entry` again: the earlier statements deliberately change what `entry`
+      // sees, and a repeated call must still finish the parts it did not reach.
+      const claimed = countIs(
+        db
+          .select({ value: count() })
+          .from(ownerGuard)
+          .where(
+            and(
+              eq(ownerGuard.organizationId, input.organizationId),
+              eq(ownerGuard.userId, input.userId),
+              eq(ownerGuard.role, "owner"),
+            ),
+          ),
+        1,
+      );
+
+      const statements: unknown[] = [
+        // `insert ... select ... where` rather than `values`: a WHERE clause is
+        // the only way to make the grant itself carry the guard.
+        db
+          .insert(organizationUser)
+          .select(
+            sql`select ${crypto.randomUUID()}, ${input.organizationId}, ${input.userId}, 'owner', 'active', ${nowIso} where ${entry}`,
+          )
+          .onConflictDoNothing({
+            target: [organizationUser.organizationId, organizationUser.userId],
+          }),
+        db
+          .update(organizationUser)
+          .set({ role: "owner", status: "active" })
+          .where(
+            and(
+              eq(organizationUser.organizationId, input.organizationId),
+              eq(organizationUser.userId, input.userId),
+              entry,
+            ),
+          ),
+        db
+          .update(organization)
+          .set({ expiresAt: null, updatedAt: nowIso })
+          .where(and(eq(organization.id, input.organizationId), claimed)),
+      ];
+
+      if (input.provisioning?.revokeAccess) {
+        const { userId: provisioningUserId } = input.provisioning;
+        // Only ever the machine identity that provisioned the organization; a
+        // person's membership is never collateral of someone else's claim.
+        const isService = countIs(
+          db
+            .select({ value: count() })
+            .from(user)
+            .where(and(eq(user.id, provisioningUserId), eq(user.kind, "service"))),
+          1,
+        );
+
+        statements.push(
+          db
+            .update(apiKey)
+            .set({ enabled: false, revokedAt: now })
+            .where(
+              and(
+                eq(apiKey.organizationId, input.organizationId),
+                eq(apiKey.userId, provisioningUserId),
+                isNull(apiKey.revokedAt),
+                claimed,
+                isService,
+              ),
+            ),
+          db
+            .delete(organizationUser)
+            .where(
+              and(
+                eq(organizationUser.organizationId, input.organizationId),
+                eq(organizationUser.userId, provisioningUserId),
+                claimed,
+                isService,
+              ),
+            ),
+        );
+      }
+
+      // No compensation to hand `runAtomically`: every statement carries its own
+      // guard and is a no-op once it has run, so a driver without `batch` that
+      // fails halfway leaves a state the next call simply finishes.
+      await runAtomically(db, statements, async () => {}, onError);
+
+      // The outcome is read from the rows, not from how many changed: a repeat
+      // of a claim that already landed changes nothing and is still a success.
+      const membership = await findMembership(input.userId, input.organizationId);
+      return membership?.role === "owner" && membership.organization.expiresAt === null
+        ? membership
+        : null;
+    },
+
     async ensureDefaultOrganizationWithOwner(input) {
       const now = new Date().toISOString();
 
@@ -415,11 +727,7 @@ export const createCfAuthRepository = (
       // pure function of the user id, two concurrent re-provisions target the
       // same row and `on conflict do nothing` settles it — a random id would
       // let them mint two organizations.
-      for (
-        let generation = 0;
-        generation < maxDefaultOrganizationGenerations;
-        generation += 1
-      ) {
+      for (let generation = 0; generation < maxDefaultOrganizationGenerations; generation += 1) {
         const suffix = generation === 0 ? "" : `:${generation}`;
         const organizationId = await deterministicUuid(
           `default-organization:${input.userId}${suffix}`,
@@ -481,7 +789,15 @@ export const createCfAuthRepository = (
               role: "owner",
               status: "active",
               joinedAt: inserted[0]?.joinedAt ?? now,
-              organization: { id: organizationId, name: input.name, createdAt: now },
+              organization: {
+                id: organizationId,
+                name: input.name,
+                createdAt: now,
+                claimed:
+                  (await db.select({ kind: user.kind }).from(user).where(eq(user.id, input.userId)).get())
+                    ?.kind === "human",
+                expiresAt: null,
+              },
             },
           };
         }
@@ -497,7 +813,10 @@ export const createCfAuthRepository = (
 
       // Every slot is taken by an organization the user has left. Vanishingly
       // unlikely, but fall back to a unique organization rather than looping.
-      return { membership: await createOrganizationWithOwner(input), created: true };
+      return {
+        membership: await createOrganizationWithOwner(input),
+        created: true,
+      };
     },
 
     async addOrganizationUser(input) {
@@ -565,9 +884,7 @@ export const createCfAuthRepository = (
 
       const membership = await findMembership(input.userId, input.organizationId);
 
-      return membership
-        ? { ok: true, membership }
-        : { ok: false, reason: "not_a_member" as const };
+      return membership ? { ok: true, membership } : { ok: false, reason: "not_a_member" as const };
     },
 
     async removeOrganizationUser(input) {
@@ -598,61 +915,66 @@ export const createCfAuthRepository = (
     },
 
     async createApiKey(input) {
-      const now = new Date().toISOString();
       const id = crypto.randomUUID();
-
-      await db.insert(apiKey).values({
-        id,
-        organizationId: input.organizationId,
-        name: input.name,
-        tokenHash: input.tokenHash,
-        tokenHint: input.tokenHint,
-        createdAt: now,
-        revokedAt: null,
-      });
-
+      const createdAt = new Date();
+      await db.insert(apiKey).values({ id, ...input, createdAt, revokedAt: null });
       return {
         id,
+        userId: input.userId,
         organizationId: input.organizationId,
         name: input.name,
         tokenHint: input.tokenHint,
-        createdAt: now,
+        enabled: input.enabled,
+        expiresAt: input.expiresAt?.toISOString() ?? null,
+        createdAt: createdAt.toISOString(),
         revokedAt: null,
       };
     },
 
     async listApiKeys(organizationId) {
-      return db
+      const rows = await db
         .select(apiKeyColumns)
         .from(apiKey)
         .where(eq(apiKey.organizationId, organizationId))
         .orderBy(asc(apiKey.createdAt), asc(apiKey.id));
+      return rows.map(toApiKeySummary);
     },
-
     async findApiKeyById(apiKeyId, organizationId) {
       const row = await db
         .select(apiKeyColumns)
         .from(apiKey)
         .where(and(eq(apiKey.id, apiKeyId), eq(apiKey.organizationId, organizationId)))
         .get();
-
-      return row ?? null;
+      return row ? toApiKeySummary(row) : null;
     },
-
-    async revokeApiKey(apiKeyId, organizationId) {
-      const existing = await db
+    async enableApiKey(apiKeyId, organizationId, now) {
+      await db
+        .update(apiKey)
+        .set({ enabled: true })
+        .where(
+          and(
+            eq(apiKey.id, apiKeyId),
+            eq(apiKey.organizationId, organizationId),
+            isNull(apiKey.revokedAt),
+            or(isNull(apiKey.expiresAt), gt(apiKey.expiresAt, now)),
+            organizationUsable(organizationId, now),
+          ),
+        );
+      const row = await db
         .select(apiKeyColumns)
         .from(apiKey)
         .where(and(eq(apiKey.id, apiKeyId), eq(apiKey.organizationId, organizationId)))
         .get();
+      return row ? toApiKeySummary(row) : null;
+    },
 
-      if (!existing || existing.revokedAt) {
-        return existing ?? null;
-      }
-
+    async revokeApiKey(apiKeyId, organizationId) {
       await db
         .update(apiKey)
-        .set({ revokedAt: new Date().toISOString() })
+        .set({
+          enabled: false,
+          revokedAt: new Date(),
+        })
         .where(
           and(
             eq(apiKey.id, apiKeyId),
@@ -660,45 +982,28 @@ export const createCfAuthRepository = (
             sql`${apiKey.revokedAt} is null`,
           ),
         );
-
       const row = await db
         .select(apiKeyColumns)
         .from(apiKey)
         .where(and(eq(apiKey.id, apiKeyId), eq(apiKey.organizationId, organizationId)))
         .get();
-
-      return row ?? null;
+      return row ? toApiKeySummary(row) : null;
     },
 
-    async findActiveApiKeyByHash(tokenHash) {
+    async findActiveApiKeyByHash(tokenHash, now) {
       const row = await db
-        .select({
-          ...apiKeyColumns,
-          organizationName: organization.name,
-          organizationCreatedAt: organization.createdAt,
-        })
+        .select(apiKeyColumns)
         .from(apiKey)
-        .innerJoin(organization, eq(organization.id, apiKey.organizationId))
-        .where(and(eq(apiKey.tokenHash, tokenHash), sql`${apiKey.revokedAt} is null`))
+        .where(
+          and(
+            eq(apiKey.tokenHash, tokenHash),
+            eq(apiKey.enabled, true),
+            isNull(apiKey.revokedAt),
+            or(isNull(apiKey.expiresAt), gt(apiKey.expiresAt, now)),
+          ),
+        )
         .get();
-
-      if (!row) {
-        return null;
-      }
-
-      return {
-        id: row.id,
-        organizationId: row.organizationId,
-        name: row.name,
-        tokenHint: row.tokenHint,
-        createdAt: row.createdAt,
-        revokedAt: row.revokedAt,
-        organization: {
-          id: row.organizationId,
-          name: row.organizationName,
-          createdAt: row.organizationCreatedAt,
-        },
-      };
+      return row ? toApiKeySummary(row) : null;
     },
   };
 };

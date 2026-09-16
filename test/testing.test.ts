@@ -7,7 +7,7 @@ describe("cf-auth/testing", () => {
     const harness = await createTestAuth();
     const sessions = createTestSessions(harness.cfAuth);
 
-    const operator = await sessions.operator({ email: "minted@example.com" });
+    const operator = await sessions.human({ email: "minted@example.com" });
     const state = await harness.me({
       headers: { Cookie: operator.cookie },
       useJar: false,
@@ -26,13 +26,16 @@ describe("cf-auth/testing", () => {
     const harness = await createTestAuth();
     const sessions = createTestSessions(harness.cfAuth);
 
-    const [first, second] = [await sessions.operator(), await sessions.operator()];
+    const [first, second] = [await sessions.human(), await sessions.human()];
 
     expect(first.userId).not.toBe(second.userId);
     expect(first.organizationId).not.toBe(second.organizationId);
 
     for (const operator of [first, second]) {
-      const state = await harness.me({ headers: { Cookie: operator.cookie }, useJar: false });
+      const state = await harness.me({
+        headers: { Cookie: operator.cookie },
+        useJar: false,
+      });
       expect(state.organization?.id).toBe(operator.organizationId);
     }
   });
@@ -52,11 +55,17 @@ describe("cf-auth/testing", () => {
       password: "correct-horse-battery",
     });
     const realCookie = (signUp.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
-    const [realName, realValue] = [realCookie.slice(0, realCookie.indexOf("=")), realCookie.slice(realCookie.indexOf("=") + 1)];
+    const [realName, realValue] = [
+      realCookie.slice(0, realCookie.indexOf("=")),
+      realCookie.slice(realCookie.indexOf("=") + 1),
+    ];
 
     const user = await harness.cfAuth.repository.findUserByEmail("roundtrip@example.com");
     const minted = await createTestSessions(harness.cfAuth).cookieFor(user!.id);
-    const [mintedName, mintedValue] = [minted.slice(0, minted.indexOf("=")), minted.slice(minted.indexOf("=") + 1)];
+    const [mintedName, mintedValue] = [
+      minted.slice(0, minted.indexOf("=")),
+      minted.slice(minted.indexOf("=") + 1),
+    ];
 
     expect(mintedName).toBe(realName);
     // Same shape: a token and a signature, URL-encoded, differing only in the
@@ -67,14 +76,17 @@ describe("cf-auth/testing", () => {
     expect(halves(mintedValue)[0]).not.toBe(halves(realValue)[0]);
 
     // And the real proof: the middleware accepts it.
-    const state = await harness.me({ headers: { Cookie: minted }, useJar: false });
+    const state = await harness.me({
+      headers: { Cookie: minted },
+      useJar: false,
+    });
     expect(state.user?.id).toBe(user!.id);
   });
 
   it("signs a fresh token every time, so nothing is reusable between tests", async () => {
     const harness = await createTestAuth();
     const sessions = createTestSessions(harness.cfAuth);
-    const operator = await sessions.operator();
+    const operator = await sessions.human();
 
     const [first, second] = [
       await sessions.cookieFor(operator.userId),

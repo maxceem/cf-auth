@@ -19,20 +19,26 @@ CREATE INDEX `idx_account_user_id` ON `user_account` (`user_id`);--> statement-b
 CREATE UNIQUE INDEX `idx_account_provider_account` ON `user_account` (`provider_id`,`account_id`);--> statement-breakpoint
 CREATE TABLE `api_key` (
 	`id` text PRIMARY KEY NOT NULL,
+	`user_id` text NOT NULL,
 	`organization_id` text NOT NULL,
 	`name` text NOT NULL,
 	`token_hash` text NOT NULL,
-	`token_hint` text,
-	`created_at` text NOT NULL,
-	`revoked_at` text,
+	`token_hint` text NOT NULL,
+	`enabled` integer DEFAULT true NOT NULL,
+	`expires_at` integer,
+	`created_at` integer NOT NULL,
+	`revoked_at` integer,
+	FOREIGN KEY (`user_id`) REFERENCES `user`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`organization_id`) REFERENCES `organization`(`id`) ON UPDATE no action ON DELETE cascade
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `api_key_token_hash_unique` ON `api_key` (`token_hash`);--> statement-breakpoint
+CREATE INDEX `idx_api_key_user_id` ON `api_key` (`user_id`);--> statement-breakpoint
 CREATE INDEX `idx_api_key_organization_id` ON `api_key` (`organization_id`);--> statement-breakpoint
 CREATE TABLE `organization` (
 	`id` text PRIMARY KEY NOT NULL,
 	`name` text NOT NULL,
+	`expires_at` text,
 	`created_by_user_id` text NOT NULL,
 	`created_at` text NOT NULL,
 	`updated_at` text NOT NULL,
@@ -72,11 +78,13 @@ CREATE INDEX `idx_session_user_id` ON `user_session` (`user_id`);--> statement-b
 CREATE TABLE `user` (
 	`id` text PRIMARY KEY NOT NULL,
 	`name` text NOT NULL,
-	`email` text NOT NULL,
+	`email` text,
+	`kind` text DEFAULT 'human' NOT NULL,
 	`email_verified` integer DEFAULT false NOT NULL,
 	`image` text,
 	`created_at` integer NOT NULL,
-	`updated_at` integer NOT NULL
+	`updated_at` integer NOT NULL,
+	CONSTRAINT "user_kind_email_check" CHECK(("user"."kind" = 'human' and "user"."email" is not null) or ("user"."kind" = 'service' and "user"."email" is null))
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `idx_user_email` ON `user` ("email" COLLATE NOCASE);--> statement-breakpoint

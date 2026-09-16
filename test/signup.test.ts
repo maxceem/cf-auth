@@ -5,7 +5,10 @@ describe("signup provisioning", () => {
   it("creates the user and a default organization owned by them", async () => {
     const harness = await createTestAuth();
 
-    await harness.signUp({ email: "owner@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "owner@example.com",
+      password: "correct-horse-battery",
+    });
 
     const user = await harness.cfAuth.repository.findUserByEmail("owner@example.com");
     expect(user).not.toBeNull();
@@ -23,7 +26,10 @@ describe("signup provisioning", () => {
   it("emits user.signup and organization.created events", async () => {
     const harness = await createTestAuth();
 
-    await harness.signUp({ email: "events@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "events@example.com",
+      password: "correct-horse-battery",
+    });
 
     expect(harness.events.map((event) => event.type)).toEqual([
       "user.signup",
@@ -37,9 +43,15 @@ describe("signup provisioning", () => {
   it("gives each user their own organization", async () => {
     const harness = await createTestAuth();
 
-    await harness.signUp({ email: "first@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "first@example.com",
+      password: "correct-horse-battery",
+    });
     harness.jar.clear();
-    await harness.signUp({ email: "second@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "second@example.com",
+      password: "correct-horse-battery",
+    });
 
     const first = await harness.cfAuth.repository.findUserByEmail("first@example.com");
     const second = await harness.cfAuth.repository.findUserByEmail("second@example.com");
@@ -55,11 +67,14 @@ describe("signup provisioning", () => {
   it("honours a configured default organization name function", async () => {
     const harness = await createTestAuth({
       organizations: {
-        defaultOrganizationName: (user) => `${user.email.split("@")[0]}'s workspace`,
+        defaultOrganizationName: (user) => `${user.email!.split("@")[0]}'s workspace`,
       },
     });
 
-    await harness.signUp({ email: "dana@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "dana@example.com",
+      password: "correct-horse-battery",
+    });
 
     const user = await harness.cfAuth.repository.findUserByEmail("dana@example.com");
     const memberships = await harness.cfAuth.repository.listOrganizationsForUser(user!.id);
@@ -72,7 +87,10 @@ describe("signup provisioning", () => {
       organizations: { autoProvisionDefaultOrganization: false },
     });
 
-    await harness.signUp({ email: "solo@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "solo@example.com",
+      password: "correct-horse-battery",
+    });
 
     const user = await harness.cfAuth.repository.findUserByEmail("solo@example.com");
     expect(await harness.cfAuth.repository.listOrganizationsForUser(user!.id)).toEqual([]);
@@ -86,7 +104,10 @@ describe("signup provisioning", () => {
   it("is idempotent — re-provisioning the same user does not create a second org", async () => {
     const harness = await createTestAuth();
 
-    await harness.signUp({ email: "repeat@example.com", password: "correct-horse-battery" });
+    await harness.signUp({
+      email: "repeat@example.com",
+      password: "correct-horse-battery",
+    });
     const user = await harness.cfAuth.repository.findUserByEmail("repeat@example.com");
 
     await harness.cfAuth.service.provisionNewUser(user!);

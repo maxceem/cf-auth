@@ -5,6 +5,7 @@ import { drizzle } from "drizzle-orm/libsql";
 import { Hono } from "hono";
 import { afterEach } from "vitest";
 import { createCfAuth } from "../src/cf-auth.js";
+import { createTestSessions } from "../src/testing.js";
 import type { CfAuthConfig, CfAuthDatabase } from "../src/config.js";
 import type { CfAuthVariables } from "../src/middleware.js";
 import { cfAuthTables } from "../src/schema.js";
@@ -21,7 +22,9 @@ const statementBreakpoint = "--> statement-breakpoint";
  * comma-splitting fallback.
  */
 const readSetCookies = (headers: Headers): string[] => {
-  const withGetSetCookie = headers as unknown as { getSetCookie?: () => string[] };
+  const withGetSetCookie = headers as unknown as {
+    getSetCookie?: () => string[];
+  };
 
   if (typeof withGetSetCookie.getSetCookie === "function") {
     return withGetSetCookie.getSetCookie();
@@ -59,12 +62,11 @@ const applyMigrations = async (client: Client) => {
   for (const fileName of fileNames) {
     const sql = await readFile(`${migrationsDirectory}${fileName}`, "utf8");
 
-    for (const statement of sql
+    const statements = sql
       .split(statementBreakpoint)
       .map((value) => value.trim())
-      .filter(Boolean)) {
-      await client.execute(statement);
-    }
+      .filter(Boolean);
+    await client.batch(statements, "write");
   }
 };
 
@@ -119,7 +121,9 @@ export const createTestAuth = async (overrides: TestOverrides = {}) => {
   openClients.add(client);
   await applyMigrations(client);
 
-  const db = drizzle(client, { schema: cfAuthTables }) as unknown as CfAuthDatabase;
+  const db = drizzle(client, {
+    schema: cfAuthTables,
+  }) as unknown as CfAuthDatabase;
   const events: CfAuthEvent[] = [];
   const errors: unknown[] = [];
 
@@ -146,6 +150,16 @@ export const createTestAuth = async (overrides: TestOverrides = {}) => {
   app.get("/api/me", (c) => c.json(c.get("authState")));
 
   const jar = new CookieJar();
+  const sessions = createTestSessions(cfAuth);
+
+  /**
+   * The `AuthState` a signed-in request for this user would resolve to.
+   *
+   * Service methods take an actor, and an actor is only interactive while a
+   * session backs it — so this mints one rather than naming a user id.
+   */
+  const actorFor = async (userId: string, currentOrganizationId: string | null = null) =>
+    sessions.actorFor(userId, currentOrganizationId);
 
   /** Issues a request through the Hono app, replaying and absorbing cookies. */
   const request = async (
@@ -181,7 +195,11 @@ export const createTestAuth = async (overrides: TestOverrides = {}) => {
 
   const signUp = async (input: { email: string; password: string; name?: string }) => {
     const response = await request(`${cfAuth.basePath}/sign-up/email`, {
-      json: { email: input.email, password: input.password, name: input.name ?? input.email },
+      json: {
+        email: input.email,
+        password: input.password,
+        name: input.name ?? input.email,
+      },
     });
 
     if (!response.ok) {
@@ -192,7 +210,9 @@ export const createTestAuth = async (overrides: TestOverrides = {}) => {
   };
 
   const signIn = async (input: { email: string; password: string }) => {
-    const response = await request(`${cfAuth.basePath}/sign-in/email`, { json: input });
+    const response = await request(`${cfAuth.basePath}/sign-in/email`, {
+      json: input,
+    });
 
     if (!response.ok) {
       throw new Error(`sign-in failed (${response.status}): ${await response.text()}`);
@@ -215,6 +235,8 @@ export const createTestAuth = async (overrides: TestOverrides = {}) => {
     events,
     errors,
     request,
+    sessions,
+    actorFor,
     signUp,
     signIn,
     me,

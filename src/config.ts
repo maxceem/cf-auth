@@ -75,6 +75,11 @@ export interface EmailAndPasswordConfig {
   requireEmailVerification?: boolean;
 }
 
+export interface UserHooksConfig {
+  /** Runs immediately before Better Auth persists a new human identity. */
+  beforeCreate?: (user: AuthUser) => void | Promise<void>;
+}
+
 export interface CookieConfig {
   /**
    * Namespace for every cookie this package owns. better-auth cookies become
@@ -127,6 +132,8 @@ export interface CfAuthConfig {
 
   /** Reject creation of every new Better Auth user while preserving sign-in for existing users. */
   disableSignUp?: boolean;
+
+  userHooks?: UserHooksConfig;
 
   emailAndPassword?: EmailAndPasswordConfig;
   google?: GoogleOAuthConfig;
@@ -181,6 +188,7 @@ export interface ResolvedCfAuthConfig {
   basePath: string;
   trustedOrigins: string[];
   disableSignUp: boolean;
+  userHooks: UserHooksConfig;
   emailAndPassword: Required<EmailAndPasswordConfig>;
   google: GoogleOAuthConfig | undefined;
   oauthProxy: OAuthProxyConfig | undefined;
@@ -243,8 +251,8 @@ export const resolveConfig = (config: CfAuthConfig): ResolvedCfAuthConfig => {
       throw validationError("`oauthProxy.secret` is required");
     }
     if (
-      config.oauthProxy.maxAge !== undefined
-      && (!Number.isFinite(config.oauthProxy.maxAge) || config.oauthProxy.maxAge <= 0)
+      config.oauthProxy.maxAge !== undefined &&
+      (!Number.isFinite(config.oauthProxy.maxAge) || config.oauthProxy.maxAge <= 0)
     ) {
       throw validationError("`oauthProxy.maxAge` must be a positive number");
     }
@@ -276,6 +284,7 @@ export const resolveConfig = (config: CfAuthConfig): ResolvedCfAuthConfig => {
     basePath: normalizeBasePath(config.basePath ?? "/api/auth"),
     trustedOrigins,
     disableSignUp: config.disableSignUp ?? false,
+    userHooks: config.userHooks ?? {},
     emailAndPassword: {
       enabled: config.emailAndPassword?.enabled ?? true,
       minPasswordLength: config.emailAndPassword?.minPasswordLength ?? 8,

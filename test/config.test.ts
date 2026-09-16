@@ -51,14 +51,14 @@ describe("resolveConfig", () => {
 
     expect(config.basePath).toBe("/auth/better");
     expect(config.baseUrl).toBe("https://app.example.com");
-    expect(config.trustedOrigins).toEqual([
-      "https://app.example.com",
-      "http://localhost:5173",
-    ]);
+    expect(config.trustedOrigins).toEqual(["https://app.example.com", "http://localhost:5173"]);
   });
 
   it("allows a separate cookie secret", () => {
-    const config = resolveConfig({ ...base, cookieSecret: "different-cookie-secret" });
+    const config = resolveConfig({
+      ...base,
+      cookieSecret: "different-cookie-secret",
+    });
     expect(config.cookieSecret).toBe("different-cookie-secret");
     expect(config.secret).toBe(base.secret);
   });
@@ -76,7 +76,9 @@ describe("resolveConfig", () => {
       throw new Error("service is not used while building options");
     });
 
-    expect(options.socialProviders?.google).toMatchObject({ disableSignUp: true });
+    expect(options.socialProviders?.google).toMatchObject({
+      disableSignUp: true,
+    });
   });
 
   it("configures the OAuth proxy with a dedicated shared secret", () => {
@@ -118,34 +120,61 @@ describe("resolveConfig", () => {
     });
 
     expect(options.emailAndPassword).toMatchObject({ disableSignUp: true });
-    await expect(options.databaseHooks?.user?.create?.before?.({} as never, null)).rejects.toMatchObject({
+    await expect(
+      options.databaseHooks?.user?.create?.before?.({} as never, null),
+    ).rejects.toMatchObject({
       body: { code: "REGISTRATION_DISABLED", message: "signup disabled" },
     });
+  });
+
+  it("runs the host user hook immediately before persistence", async () => {
+    const seen: string[] = [];
+    const config = resolveConfig({
+      ...base,
+      userHooks: { beforeCreate: (user) => { seen.push(user.email!); } },
+    });
+    const options = createBetterAuthOptions(config, () => {
+      throw new Error("service is not used while checking the hook");
+    });
+
+    await options.databaseHooks?.user?.create?.before?.({
+      id: "new-user",
+      name: "New User",
+      email: "new@example.test",
+      emailVerified: false,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }, null);
+    expect(seen).toEqual(["new@example.test"]);
   });
 
   it("rejects missing or ambiguous inputs", () => {
     expect(() => resolveConfig({ ...base, appName: " " })).toThrowError(/appName/);
     expect(() => resolveConfig({ ...base, secret: "" })).toThrowError(/secret/);
     expect(() => resolveConfig({ appName: "X", secret: "y" })).toThrowError(/d1.*db|db.*d1/);
+    expect(() => resolveConfig({ ...base, d1: {} as never })).toThrowError(/only one/);
     expect(() =>
-      resolveConfig({ ...base, d1: {} as never }),
-    ).toThrowError(/only one/);
-    expect(() => resolveConfig({
-      ...base,
-      oauthProxy: { productionUrl: "", secret: "proxy-secret" },
-    })).toThrowError(/productionUrl/);
-    expect(() => resolveConfig({
-      ...base,
-      oauthProxy: { productionUrl: "https://auth.example.com", secret: "" },
-    })).toThrowError(/oauthProxy.secret/);
-    expect(() => resolveConfig({
-      ...base,
-      oauthProxy: {
-        productionUrl: "https://auth.example.com",
-        secret: "proxy-secret",
-        maxAge: 0,
-      },
-    })).toThrowError(/maxAge/);
+      resolveConfig({
+        ...base,
+        oauthProxy: { productionUrl: "", secret: "proxy-secret" },
+      }),
+    ).toThrowError(/productionUrl/);
+    expect(() =>
+      resolveConfig({
+        ...base,
+        oauthProxy: { productionUrl: "https://auth.example.com", secret: "" },
+      }),
+    ).toThrowError(/oauthProxy.secret/);
+    expect(() =>
+      resolveConfig({
+        ...base,
+        oauthProxy: {
+          productionUrl: "https://auth.example.com",
+          secret: "proxy-secret",
+          maxAge: 0,
+        },
+      }),
+    ).toThrowError(/maxAge/);
   });
 });
 
