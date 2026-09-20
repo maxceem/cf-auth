@@ -27,6 +27,7 @@ describe("resolveConfig", () => {
       minPasswordLength: 8,
       maxPasswordLength: 128,
       requireEmailVerification: false,
+      revokeOtherSessionsOnPasswordChange: false,
     });
     expect(config.apiKeys).toEqual({
       enabled: false,
@@ -99,6 +100,24 @@ describe("resolveConfig", () => {
 
     // Deliberate linking by a signed-in user is a separate switch, left alone.
     expect(optionsFor(base).account?.accountLinking?.enabled).toBeUndefined();
+  });
+
+  it("installs password-change session revocation only when enabled", () => {
+    const defaultOptions = createBetterAuthOptions(resolveConfig(base), () => {
+      throw new Error("service is not used while building options");
+    });
+    const protectedOptions = createBetterAuthOptions(
+      resolveConfig({
+        ...base,
+        emailAndPassword: { revokeOtherSessionsOnPasswordChange: true },
+      }),
+      () => {
+        throw new Error("service is not used while building options");
+      },
+    );
+
+    expect(defaultOptions.hooks).toBeUndefined();
+    expect(protectedOptions.hooks?.before).toEqual(expect.any(Function));
   });
 
   it("configures the OAuth proxy with a dedicated shared secret", () => {

@@ -66,6 +66,33 @@ describe("session resolution", () => {
     expect(state.organization).not.toBeNull();
   });
 
+  it("revokes other sessions on password change only when the host opts in", async () => {
+    for (const revokeOtherSessionsOnPasswordChange of [false, true]) {
+      const harness = await createTestAuth({
+        emailAndPassword: { revokeOtherSessionsOnPasswordChange },
+      });
+      const email = `password-${String(revokeOtherSessionsOnPasswordChange)}@example.com`;
+      await harness.signUp({ email, password: "correct-horse-battery" });
+      const user = await harness.cfAuth.repository.findUserByEmail(email);
+      const otherSessionId = await harness.sessions.sessionIdFor(user!.id);
+
+      const changed = await harness.request(`${harness.cfAuth.basePath}/change-password`, {
+        json: {
+          currentPassword: "correct-horse-battery",
+          newPassword: "new-correct-horse-battery",
+          // An opted-in host overrides this client request.
+          revokeOtherSessions: false,
+        },
+      });
+      expect(changed.status, await changed.clone().text()).toBe(200);
+      const other = await harness.client.execute({
+        sql: "select id from user_session where id = ?",
+        args: [otherSessionId],
+      });
+      expect(other.rows).toHaveLength(revokeOtherSessionsOnPasswordChange ? 0 : 1);
+    }
+  });
+
   it("rejects a wrong password", async () => {
     const harness = await createTestAuth();
     await harness.signUp({

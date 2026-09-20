@@ -182,6 +182,8 @@ ones worth knowing about.
 | `basePath`                              | `"/api/auth"`       | Where the sign-in endpoints live.                                                         |
 | `disableSignUp`                         | `false`             | Turns away new users while existing ones can still sign in.                               |
 | `userHooks.beforeCreate`                | —                   | Runs an application hook immediately before a new human identity is persisted.            |
+| `userHooks.atomicCreateGuard`           | —                   | Gates human persistence with a host-supplied Drizzle SQL predicate in the insert statement. |
+| `emailAndPassword.revokeOtherSessionsOnPasswordChange` | `false` | Forces password changes to revoke every other session. |
 | `google`                                | —                   | `{ clientId, clientSecret }`. Leave it out to turn Google off.                            |
 | `accountLinking.implicit`               | `false`             | Whether a Google sign-in may join an existing password account. See below.                |
 | `apiKeys`                               | off                 | `{ enabled: true, tokenPrefix: "sk_live_" }`.                                             |
@@ -227,6 +229,50 @@ const cfAuth = createCfAuth({
 
 Linking a provider deliberately, from an account someone is already signed in
 to, is a different thing and always works.
+
+### Atomic registration admission
+
+Use `userHooks.atomicCreateGuard` when admission depends on database state that
+another registration can change concurrently. The callback receives the
+configured tables and returns only the admission predicate:
+
+```ts
+import { sql } from "drizzle-orm";
+
+createCfAuth({
+  // ...
+  userHooks: {
+    beforeCreate: async (user) => {
+      await recordRegistrationAttempt(user);
+    },
+    atomicCreateGuard: {
+      condition: (tables) =>
+        sql`not exists (select 1 from ${tables.user} where ${tables.user.kind} = 'human')`,
+      onDenied: () => recordRegistrationDenial(),
+    },
+  },
+});
+```
+
+cf-auth normalizes and persists the human with one guarded
+`INSERT ... SELECT ... WHERE ... RETURNING` statement. A false predicate calls
+`onDenied`, then returns the usual `403 REGISTRATION_DISABLED` error. The guard
+also applies inside Better Auth's adapter callback path. The installed SQLite
+adapter executes the rest of signup sequentially, so this guarantees the user
+insert's atomic admission decision, not a transaction around the whole signup.
+
+### Live credential authority in an atomic write
+
+`credentialAuthorityCondition(tables, input)` returns `{ sql, params }` for a
+SQLite condition that requires an active membership, one of the explicit
+allowed roles, and either a live scoped API key or a live human session. It
+uses the later of `input.nowMs` and SQLite's current clock and respects custom
+table prefixes.
+
+Place it in the same conditional mutation or database batch as the protected
+write. A separate async preflight leaves a revocation or role-change race. The
+condition covers credential and membership authority only; append account,
+resource, and deadline rules required by your application to that same write.
 
 ### Google sign-in from preview URLs
 
