@@ -38,6 +38,7 @@ describe("resolveConfig", () => {
     expect(config.openAPI).toBe(false);
     expect(config.google).toBeUndefined();
     expect(config.oauthProxy).toBeUndefined();
+    expect(config.accountLinking).toEqual({ implicit: false });
     expect(config.cookies.maxAge).toBe(60 * 60 * 24 * 365);
   });
 
@@ -79,6 +80,25 @@ describe("resolveConfig", () => {
     expect(options.socialProviders?.google).toMatchObject({
       disableSignUp: true,
     });
+  });
+
+  it("forwards the account linking policy to Better Auth", () => {
+    const optionsFor = (config: Parameters<typeof resolveConfig>[0]) =>
+      createBetterAuthOptions(resolveConfig(config), () => {
+        throw new Error("service is not used while building options");
+      });
+
+    // Nothing here verifies an email address, so linking is refused by default.
+    expect(optionsFor(base).account?.accountLinking).toMatchObject({
+      disableImplicitLinking: true,
+    });
+
+    expect(
+      optionsFor({ ...base, accountLinking: { implicit: true } }).account?.accountLinking,
+    ).toMatchObject({ disableImplicitLinking: false });
+
+    // Deliberate linking by a signed-in user is a separate switch, left alone.
+    expect(optionsFor(base).account?.accountLinking?.enabled).toBeUndefined();
   });
 
   it("configures the OAuth proxy with a dedicated shared secret", () => {

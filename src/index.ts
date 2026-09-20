@@ -11,6 +11,7 @@ export { createCfAuth, type CfAuth } from "./cf-auth.js";
 
 export {
   resolveConfig,
+  type AccountLinkingConfig,
   type ApiKeysConfig,
   type CfAuthConfig,
   type CfAuthDatabase,

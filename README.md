@@ -4,7 +4,9 @@ Sign-in and organizations for Cloudflare Workers apps built on Hono, D1 and
 drizzle. It wraps [better-auth](https://better-auth.com) and adds the
 multi-tenant part that every one of these apps ends up writing again:
 
-- Email and password sign-in, plus Google if you want it.
+- Email and password sign-in, plus Google if you want it. A Google sign-in
+  never joins a password account that happens to share its email address unless
+  you ask for it.
 - **Organizations** with `owner`, `admin` and `member` roles, and a default one
   made for each human signup; email-less service identities share memberships.
 - Hono middleware that works out who is calling, from a session cookie **or** an

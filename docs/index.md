@@ -183,6 +183,7 @@ ones worth knowing about.
 | `disableSignUp`                         | `false`             | Turns away new users while existing ones can still sign in.                               |
 | `userHooks.beforeCreate`                | —                   | Runs an application hook immediately before a new human identity is persisted.            |
 | `google`                                | —                   | `{ clientId, clientSecret }`. Leave it out to turn Google off.                            |
+| `accountLinking.implicit`               | `false`             | Whether a Google sign-in may join an existing password account. See below.                |
 | `apiKeys`                               | off                 | `{ enabled: true, tokenPrefix: "sk_live_" }`.                                             |
 | `organizations.defaultOrganizationName` | `"My Organization"` | A string, or a function of the user.                                                      |
 | `cookies.prefix`                        | from `appName`      | See below.                                                                                |
@@ -204,6 +205,28 @@ breaking: the middleware falls back to the user's first organization and writes
 the cookie again, so all anyone sees is their selected organization being reset
 once. Sessions are fine as long as `secret` has not changed. Set
 `cookies.prefix` yourself if you want `appName` to stay free to change.
+
+### Google sign-in and an email that already has a password
+
+Someone signs up with `ada@example.com` and a password; later a Google account
+for the same address signs in. By default those stay two different people: the
+Google sign-in is refused with `account not linked` rather than opening the
+password account.
+
+That is deliberate. Nothing here verifies an email address, so the first person
+to type one is not proof of anything — and if a Google sign-in joined whatever
+account already held the address, whoever registered it first would collect
+every later sign-in for it. Turn it on only where you verify addresses yourself:
+
+```ts
+const cfAuth = createCfAuth({
+  // ...the usual settings
+  accountLinking: { implicit: true },
+});
+```
+
+Linking a provider deliberately, from an account someone is already signed in
+to, is a different thing and always works.
 
 ### Google sign-in from preview URLs
 

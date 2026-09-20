@@ -75,6 +75,17 @@ export interface EmailAndPasswordConfig {
   requireEmailVerification?: boolean;
 }
 
+export interface AccountLinkingConfig {
+  /**
+   * Join a social login to an existing user who has the same email address
+   * when the provider reports it verified. Default: `false`, because this
+   * library does not verify email addresses itself, so whoever registered
+   * the address first with a password would otherwise receive every later
+   * Google sign-in for it. Explicit linking by a signed-in user is unaffected.
+   */
+  implicit?: boolean;
+}
+
 export interface UserHooksConfig {
   /** Runs immediately before Better Auth persists a new human identity. */
   beforeCreate?: (user: AuthUser) => void | Promise<void>;
@@ -138,6 +149,7 @@ export interface CfAuthConfig {
   emailAndPassword?: EmailAndPasswordConfig;
   google?: GoogleOAuthConfig;
   oauthProxy?: OAuthProxyConfig;
+  accountLinking?: AccountLinkingConfig;
 
   organizations?: OrganizationsConfig;
   apiKeys?: ApiKeysConfig;
@@ -192,6 +204,7 @@ export interface ResolvedCfAuthConfig {
   emailAndPassword: Required<EmailAndPasswordConfig>;
   google: GoogleOAuthConfig | undefined;
   oauthProxy: OAuthProxyConfig | undefined;
+  accountLinking: { implicit: boolean };
   organizations: {
     autoProvisionDefaultOrganization: boolean;
     resolveDefaultOrganizationName: (user: AuthUser) => string;
@@ -293,6 +306,7 @@ export const resolveConfig = (config: CfAuthConfig): ResolvedCfAuthConfig => {
     },
     google: config.google,
     oauthProxy,
+    accountLinking: { implicit: config.accountLinking?.implicit ?? false },
     organizations: {
       autoProvisionDefaultOrganization:
         config.organizations?.autoProvisionDefaultOrganization ?? true,

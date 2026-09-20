@@ -70,6 +70,15 @@ export const createBetterAuthOptions = (
       maxPasswordLength: config.emailAndPassword.maxPasswordLength,
       requireEmailVerification: config.emailAndPassword.requireEmailVerification,
     },
+    account: {
+      accountLinking: {
+        // Off unless the host opts in: nothing here verifies an email address,
+        // so an unverified registration must not collect the social logins for
+        // it. `enabled` is left alone, so a signed-in user can still link a
+        // provider deliberately.
+        disableImplicitLinking: !config.accountLinking.implicit,
+      },
+    },
     ...(config.google
       ? {
           socialProviders: {
