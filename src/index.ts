@@ -21,7 +21,14 @@ export {
   type OAuthProxyConfig,
   type OrganizationsConfig,
   type ResolvedCfAuthConfig,
+  type UserHooksConfig,
 } from "./config.js";
+
+export {
+  credentialAuthorityCondition,
+  type CompiledSqlCondition,
+  type CredentialAuthorityInput,
+} from "./authority.js";
 
 export {
   actionSources,

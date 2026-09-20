@@ -1,8 +1,13 @@
 import { drizzleAdapter } from "@better-auth/drizzle-adapter";
 import { betterAuth } from "better-auth/minimal";
 import { oAuthProxy, openAPI } from "better-auth/plugins";
-import type { Auth, BetterAuthOptions, BetterAuthPlugin } from "better-auth/types";
-import { APIError } from "better-auth/api";
+import type {
+  Auth,
+  BetterAuthOptions,
+  BetterAuthPlugin,
+} from "better-auth/types";
+import { APIError, createAuthMiddleware } from "better-auth/api";
+import { guardUserCreates } from "./atomic-user-create.js";
 import type { ResolvedCfAuthConfig } from "./config.js";
 import { toBetterAuthSchema } from "./schema.js";
 import type { CfAuthService } from "./service.js";
@@ -59,10 +64,14 @@ export const createBetterAuthOptions = (
     basePath: config.basePath,
     secret: config.secret,
     trustedOrigins: config.trustedOrigins,
-    database: drizzleAdapter(config.db, {
-      provider: "sqlite",
-      schema: toBetterAuthSchema(config.tables),
-    }),
+    database: (() => {
+      const factory = drizzleAdapter(config.db, {
+        provider: "sqlite",
+        schema: toBetterAuthSchema(config.tables),
+      });
+      if (!config.userHooks.atomicCreateGuard) return factory;
+      return (options: BetterAuthOptions) => guardUserCreates(config, factory(options));
+    })(),
     emailAndPassword: {
       enabled: config.emailAndPassword.enabled,
       disableSignUp: config.disableSignUp,
@@ -79,6 +88,20 @@ export const createBetterAuthOptions = (
         disableImplicitLinking: !config.accountLinking.implicit,
       },
     },
+    ...(config.emailAndPassword.revokeOtherSessionsOnPasswordChange
+      ? {
+          hooks: {
+            before: createAuthMiddleware(async (ctx) => {
+              if (ctx.path !== "/change-password") return;
+              return {
+                context: {
+                  body: { ...ctx.body, revokeOtherSessions: true },
+                },
+              };
+            }),
+          },
+        }
+      : {}),
     ...(config.google
       ? {
           socialProviders: {

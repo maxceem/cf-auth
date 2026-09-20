@@ -1,6 +1,7 @@
 import type { D1Database } from "@cloudflare/workers-types";
 import { drizzle } from "drizzle-orm/d1";
 import type { BaseSQLiteDatabase } from "drizzle-orm/sqlite-core";
+import type { SQL } from "drizzle-orm";
 import { validationError } from "./errors.js";
 import { cfAuthTables, type CfAuthTables } from "./schema.js";
 import type { AuthUser, CfAuthEvent } from "./types.js";
@@ -73,6 +74,8 @@ export interface EmailAndPasswordConfig {
   maxPasswordLength?: number;
   /** Default: `false`. */
   requireEmailVerification?: boolean;
+  /** Ignore a caller-supplied `false` and revoke every other session after a password change. Default: `false`. */
+  revokeOtherSessionsOnPasswordChange?: boolean;
 }
 
 export interface AccountLinkingConfig {
@@ -89,6 +92,16 @@ export interface AccountLinkingConfig {
 export interface UserHooksConfig {
   /** Runs immediately before Better Auth persists a new human identity. */
   beforeCreate?: (user: AuthUser) => void | Promise<void>;
+  /**
+   * Makes human creation conditional in the same SQLite statement as the insert.
+   * The host owns only the admission predicate; cf-auth owns normalization and
+   * persistence. This prevents concurrent creates from both passing a separate
+   * preflight read.
+   */
+  atomicCreateGuard?: {
+    condition: (tables: CfAuthTables) => SQL;
+    onDenied?: () => void | Promise<void>;
+  };
 }
 
 export interface CookieConfig {
@@ -303,6 +316,8 @@ export const resolveConfig = (config: CfAuthConfig): ResolvedCfAuthConfig => {
       minPasswordLength: config.emailAndPassword?.minPasswordLength ?? 8,
       maxPasswordLength: config.emailAndPassword?.maxPasswordLength ?? 128,
       requireEmailVerification: config.emailAndPassword?.requireEmailVerification ?? false,
+      revokeOtherSessionsOnPasswordChange:
+        config.emailAndPassword?.revokeOtherSessionsOnPasswordChange ?? false,
     },
     google: config.google,
     oauthProxy,
