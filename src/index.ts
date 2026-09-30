@@ -18,14 +18,19 @@ export {
   type CookieConfig,
   type EmailAndPasswordConfig,
   type GoogleOAuthConfig,
+  type LoginOperationConfig,
   type OAuthProxyConfig,
+  type OperationsConfig,
   type OrganizationsConfig,
   type ResolvedCfAuthConfig,
+  type ResolvedOperationsConfig,
   type UserHooksConfig,
 } from "./config.js";
 
 export {
   credentialAuthorityCondition,
+  credentialAuthoritySql,
+  liveHumanSessionSql,
   type CompiledSqlCondition,
   type CredentialAuthorityInput,
 } from "./authority.js";
@@ -38,6 +43,7 @@ export {
   hasRoleAtLeast,
   isApiKeyActionSource,
   isOrganizationExpired,
+  operationStates,
   organizationMemberStatuses,
   organizationRoles,
   type ActionSource,
@@ -51,6 +57,7 @@ export {
   type IdentityKind,
   type CfAuthEvent,
   type CreatedApiKey,
+  type OperationState,
   type OrganizationMember,
   type OrganizationMemberStatus,
   type OrganizationMembership,
@@ -59,13 +66,21 @@ export {
 } from "./types.js";
 
 export {
+  alreadyCompleted,
   CfAuthError,
   conflict,
   forbidden,
+  invalidProof,
   isCfAuthError,
+  notAMember,
   notFound,
+  operationDenied,
+  operationExpired,
+  operationNotFound,
+  operationPending,
   organizationExpired,
   sessionRequired,
+  tooManyPending,
   unauthorized,
   validationError,
 } from "./errors.js";
@@ -111,6 +126,40 @@ export {
   type CfBetterAuth,
 } from "./better-auth.js";
 
-export { deriveSecret } from "./crypto.js";
+export { guardedInsert } from "./guarded-insert.js";
+
+export {
+  createOperationsService,
+  defineOperationKind,
+  operationSweepStatementCount,
+  type AmendOperationInput,
+  type ApproveOperationInput,
+  type CfAuthOperations,
+  type CompleteOperationInput,
+  type OpenOperationInput,
+  type OperationApproval,
+  type OperationApproveContext,
+  type OperationApproveResult,
+  type OperationBrowserCredential,
+  type OperationClient,
+  type OperationClientMeta,
+  type OperationDeliverableContext,
+  type OperationDetails,
+  type OperationKind,
+  type OperationKindDefinition,
+  type OperationPayloadSchema,
+  type OperationRecord,
+  type OperationRefusalContext,
+  type OperationSweepStatements,
+  type OperationView,
+} from "./operations.js";
+
+export {
+  loginOperationKindName,
+  type LoginOperationOutcome,
+  type LoginOperationRecord,
+} from "./login-operation.js";
+
+export { createOperationToken, deriveSecret } from "./crypto.js";
 
 export * from "./schema.js";

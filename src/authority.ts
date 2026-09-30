@@ -24,18 +24,20 @@ const compileSqlite = (condition: SQL): CompiledSqlCondition => {
   return { sql: query.sql, params: query.params };
 };
 
+/** SQLite's current clock in epoch milliseconds, or the caller's, whichever is later. */
+export const sqliteNowMs = (nowMs: number): SQL =>
+  sql`max(${nowMs}, cast((julianday('now') - 2440587.5) * 86400000 as integer))`;
+
 /**
- * Compiles the live credential and membership authority predicate used inside
- * an existing SQLite mutation boundary. Table and column names come from the
- * configured cf-auth schema, including custom prefixes. This covers only a
- * live credential plus active membership and an allowed role; the host must
- * append its account, resource, and deadline policy to the same mutation.
+ * The live credential and membership authority predicate as a drizzle `SQL`
+ * fragment, for a write built with drizzle. See
+ * {@link credentialAuthorityCondition} for the compiled form.
  */
-export const credentialAuthorityCondition = (
+export const credentialAuthoritySql = (
   tables: CfAuthTables,
   input: CredentialAuthorityInput,
-): CompiledSqlCondition => {
-  if (input.allowedRoles.length === 0) return { sql: "0", params: [] };
+): SQL => {
+  if (input.allowedRoles.length === 0) return sql`0`;
 
   const membership = alias(tables.organizationUser, "cf_auth_membership");
   const user = alias(tables.user, "cf_auth_user");
@@ -46,12 +48,9 @@ export const credentialAuthorityCondition = (
   const keyAlias = sql.identifier("cf_auth_key");
   const sessionAlias = sql.identifier("cf_auth_session");
   const roles = sql.join(input.allowedRoles.map((role) => sql`${role}`), sql`, `);
-  const liveAfter = sql`max(
-    ${input.nowMs},
-    cast((julianday('now') - 2440587.5) * 86400000 as integer)
-  )`;
+  const liveAfter = sqliteNowMs(input.nowMs);
 
-  return compileSqlite(sql`exists (
+  return sql`exists (
     select 1
     from ${tables.organizationUser} as ${membershipAlias}
     join ${tables.user} as ${userAlias} on ${user.id} = ${membership.userId}
@@ -79,5 +78,39 @@ export const credentialAuthorityCondition = (
           )
         )
       )
-  )`);
+  )`;
 };
+
+/**
+ * True while `sessionId` is a live session of the human `userId`, whatever
+ * organizations they belong to. For a write whose authority is the person
+ * rather than a membership.
+ */
+export const liveHumanSessionSql = (
+  tables: CfAuthTables,
+  input: { userId: string; sessionId: string; nowMs: number },
+): SQL => {
+  const user = alias(tables.user, "cf_auth_session_user");
+  const session = alias(tables.session, "cf_auth_live_session");
+  return sql`exists (
+    select 1
+    from ${tables.session} as ${sql.identifier("cf_auth_live_session")}
+    join ${tables.user} as ${sql.identifier("cf_auth_session_user")} on ${user.id} = ${session.userId}
+    where ${session.id} = ${input.sessionId}
+      and ${session.userId} = ${input.userId}
+      and ${user.kind} = 'human'
+      and ${session.expiresAt} > ${sqliteNowMs(input.nowMs)}
+  )`;
+};
+
+/**
+ * Compiles the live credential and membership authority predicate used inside
+ * an existing SQLite mutation boundary. Table and column names come from the
+ * configured cf-auth schema, including custom prefixes. This covers only a
+ * live credential plus active membership and an allowed role; the host must
+ * append its account, resource, and deadline policy to the same mutation.
+ */
+export const credentialAuthorityCondition = (
+  tables: CfAuthTables,
+  input: CredentialAuthorityInput,
+): CompiledSqlCondition => compileSqlite(credentialAuthoritySql(tables, input));

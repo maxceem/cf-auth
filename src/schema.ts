@@ -1,13 +1,13 @@
 import { sql } from "drizzle-orm";
 import { check, index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
-import { organizationMemberStatuses, organizationRoles } from "./types.js";
+import { operationStates, organizationMemberStatuses, organizationRoles } from "./types.js";
 
 export interface CfAuthTablesOptions {
   /**
    * Prefix applied to every physical table and index name, e.g. `"auth_"`
    * produces `auth_user`, `auth_user_session`, ... Defaults to `""` (unprefixed:
    * `user`, `user_session`, `user_account`, `verification`, `organization`,
-   * `organization_user`, `api_key`).
+   * `organization_user`, `api_key`, `operation`).
    *
    * If you set this, you must regenerate the reference migration — see the
    * README "Migrations" section.
@@ -182,11 +182,87 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
       expiresAt: integer("expires_at", { mode: "timestamp_ms" }),
       createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
       revokedAt: integer("revoked_at", { mode: "timestamp_ms" }),
+      /** Where the key was issued from, e.g. `console`, `cli` or `bootstrap`. Display only. */
+      source: text("source").notNull().default("console"),
+      /** A human-readable note about the holder, e.g. `CLI on mac-studio`. Display only. */
+      label: text("label"),
     },
     (table) => [
       uniqueIndex(ix("api_key_token_hash_unique")).on(table.tokenHash),
       index(ix("idx_api_key_user_id")).on(table.userId),
       index(ix("idx_api_key_organization_id")).on(table.organizationId),
+    ],
+  );
+
+  // --- browser-approved operations ---------------------------------------------
+  // One row per operation a client opened: what it asked for, who may approve
+  // it, and what it achieved. Secrets are never stored in the clear: the
+  // client's token, the browser proof and the redeem code are SHA-256
+  // digests; the user code is a digest for lookup plus a sealed (AES-GCM) copy
+  // for display; and an outcome carrying a secret is sealed until it is
+  // collected or its window passes. Timestamps are epoch milliseconds so the
+  // guards inside a write can compare them with SQLite's own clock.
+
+  const operation = sqliteTable(
+    t("operation"),
+    {
+      id: text("id").primaryKey(),
+      kind: text("kind").notNull(),
+      state: text("state", { enum: operationStates }).notNull(),
+      /** Null for a kind anyone may open. */
+      openerUserId: text("opener_user_id").references(() => user.id, { onDelete: "cascade" }),
+      /** The session or API key the opener held; rechecked when the operation is approved. */
+      openerCredentialId: text("opener_credential_id"),
+      /** The opener's organization, or, for a public kind, the one its approver chose. */
+      organizationId: text("organization_id").references(() => organization.id, {
+        onDelete: "cascade",
+      }),
+      /** What the pending-per-opener cap counts: the opener's user id, or the client's address. */
+      openerKey: text("opener_key"),
+      /** Digest of the request a retry with the same token must repeat. */
+      requestHash: text("request_hash").notNull(),
+      pollTokenHash: text("poll_token_hash").notNull(),
+      browserProofHash: text("browser_proof_hash"),
+      userCodeHash: text("user_code_hash"),
+      /** The user code itself, sealed, so the approval page can show what the terminal shows. */
+      userCodeSealed: text("user_code_sealed"),
+      clientLabel: text("client_label"),
+      clientMeta: text("client_meta"),
+      loopbackRedirect: text("loopback_redirect"),
+      redeemCodeHash: text("redeem_code_hash"),
+      /** What the operation achieved, kept in the clear; never a secret. */
+      outcome: text("outcome"),
+      sealedOutcome: text("sealed_outcome"),
+      sealedUntil: integer("sealed_until", { mode: "timestamp_ms" }),
+      decidedByUserId: text("decided_by_user_id").references(() => user.id, {
+        onDelete: "set null",
+      }),
+      payload: text("payload"),
+      createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+      updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+      /** While pending, the deadline for approval or completion. */
+      expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
+      /** When the sweep may delete the record, whatever its state. */
+      retainUntil: integer("retain_until", { mode: "timestamp_ms" }).notNull(),
+    },
+    (table) => [
+      uniqueIndex(ix("operation_poll_token_hash_unique")).on(table.pollTokenHash),
+      uniqueIndex(ix("operation_user_code_pending_unique"))
+        .on(table.userCodeHash)
+        .where(sql`${table.state} = 'pending'`),
+      index(ix("idx_operation_organization")).on(
+        table.organizationId,
+        table.state,
+        table.expiresAt,
+      ),
+      index(ix("idx_operation_opener")).on(table.openerKey, table.state, table.expiresAt),
+      index(ix("idx_operation_state_expires")).on(table.state, table.expiresAt),
+      index(ix("idx_operation_sealed_until")).on(table.sealedUntil),
+      index(ix("idx_operation_retain_until")).on(table.retainUntil),
+      check(
+        `${prefix}operation_state_check`,
+        sql`${table.state} in ('pending', 'completed', 'denied', 'expired', 'retired')`,
+      ),
     ],
   );
 
@@ -198,6 +274,7 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
     organization,
     organizationUser,
     apiKey,
+    operation,
   };
 };
 
@@ -208,7 +285,7 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
  *
  * ```ts
  * import { cfAuthTables } from "@maxceem/cf-auth/schema";
- * export const { user, session, account, verification, organization, organizationUser, apiKey } =
+ * export const { user, session, account, verification, organization, organizationUser, apiKey, operation } =
  *   cfAuthTables;
  * export const myAppTable = sqliteTable("my_app", { ... });
  * ```
@@ -237,4 +314,5 @@ export const {
   organization: organizationTable,
   organizationUser: organizationUserTable,
   apiKey: apiKeyTable,
+  operation: operationTable,
 } = cfAuthTables;

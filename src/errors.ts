@@ -49,5 +49,37 @@ export const organizationExpired = (
 export const validationError = (message: string) =>
   new CfAuthError("validation_error", message, 422);
 
+// --- operations ----------------------------------------------------------------
+
+/** No operation answers to that id and token. Deliberately silent about which part was wrong. */
+export const operationNotFound = (message = "Operation was not found") =>
+  new CfAuthError("operation_not_found", message, 404);
+
+/** The operation, or the one-time outcome being collected, has passed its deadline. */
+export const operationExpired = (message = "This operation has expired") =>
+  new CfAuthError("operation_expired", message, 410);
+
+export const operationDenied = (message = "This operation was denied") =>
+  new CfAuthError("operation_denied", message, 409);
+
+/** The operation has not been approved or completed yet; ask again later. */
+export const operationPending = (message = "This operation is still pending") =>
+  new CfAuthError("operation_pending", message, 409);
+
+/** The browser proof, user code or redeem code does not match this operation. */
+export const invalidProof = (message = "The proof does not match this operation") =>
+  new CfAuthError("invalid_proof", message, 403);
+
+export const alreadyCompleted = (message = "This operation has already been completed") =>
+  new CfAuthError("already_completed", message, 409);
+
+export const tooManyPending = (message = "Too many operations are waiting for approval") =>
+  new CfAuthError("too_many_pending", message, 429);
+
+/** The approver does not hold the membership an operation's kind requires. */
+export const notAMember = (
+  message = "You are not a member of this organization with the required role",
+) => new CfAuthError("not_a_member", message, 403);
+
 export const isCfAuthError = (value: unknown): value is CfAuthError =>
   value instanceof CfAuthError;

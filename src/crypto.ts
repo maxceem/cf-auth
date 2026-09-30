@@ -90,3 +90,134 @@ export const generateApiKeyToken = async (
     tokenHint: plaintext.slice(-4),
   };
 };
+
+/** SHA-256 hex digest of any secret the database keeps only a digest of. */
+export const sha256Hex = hashApiKeyToken;
+
+const base64UrlEncode = (bytes: Uint8Array): string => {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+
+const base64UrlDecode = (value: string): Uint8Array => {
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(padded + "=".repeat((4 - (padded.length % 4)) % 4));
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+};
+
+/** `bytes` of secure randomness, base64url without padding. */
+export const randomToken = (bytes = 32): string =>
+  base64UrlEncode(crypto.getRandomValues(new Uint8Array(bytes)));
+
+/**
+ * A fresh operation token, the one secret a client holds for an operation: 32
+ * random bytes, base64url. Clients may mint their own the same way; the server
+ * only ever stores its digest.
+ */
+export const createOperationToken = (): string => randomToken(32);
+
+const hmacBytes = async (key: string, message: string): Promise<Uint8Array> => {
+  const imported = await crypto.subtle.importKey(
+    "raw",
+    textEncoder.encode(key),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  return new Uint8Array(await crypto.subtle.sign("HMAC", imported, textEncoder.encode(message)));
+};
+
+/** HMAC-SHA256 of `message` keyed by `key`, hex. */
+export const hmacHex = async (key: string, message: string): Promise<string> =>
+  toHex(await hmacBytes(key, message));
+
+/**
+ * Compares two strings without an early exit, so how long a comparison takes
+ * says nothing about how much of a secret digest matched. Unequal lengths
+ * still walk the longer input.
+ */
+export const timingSafeEqual = (left: string, right: string): boolean => {
+  const length = Math.max(left.length, right.length);
+  let difference = left.length ^ right.length;
+  for (let index = 0; index < length; index += 1) {
+    difference |= (left.charCodeAt(index) || 0) ^ (right.charCodeAt(index) || 0);
+  }
+  return difference === 0;
+};
+
+/**
+ * The alphabet of a user code: no `0`/`O`, `1`/`I`/`L`, so what a person reads
+ * in a terminal is what they type in a browser.
+ */
+export const userCodeAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+export const userCodeLength = 8;
+const userCodeRejectionThreshold = 256 - (256 % userCodeAlphabet.length);
+
+/**
+ * A user code derived from the operation token, so a client that retries or
+ * polls is shown the same code and the server never has to store it: only
+ * its digest is kept. Formatted `ABCD-EFGH`.
+ */
+export const deriveUserCode = async (token: string, realm: string): Promise<string> => {
+  let code = "";
+  for (let round = 0; code.length < userCodeLength; round += 1) {
+    for (const byte of await hmacBytes(token, `cf-auth:operation-user-code:${realm}:${round}`)) {
+      if (byte >= userCodeRejectionThreshold) continue;
+      code += userCodeAlphabet[byte % userCodeAlphabet.length];
+      if (code.length === userCodeLength) break;
+    }
+  }
+  return `${code.slice(0, 4)}-${code.slice(4)}`;
+};
+
+/**
+ * A user code as typed: case and separators ignored. Null when what remains
+ * cannot be a code at all.
+ */
+export const normalizeUserCode = (value: string): string | null => {
+  const normalized = value.toUpperCase().replace(/[\s-]/g, "");
+  if (normalized.length !== userCodeLength) return null;
+  for (const character of normalized) {
+    if (!userCodeAlphabet.includes(character)) return null;
+  }
+  return normalized;
+};
+
+const sealKey = async (secret: string): Promise<CryptoKey> =>
+  crypto.subtle.importKey(
+    "raw",
+    Uint8Array.from((await deriveSecret(secret, "cf-auth:operation-seal")).match(/../g)!, (pair) =>
+      Number.parseInt(pair, 16),
+    ),
+    "AES-GCM",
+    false,
+    ["encrypt", "decrypt"],
+  );
+
+/**
+ * Encrypts `plaintext` with AES-256-GCM under a subkey of `secret`, bound to
+ * `context` (the operation id) so a sealed value cannot be moved to another
+ * row and opened there. Returns `iv.ciphertext`, both base64url.
+ */
+export const sealText = async (secret: string, context: string, plaintext: string): Promise<string> => {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: textEncoder.encode(context) },
+    await sealKey(secret),
+    textEncoder.encode(plaintext),
+  );
+  return `${base64UrlEncode(iv)}.${base64UrlEncode(new Uint8Array(ciphertext))}`;
+};
+
+/** Opens a value from {@link sealText}; throws if it was sealed for another context or key. */
+export const openText = async (secret: string, context: string, sealed: string): Promise<string> => {
+  const [iv, ciphertext] = sealed.split(".");
+  if (!iv || !ciphertext) throw new Error("Malformed sealed value");
+  const plaintext = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: base64UrlDecode(iv), additionalData: textEncoder.encode(context) },
+    await sealKey(secret),
+    base64UrlDecode(ciphertext),
+  );
+  return new TextDecoder().decode(plaintext);
+};

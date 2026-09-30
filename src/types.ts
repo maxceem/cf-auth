@@ -28,6 +28,16 @@ export type ApiKeyActionSource = (typeof apiKeyActionSources)[number];
 export const isApiKeyActionSource = (value: ActionSource): value is ApiKeyActionSource =>
   (apiKeyActionSources as readonly string[]).includes(value);
 
+/**
+ * Where a browser-approved operation stands.
+ *
+ * `pending` waits for a browser (or, for a kind without one, for the app);
+ * `completed` and `denied` are the two answers; `expired` means nobody answered
+ * in time; `retired` means the app ended a completed operation's authority.
+ */
+export const operationStates = ["pending", "completed", "denied", "expired", "retired"] as const;
+export type OperationState = (typeof operationStates)[number];
+
 /** Which credential proved the caller's identity. */
 export type AuthCredentialType = "session" | "apiKey";
 
@@ -117,6 +127,10 @@ export interface ApiKeySummary {
    * this to `false` too, so `enabled && !revokedAt` is the live key.
    */
   enabled: boolean;
+  /** Where the key was issued from, e.g. `console`, `cli` or `bootstrap`. */
+  source: string;
+  /** A human-readable note about the holder, e.g. `CLI on mac-studio`. */
+  label: string | null;
   createdAt: string;
   revokedAt: string | null;
 }
