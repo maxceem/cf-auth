@@ -44,6 +44,8 @@ describe("initial schema", () => {
       "expires_at",
       "created_at",
       "revoked_at",
+      "source",
+      "label",
     ]);
   });
 });

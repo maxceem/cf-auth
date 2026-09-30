@@ -1,6 +1,6 @@
 {
   "name": "@maxceem/cf-auth",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": false,
   "description": "Authentication, organization tenancy, and API keys for Cloudflare Workers using Better Auth, Hono, D1, and Drizzle ORM.",
   "license": "Apache-2.0",
@@ -79,6 +79,7 @@
     "drizzle-kit": "0.31.10",
     "drizzle-orm": "0.45.2",
     "hono": "4.12.8",
+    "miniflare": "4.20260721.0",
     "typescript": "5.9.3",
     "vitest": "4.1.0"
   },

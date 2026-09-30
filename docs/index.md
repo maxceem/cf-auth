@@ -10,6 +10,7 @@ database.
 - [Who is calling](#who-is-calling)
 - [Organizations](#organizations)
 - [API keys](#api-keys)
+- [Operations approved in a browser](#operations-approved-in-a-browser)
 - [The organization cookie](#the-organization-cookie)
 - [Audit events](#audit-events)
 - [Environment](#environment)
@@ -123,6 +124,7 @@ export const {
   organization,
   organizationUser,
   apiKey,
+  operation,
 } = cfAuthTables;
 
 // Your own tables use `organization.id` as the tenant key.
@@ -146,10 +148,11 @@ Because the auth tables sit in your schema file, drizzle-kit treats them and
 your own tables as one thing: one migration folder, one history.
 
 If you would rather not run drizzle-kit, the ready-made SQL for the default
-table names ships at
-`node_modules/@maxceem/cf-auth/drizzle/0000_cf_auth_init.sql`. Copy it in as
-your first migration. The package's own tests apply this exact file, so it
-cannot drift from the schema.
+table names ships in `node_modules/@maxceem/cf-auth/drizzle/`:
+`0000_cf_auth_init.sql` creates the tables, and `0001_cf_auth_operations.sql`
+adds the `operation` table and the `source` and `label` columns of `api_key`.
+Copy them in, in order. The package's own tests apply these exact files, so
+they cannot drift from the schema.
 
 ### Renaming the tables
 
@@ -187,6 +190,7 @@ ones worth knowing about.
 | `google`                                | —                   | `{ clientId, clientSecret }`. Leave it out to turn Google off.                            |
 | `accountLinking.implicit`               | `false`             | Whether a Google sign-in may join an existing password account. See below.                |
 | `apiKeys`                               | off                 | `{ enabled: true, tokenPrefix: "sk_live_" }`.                                             |
+| `operations`                            | off                 | `{ enabled: true, realm }`. See [Operations](#operations-approved-in-a-browser).          |
 | `organizations.defaultOrganizationName` | `"My Organization"` | A string, or a function of the user.                                                      |
 | `cookies.prefix`                        | from `appName`      | See below.                                                                                |
 | `onEvent`                               | —                   | Called for sign-ups and key changes. See [Audit events](#audit-events).                   |
@@ -433,13 +437,23 @@ const key = await cfAuth.service.createApiKey({
   organizationId,
   actor: state,
   name: "CI pipeline",
+  label: "GitHub Actions", // optional, for people reading the list
 });
 // Securely deliver key.plaintext once; never include it in logs.
 await cfAuth.service.listApiKeys({ organizationId, actor: state });
 await cfAuth.service.revokeApiKey({ organizationId, actor: state, apiKeyId });
+await cfAuth.service.revokeOwnApiKey({ actor: state }); // the key the caller used
 ```
 
 Creation and revocation require an owner/admin; listing requires membership.
+`revokeOwnApiKey` needs no role: a key holder can always end the key it
+authenticated with, which is what a CLI's `logout` does. Any other credential
+gets `403 api_key_required`.
+
+Every key records where it came from. `source` is a short word — `console`
+unless you pass another, `cli` for the keys the built-in `login` operation
+issues — and `label` is optional free text such as `CLI on mac-studio`. Both are
+for display only; nothing authorizes on them.
 Session and API-key callers use the same membership role. Keys never acquire
 browser assurance, including keys belonging to a human. Applications expose
 their own authorized management routes around these server methods when needed.
@@ -497,6 +511,324 @@ and refuses when somebody else already owns the organization, when the deadline
 has passed, or when the provisioning credential is no longer live. Repeating a
 claim that already landed settles on the same membership rather than failing,
 so a caller that lost its answer can simply ask again.
+
+When the claim is what an approval does, use
+`claimOrganizationStatements({ actor, organizationId, provisioning, condition })`
+instead. It returns `{ statements, afterCommit }` — the same guarded writes as
+drizzle builders, with `condition` added to their guard — so an operation
+kind's `approve` can return them and pass the operation's `guard` as
+`condition`. The ownership change then lands in the batch that completes the
+operation or not at all: a denial that commits first leaves the organization
+unclaimed. `afterCommit` emits `organization.claimed` if it landed.
+
+---
+
+## Operations approved in a browser
+
+Some things a command-line tool asks for should not happen until a person says
+so in a browser: logging the tool in, or a change you want someone to look at
+first. An **operation** is one of those requests. The tool opens it, a signed-in
+person approves or denies it on a page you serve, and the tool collects the
+outcome.
+
+Turn it on and name a realm — a stable public identifier of this deployment:
+
+```ts
+createCfAuth({
+  // ...the usual settings
+  apiKeys: { enabled: true },
+  operations: { enabled: true, realm: env.DEPLOYMENT_ID },
+});
+```
+
+Then `cfAuth.operations` has everything below. It declares no routes: you mount
+your own and call these from them.
+
+### How it fits together
+
+The tool makes one random token and keeps it (`createOperationToken()` makes
+one; any 32 random bytes in base64url will do). The server stores only its
+digest, so holding the token is the whole proof of being the tool that asked.
+
+```ts
+const { operations } = cfAuth;
+
+// 1. The tool asks. Answers with the id, and while it is pending, the proof
+//    for the approval link and a code to show in the terminal.
+const view = await operations.open({
+  kind: "login",
+  token,
+  rateLimitKey: c.req.header("CF-Connecting-IP"), // what the pending cap counts
+  client: {
+    label: "CLI on mac-studio",
+    meta: { os: "darwin", ip: clientAddress, userAgent },
+    loopbackRedirect: "http://127.0.0.1:53682/callback", // optional
+  },
+});
+// The tool opens `${appUrl}/cli/approve/${view.id}#${view.browserProof}`
+// and prints view.userCode, e.g. "KMXT-4R9Q".
+
+// 2. Your approval page reads what to show, with the proof from its fragment.
+const details = await operations.details({ id, proof, viewer: c.get("authState") });
+
+// 3. The person approves, or denies.
+const approval = await operations.approve({
+  id,
+  proof,
+  actor: c.get("authState"),
+  organizationId, // the one they picked
+});
+await operations.deny({ id, proof, actor: c.get("authState") }); // actor optional
+
+// 4. The tool collects the outcome.
+const status = await operations.poll({ id, token });
+```
+
+Put the proof in the URL **fragment**, never the path or query: a fragment is
+not sent to the server, so it never lands in a log. The page reads it, sends it
+in a request body, and should remove it from the address bar.
+
+A person can also type the code instead of following the link. A code-entry
+page calls `lookupByUserCode({ userCode })`, which ignores case and dashes and
+answers `{ id, kind, expiresAt }` or null, and then carries on with
+`{ id, userCode }` wherever the calls above take `{ id, proof }`. Eight
+characters are guessable in bulk, so rate-limit the routes that accept a code.
+
+The approval page can show the same code the terminal shows, whichever way the
+person arrived: `details` answers with `userCode`. It is kept sealed like an
+outcome, beside an HMAC of it under a subkey of `secret` that `lookupByUserCode`
+searches by — so reading the table does not let anyone try every code offline.
+After `secret` changes, `details` answers `userCode: null` rather than failing.
+It also answers `createdAt`, as `poll` does, for showing when the request was
+made.
+
+Declining needs nobody signed in: a person who receives a link they did not ask
+for must be able to refuse it without an account. `deny` takes the proof or the
+code, and `actor`, when you pass one, only records who declined.
+
+An operation is `pending`, then `completed` or `denied`; `expired` if nobody
+answered in time; `retired` if you ended it with `retire({ id })` — a pending
+one can then no longer be approved, and a completed one gives up whatever it
+still holds. `poll` reports a pending operation past its deadline as `expired`
+straight away, whether or not the sweep has recorded it yet.
+
+Retrying `open` with the same token and the same request answers the way `poll`
+would, completed operations included, so a tool whose response was lost just
+asks again. The same token with a different request is `409 conflict`.
+`findByToken({ token })` answers with the operation a token opened, or null,
+without handing anything over.
+
+Operation ids are random UUIDs unless you pass `id` to `open` — up to 128
+letters, digits, `:`, `_`, `.` or `-` — for instance to keep an id derived from
+the token. An id already taken by another token is `409 conflict`.
+
+### Outcomes that carry a secret
+
+An outcome can be **sealed**: stored encrypted under a key derived from
+`secret`, handed to the tool once, and dropped as soon as it is collected or
+after 15 minutes (`operations.sealTtlMs`). A kind with `deliver: "window"`
+hands it to every `poll` or `redeem` that asks until those 15 minutes are up,
+for a tool that may lose a response and must be able to ask again; the sweep
+drops it after. The answer that hands it over carries
+`outcome`; every answer carries `record`, the part kept in the clear, and
+`collect`, which says whether a sealed outcome is still waiting and how to get
+it. Rotating `secret` makes sealed outcomes still waiting unreadable, so the
+tool has to ask again.
+
+When the tool registered a `loopbackRedirect`, polling never hands the outcome
+over. `approve` answers with `redirectUrl` — the redirect with a one-time
+`?code=` — and your page sends the browser there. The tool's local listener
+receives the code and exchanges it:
+
+```ts
+const { outcome } = await operations.redeem({ id, token, redeemCode });
+```
+
+It needs the token as well as the code, so a code caught in transit is useless
+on its own. Only `127.0.0.1` or `[::1]` with an explicit port is accepted as a
+redirect.
+
+For a kind a signed-in caller opened, `poll` and `redeem` check the credential
+that opened it again before handing a sealed outcome over: revoke that key, and
+what it asked for is not delivered. A sealed outcome that can no longer be read
+because `secret` changed is `410 operation_expired`, and is left in place rather
+than spent.
+
+### The built-in `login`
+
+`login` is registered whenever operations are on, and needs `apiKeys`. Anyone
+may open one — the tool has no credential yet — and it needs `client.label`.
+The person approving must be a member of the organization they choose, with at
+least `operations.login.minRole`. That is `admin` unless you say otherwise —
+the same people who may create an API key in the console. Set
+`login: { minRole: "member" }` to let every member log a tool in. Approving
+creates an API key that belongs to them, in that organization, named after the
+label and marked `source: "cli"`. The tool gets it sealed:
+
+```ts
+{ credential: { token: "key_..." }, organizationId, apiKeyId }
+```
+
+The key is written in the same batch that completes the operation, under a
+guard that re-reads the person's session and membership, so a person signed
+out or removed a moment earlier gets `409 conflict` rather than issuing a key.
+It is handed over only while it is still usable: revoke it before the tool
+collects it, and `poll` or `redeem` answer `410 operation_expired` and drop it.
+`details` reports `blockedBy: "session_required"` when nobody is signed in and
+`"no_eligible_organization"` when the viewer has nowhere they may log a tool in,
+so the page knows what to offer before anyone presses a button.
+
+Turn it off with `operations: { enabled: true, login: false }`; change its
+windows with `login: { minRole, pendingTtlMs, recordTtlMs }`.
+
+### Your own kinds
+
+```ts
+import { defineOperationKind } from "@maxceem/cf-auth";
+import { and, eq } from "drizzle-orm";
+import { z } from "zod";
+import { secret } from "./db/schema";
+
+const rotateSecret = defineOperationKind({
+  name: "secret.rotate",
+  payload: z.object({ secretId: z.string() }),
+  open: { minRole: "member" }, // or "public"
+  browser: true,
+  approverMinRole: "admin", // null asks only for a live session
+  approve: async ({ payload, guard, db }) => ({
+    outcome: { rotated: payload.secretId },
+    statements: [
+      db
+        .update(secret)
+        .set({ rotatedAt: new Date() })
+        .where(and(eq(secret.id, payload.secretId), guard)),
+    ],
+  }),
+});
+
+createCfAuth({ /* ... */, operations: { enabled: true, realm, kinds: [rotateSecret] } });
+```
+
+- `open` says who may open one: anybody, or a caller — session or API key —
+  holding at least `minRole` in its current organization. Such an operation is
+  pinned to that organization, and the credential that opened it is checked
+  again when it is approved: revoke the key, and its pending requests can no
+  longer be approved.
+- `payload` is a zod schema or any function that returns the value to store or
+  throws.
+- `approve` returns `{ outcome, seal?, record?, statements?, afterCommit? }`.
+  AND `guard` into each statement's `WHERE`: it holds only while the operation
+  is pending and in time and both the approver's and the opener's authority are
+  live. The statements and the completion run as one batch, and the operation
+  completes only if the last statement changed a row.
+- Statements must be drizzle query builders — `db.update`, `db.delete`, or
+  `guardedInsert(db, table, values, guard)` for an insert that carries the
+  guard. Not `db.run(sql)`: D1's batch binds parameters through each item's
+  prepared statement, and a raw statement has none. The engine refuses one
+  with parameters on every driver, so your tests catch it before D1 does.
+- `approverMinRole: null` asks only for a live session. The approver may still
+  pass an `organizationId` when the operation has none yet, but must belong to
+  it (any role), or it is `403 not_a_member`; one fixed by the opener cannot
+  be swapped for another.
+- `approver: "proof"` makes the browser proof the whole authority: `approve`
+  and `deny` take `{ id, proof }` and no actor, nobody needs to be signed in,
+  and the write runs under the opener's credential instead. A user code is not
+  enough for such a kind, and it cannot choose an organization. Use it for a
+  step that only collects something from the person the tool sent to the page.
+- `input` is a schema for what the page submits with the approval — a secret
+  typed there, say. It reaches `approve` as `input` and is never stored.
+  `details` reports `approver` and `takesInput` so the page knows what to ask
+  for.
+- `refusal` returns a short code for whatever stands between this viewer and
+  approving, or null. `details` reports it as `blockedBy`, and `approve` refuses
+  with it, so the page and the answer never disagree.
+- `deliverable({ operation, record, tables, now })` may return a SQL condition
+  a sealed outcome must still meet to be handed over — that the credential it
+  carries is still live, say. When it fails, `poll` and `redeem` drop the
+  outcome and answer `410 operation_expired`. `login` uses it for its key.
+- `userCode` adds a code to type; `requireClientLabel` makes `client.label`
+  mandatory; `deliver` is `"once"` or `"window"`; `countsTowardPending` (see
+  [Limits](#limits)); `pendingTtlMs` (15 minutes)
+  is how long it may wait; `recordTtlMs` (90 days) how long the record is
+  kept.
+
+A kind with `browser: false` is completed by your own code, for example a
+bootstrap that creates an account for a tool with no credential yet:
+
+```ts
+const view = await operations.open({ kind: "bootstrap", token, payload });
+// ...create the account...
+await operations.complete({
+  id: view.id,
+  outcome: { credential: { token: plaintext } },
+  record: { accountId },
+  seal: true,
+});
+return operations.poll({ id: view.id, token }); // hands the credential over, once
+```
+
+`complete` also takes `statements`; guard them with
+`await operations.guard({ id })`.
+
+Once completed, `amend({ id, outcome?, seal?, record?, condition?, statements? })`
+changes what the operation holds — renewing a key whose sealed copy lapsed, for
+instance — in one batch with `statements`, guarded by
+`await operations.guard({ id, state: "completed" })` and your own `condition`.
+It answers whether the amendment landed, so of two racing renewals you know
+which one won. Sealing a new outcome on an operation that had a loopback
+redirect drops the redirect — its redeem code went with the first outcome — so
+the new one is collected by `poll`.
+
+### Limits
+
+`open` counts pending operations inside the insert itself, so two tools racing
+for the last slot cannot both take it. An organization may have 10 at once and
+one opener 5 (`operations.limits`). The opener is the signed-in caller, or, for
+a public kind like `login`, whatever you pass as `rateLimitKey` — the address
+your edge saw, say. Without one, public kinds are limited only by what you put
+in front of them. `client.meta` is never counted: it is what the client says
+about itself. Over either limit is `429 too_many_pending`.
+
+Only kinds that wait on a person count: `countsTowardPending` defaults to
+`true` for a kind with a browser step and `false` for one without, which your
+own code completes — one it refuses to complete would otherwise hold a slot
+until its deadline. A kind that does not count is not capped either. Set it
+explicitly to change either default.
+
+### The sweep
+
+Nothing deletes itself. Run the sweep from a scheduled handler:
+
+```ts
+export default {
+  async scheduled(_event, env) {
+    await createCfAuth({ /* ... */ }).operations.sweep();
+  },
+};
+```
+
+It marks overdue pendings `expired`, drops sealed outcomes past their window,
+and deletes records past `recordTtlMs`. `sweepStatements()` returns those as
+drizzle query builders, one per step — always `operationSweepStatementCount`,
+which is 3 — for a batch of your own or a job that budgets its queries.
+
+### Errors
+
+| Code                  | Status | When                                                          |
+| --------------------- | ------ | ------------------------------------------------------------- |
+| `operation_not_found` | 404    | Unknown id — and a wrong token, which is answered the same way |
+| `invalid_proof`       | 403    | Wrong browser proof, user code or redeem code                 |
+| `operation_expired`   | 410    | Nobody answered in time, it was retired, a sealed outcome's window passed or it can no longer be read, or its opener's credential is gone |
+| `operation_denied`    | 409    | It was denied                                                  |
+| `operation_pending`   | 409    | Redeeming before it was approved                               |
+| `already_completed`   | 409    | Approving or completing it again; redeeming a `once` outcome twice |
+| `too_many_pending`    | 429    | Over a pending limit                                           |
+| `not_a_member`        | 403    | The approver lacks the membership or role the kind needs, or asked to attach an organization they do not belong to |
+| `session_required`    | 403    | The approver is not a signed-in person                         |
+| `validation_error`    | 422    | A payload, input, token, id or client field was refused        |
+
+Refused input is `422 validation_error`, as everywhere else in cf-auth. Map it
+to 400 in your error handler if that is what your API answers with.
 
 ---
 
@@ -642,4 +974,6 @@ pnpm check         # types + tests + build
 
 Tests run against real better-auth over an in-memory database, through a real
 Hono app, so sign-up, sign-in, cookies and bearer keys all go through the same
-code your app would use.
+code your app would use. `test/operations-d1.test.ts` also runs the operations
+engine on a real D1 database through Miniflare, because D1's batch accepts less
+than libsql's and only D1 shows it.

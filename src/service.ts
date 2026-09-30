@@ -1,3 +1,4 @@
+import type { SQL } from "drizzle-orm";
 import type { ResolvedCfAuthConfig } from "./config.js";
 import { generateApiKeyToken, hashApiKeyToken } from "./crypto.js";
 import {
@@ -33,6 +34,61 @@ const ensureNonEmpty = (value: string | null | undefined, label: string) => {
   }
 
   return normalized;
+};
+
+/** A key's `source`: a short lowercase word, `console` unless the caller names one. */
+export const normalizeApiKeySource = (value: string | undefined): string => {
+  if (value === undefined) return "console";
+  const normalized = value.trim();
+  if (!/^[a-z][a-z0-9_.-]{0,31}$/.test(normalized)) {
+    throw validationError("API key source must be a short lowercase word, e.g. `cli`");
+  }
+  return normalized;
+};
+
+/** A key's `label`: free text for people, at most 200 characters, blank meaning none. */
+export const normalizeApiKeyLabel = (value: string | null | undefined): string | null => {
+  const normalized = value?.trim();
+  if (!normalized) return null;
+  if (normalized.length > 200) throw validationError("API key label is too long");
+  return normalized;
+};
+
+/**
+ * The user and session behind an interactive human {@link AuthState}, or a
+ * `403 session_required` when it is anything else — an API key, a service, or
+ * a state no session backs.
+ */
+export const requireInteractiveSession = (
+  state: AuthState,
+): { userId: string; sessionId: string } => {
+  const sessionId = state.actor?.credentialId;
+  if (
+    !state.authenticated ||
+    state.assurance !== "interactive" ||
+    state.credentialType !== "session" ||
+    state.user?.kind !== "human" ||
+    !sessionId
+  )
+    throw new CfAuthError("session_required", "An interactive human session is required", 403);
+  return { userId: state.user.id, sessionId };
+};
+
+/**
+ * Hands an event to `onEvent`. A failure there never breaks the operation
+ * that raised it; it goes to `onError` instead.
+ */
+export const emitCfAuthEvent = async (config: ResolvedCfAuthConfig, event: CfAuthEvent) => {
+  if (!config.onEvent) {
+    return;
+  }
+
+  try {
+    await config.onEvent(event);
+  } catch (error) {
+    // Never let audit/telemetry failures break authentication.
+    config.onError(error, { scope: `onEvent:${event.type}` });
+  }
 };
 
 /**
@@ -112,6 +168,10 @@ export interface IssueIdentityApiKeyInput {
   expiresAt?: Date | null;
   /** Issue inactive until a protected credential exchange atomically enables it. */
   enabled?: boolean;
+  /** Where the key was issued from. Default: `"console"`. */
+  source?: string;
+  /** A human-readable note about the holder. */
+  label?: string | null;
 }
 
 export interface ClaimOrganizationInput {
@@ -189,6 +249,17 @@ export interface CfAuthService {
    * provisional deadline in the same transaction. Idempotent.
    */
   claimOrganization(input: ClaimOrganizationInput): Promise<OrganizationMembership>;
+  /**
+   * The same claim as guarded drizzle statements, for a batch of your own —
+   * an operation's approval, whose `guard` goes in `condition` so the
+   * ownership change lands in the batch that completes the operation or not
+   * at all. `afterCommit` emits `organization.claimed` if the claim landed.
+   * Shaped to spread into an operation kind's `approve` result.
+   */
+  claimOrganizationStatements(input: ClaimOrganizationInput & { condition?: SQL }): {
+    statements: unknown[];
+    afterCommit: () => Promise<void>;
+  };
   listOrganizationMembers(input: {
     actor: AuthState;
     organizationId: string;
@@ -227,6 +298,10 @@ export interface CfAuthService {
     actor: AuthState;
     name: string;
     expiresAt?: Date | null;
+    /** Where the key was issued from. Default: `"console"`. */
+    source?: string;
+    /** A human-readable note about the holder. */
+    label?: string | null;
   }): Promise<CreatedApiKey>;
   /** Requires a current owner or admin membership. */
   revokeApiKey(input: {
@@ -234,6 +309,12 @@ export interface CfAuthService {
     actor: AuthState;
     apiKeyId: string;
   }): Promise<ApiKeySummary | null>;
+  /**
+   * Revokes exactly the API key the caller authenticated with — a CLI logging
+   * itself out. Needs no role: holding a key is authority enough to end it.
+   * Throws `403 api_key_required` for any other credential.
+   */
+  revokeOwnApiKey(input: { actor: AuthState }): Promise<ApiKeySummary>;
 }
 
 export const createAuthService = (
@@ -275,21 +356,12 @@ export const createAuthService = (
       tokenHint: token.tokenHint,
       enabled: input.enabled ?? true,
       expiresAt,
+      source: normalizeApiKeySource(input.source),
+      label: normalizeApiKeyLabel(input.label),
     });
     return { ...summary, plaintext: token.plaintext };
   };
-  const emit = async (event: CfAuthEvent) => {
-    if (!config.onEvent) {
-      return;
-    }
-
-    try {
-      await config.onEvent(event);
-    } catch (error) {
-      // Never let audit/telemetry failures break authentication.
-      config.onError(error, { scope: `onEvent:${event.type}` });
-    }
-  };
+  const emit = (event: CfAuthEvent) => emitCfAuthEvent(config, event);
 
   const requireApiKeysEnabled = () => {
     if (!config.apiKeys.enabled) {
@@ -446,7 +518,14 @@ export const createAuthService = (
       }
 
       const membership = await provisionDefaultOrganization(state.user);
-      return toSessionAuthState(state.user, [membership], membership.organization.id);
+      // Carries the session through: the state is still the one that session
+      // proves, and an actor without its credential could not act.
+      return toSessionAuthState(
+        state.user,
+        [membership],
+        membership.organization.id,
+        state.actor?.credentialId ?? null,
+      );
     },
 
     async provisionNewUser(user) {
@@ -519,6 +598,26 @@ export const createAuthService = (
         membership.organization.id,
         actor.actor?.credentialId ?? null,
       );
+    },
+
+    claimOrganizationStatements(input) {
+      const { userId, sessionId } = requireInteractiveSession(input.actor);
+      const statements = repository.claimOrganizationStatements({
+        organizationId: input.organizationId,
+        userId,
+        sessionId,
+        ...(input.provisioning ? { provisioning: input.provisioning } : {}),
+        ...(input.condition ? { condition: input.condition } : {}),
+      });
+      return {
+        statements,
+        afterCommit: async () => {
+          const membership = await repository.findMembership(userId, input.organizationId);
+          if (membership?.role === "owner" && membership.organization.expiresAt === null) {
+            await emit({ type: "organization.claimed", userId, organizationId: input.organizationId });
+          }
+        },
+      };
     },
 
     async claimOrganization(input) {
@@ -709,6 +808,8 @@ export const createAuthService = (
         userId: actorUserId,
         name,
         ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+        ...(input.source !== undefined ? { source: input.source } : {}),
+        ...(input.label !== undefined ? { label: input.label } : {}),
       });
 
       await emit({
@@ -746,6 +847,33 @@ export const createAuthService = (
         type: "api_key.revoked",
         actorUserId,
         organizationId: input.organizationId,
+        apiKeyId: apiKey.id,
+        name: apiKey.name,
+      });
+
+      return apiKey;
+    },
+
+    async revokeOwnApiKey({ actor }) {
+      requireApiKeysEnabled();
+      if (!actor.authenticated || !actor.user) throw unauthorized();
+      const apiKeyId = actor.actor?.credentialId;
+      const organizationId = actor.organization?.id;
+      if (actor.credentialType !== "apiKey" || !apiKeyId || !organizationId) {
+        throw new CfAuthError(
+          "api_key_required",
+          "Only an API key can revoke itself; sign-in sessions sign out instead",
+          403,
+        );
+      }
+
+      const apiKey = await repository.revokeApiKey(apiKeyId, organizationId);
+      if (!apiKey) throw unauthorized();
+
+      await emit({
+        type: "api_key.revoked",
+        actorUserId: actor.user.id,
+        organizationId,
         apiKeyId: apiKey.id,
         name: apiKey.name,
       });

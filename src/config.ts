@@ -3,8 +3,9 @@ import { drizzle } from "drizzle-orm/d1";
 import type { BaseSQLiteDatabase } from "drizzle-orm/sqlite-core";
 import type { SQL } from "drizzle-orm";
 import { validationError } from "./errors.js";
+import type { OperationKind } from "./operations.js";
 import { cfAuthTables, type CfAuthTables } from "./schema.js";
-import type { AuthUser, CfAuthEvent } from "./types.js";
+import { organizationRoles, type AuthUser, type CfAuthEvent, type OrganizationRole } from "./types.js";
 
 /**
  * Any async drizzle SQLite database — `drizzle-orm/d1` in production,
@@ -63,6 +64,48 @@ export interface ApiKeysConfig {
    * resolves to the `api` action source. Default: `"X-Client"`.
    */
   clientHeader?: string;
+}
+
+/** The built-in `login` operation: a CLI asks, a person approves, the CLI gets an API key. */
+export interface LoginOperationConfig {
+  /**
+   * The least role the approver must hold in the organization they log the
+   * CLI in to. Default: `"admin"`, matching who may create an API key in the
+   * console; lower it to `"member"` to let every member log a CLI in.
+   */
+  minRole?: OrganizationRole;
+  /** How long the person has to approve. Default: 15 minutes. */
+  pendingTtlMs?: number;
+  /** How long the record is kept, counted from when the CLI asked. Default: 90 days. */
+  recordTtlMs?: number;
+}
+
+export interface OperationsConfig {
+  /** Turn on browser-approved operations and the `operations` service. Default: `false`. */
+  enabled?: boolean;
+  /**
+   * Mixed into every browser proof and user code, so a proof made for one
+   * deployment means nothing to another that shares its database schema. Use
+   * a stable public identifier of the deployment. Changing it invalidates the
+   * proofs of operations still pending. Default: `appName`.
+   */
+  realm?: string;
+  /** Your own operation kinds. Names must be unique; `login` is taken while the built-in one is on. */
+  kinds?: readonly OperationKind[];
+  /** The built-in `login` kind. Needs `apiKeys.enabled`. Default: on; pass `false` to leave it out. */
+  login?: boolean | LoginOperationConfig;
+  limits?: {
+    /** Pending operations one organization may have at once. Default: `10`. */
+    pendingPerOrganization?: number;
+    /**
+     * Pending operations one opener may have at once: the signed-in opener,
+     * or, for a public kind, the client address passed as `client.meta.ip`.
+     * Default: `5`.
+     */
+    pendingPerOpener?: number;
+  };
+  /** How long a sealed outcome waits to be collected. Default: 15 minutes. */
+  sealTtlMs?: number;
 }
 
 export interface EmailAndPasswordConfig {
@@ -167,6 +210,7 @@ export interface CfAuthConfig {
   organizations?: OrganizationsConfig;
   apiKeys?: ApiKeysConfig;
   cookies?: CookieConfig;
+  operations?: OperationsConfig;
 
   /** Tables to read/write. Defaults to {@link cfAuthTables}. */
   tables?: CfAuthTables;
@@ -199,6 +243,157 @@ const normalizeBasePath = (value: string) => {
   return trimTrailingSlash(withLeadingSlash) || "/";
 };
 
+export interface ResolvedOperationsConfig {
+  enabled: boolean;
+  realm: string;
+  /** The app's own kinds; the built-in `login` is added by the service when {@link login} is set. */
+  kinds: readonly OperationKind[];
+  login: Required<LoginOperationConfig> | null;
+  limits: { pendingPerOrganization: number; pendingPerOpener: number };
+  sealTtlMs: number;
+}
+
+const minute = 60_000;
+const day = 24 * 60 * minute;
+/** Defaults a kind falls back to; see {@link OperationKind}. */
+export const operationDefaults = {
+  pendingTtlMs: 15 * minute,
+  recordTtlMs: 90 * day,
+  sealTtlMs: 15 * minute,
+} as const;
+
+const operationKindName = /^[a-z][a-z0-9._-]{0,63}$/;
+
+const positiveNumber = (value: number | undefined, fallback: number, label: string) => {
+  if (value === undefined) return fallback;
+  if (!Number.isFinite(value) || value <= 0) throw validationError(`\`${label}\` must be a positive number`);
+  return value;
+};
+
+const positiveInteger = (value: number | undefined, fallback: number, label: string) => {
+  const resolved = positiveNumber(value, fallback, label);
+  if (!Number.isInteger(resolved)) throw validationError(`\`${label}\` must be a whole number`);
+  return resolved;
+};
+
+/** Checks one kind's own settings; exported so the built-in kinds go through the same rules. */
+export const validateOperationKind = (kind: OperationKind, label?: string): void => {
+  if (!operationKindName.test(kind.name ?? "")) {
+    throw validationError(
+      `Operation kind name \`${String(kind.name)}\` must be lowercase letters, digits, \`.\`, \`_\` or \`-\``,
+    );
+  }
+  label ??= `operations.kinds[${kind.name}]`;
+  if (kind.open !== "public" && !organizationRoles.includes(kind.open?.minRole)) {
+    throw validationError(`\`${label}.open\` must be "public" or { minRole }`);
+  }
+  if (
+    kind.approverMinRole !== undefined &&
+    kind.approverMinRole !== null &&
+    !organizationRoles.includes(kind.approverMinRole)
+  ) {
+    throw validationError(`\`${label}.approverMinRole\` must be an organization role or null`);
+  }
+  if (kind.approver !== undefined && kind.approver !== "session" && kind.approver !== "proof") {
+    throw validationError(`\`${label}.approver\` must be "session" or "proof"`);
+  }
+  if (kind.countsTowardPending !== undefined && typeof kind.countsTowardPending !== "boolean") {
+    throw validationError(`\`${label}.countsTowardPending\` must be a boolean`);
+  }
+  if (kind.deliver !== undefined && kind.deliver !== "once" && kind.deliver !== "window") {
+    throw validationError(`\`${label}.deliver\` must be "once" or "window"`);
+  }
+  if (!kind.browser && (kind.userCode || kind.approve || kind.refusal || kind.input || kind.approver)) {
+    throw validationError(
+      `\`${label}\`: userCode, approver, input, approve and refusal need a browser step`,
+    );
+  }
+  const pending = positiveNumber(kind.pendingTtlMs, operationDefaults.pendingTtlMs, `${label}.pendingTtlMs`);
+  const record = positiveNumber(kind.recordTtlMs, operationDefaults.recordTtlMs, `${label}.recordTtlMs`);
+  if (record < pending) {
+    throw validationError(`\`${label}.recordTtlMs\` must be at least its pendingTtlMs`);
+  }
+};
+
+const resolveOperations = (
+  config: CfAuthConfig,
+  apiKeysEnabled: boolean,
+): ResolvedOperationsConfig => {
+  const input = config.operations ?? {};
+  const enabled = input.enabled ?? false;
+  const loginInput = input.login ?? true;
+  const login =
+    enabled && loginInput !== false
+      ? {
+          minRole: (loginInput === true ? undefined : loginInput.minRole) ?? "admin",
+          pendingTtlMs: positiveNumber(
+            loginInput === true ? undefined : loginInput.pendingTtlMs,
+            operationDefaults.pendingTtlMs,
+            "operations.login.pendingTtlMs",
+          ),
+          recordTtlMs: positiveNumber(
+            loginInput === true ? undefined : loginInput.recordTtlMs,
+            operationDefaults.recordTtlMs,
+            "operations.login.recordTtlMs",
+          ),
+        }
+      : null;
+
+  if (login && !organizationRoles.includes(login.minRole)) {
+    throw validationError("`operations.login.minRole` must be an organization role");
+  }
+  if (login) {
+    // The built-in kind obeys the same rules as an app's own.
+    validateOperationKind({
+      name: "login",
+      open: "public",
+      browser: true,
+      userCode: true,
+      requireClientLabel: true,
+      approverMinRole: login.minRole,
+      pendingTtlMs: login.pendingTtlMs,
+      recordTtlMs: login.recordTtlMs,
+    }, "operations.login");
+  }
+  if (login && !apiKeysEnabled) {
+    throw validationError(
+      "The `login` operation issues API keys; set `apiKeys.enabled: true` or `operations.login: false`",
+    );
+  }
+
+  const kinds = input.kinds ?? [];
+  const names = new Set<string>(login ? ["login"] : []);
+  for (const kind of kinds) {
+    validateOperationKind(kind);
+    if (names.has(kind.name)) {
+      throw validationError(`Operation kind \`${kind.name}\` is declared twice`);
+    }
+    names.add(kind.name);
+  }
+
+  const realm = input.realm?.trim() || config.appName.trim();
+
+  return {
+    enabled,
+    realm,
+    kinds,
+    login,
+    limits: {
+      pendingPerOrganization: positiveInteger(
+        input.limits?.pendingPerOrganization,
+        10,
+        "operations.limits.pendingPerOrganization",
+      ),
+      pendingPerOpener: positiveInteger(
+        input.limits?.pendingPerOpener,
+        5,
+        "operations.limits.pendingPerOpener",
+      ),
+    },
+    sealTtlMs: positiveNumber(input.sealTtlMs, operationDefaults.sealTtlMs, "operations.sealTtlMs"),
+  };
+};
+
 export interface ResolvedCfAuthConfig {
   appName: string;
   db: CfAuthDatabase;
@@ -223,6 +418,7 @@ export interface ResolvedCfAuthConfig {
     resolveDefaultOrganizationName: (user: AuthUser) => string;
   };
   apiKeys: Required<ApiKeysConfig>;
+  operations: ResolvedOperationsConfig;
   cookies: {
     prefix: string;
     betterAuthPrefix: string;
@@ -292,6 +488,9 @@ export const resolveConfig = (config: CfAuthConfig): ResolvedCfAuthConfig => {
     };
   }
 
+  const apiKeysEnabled = config.apiKeys?.enabled ?? false;
+  const operations = resolveOperations(config, apiKeysEnabled);
+
   const trustedOrigins = [
     ...new Set(
       [baseUrl, ...(config.trustedOrigins ?? [])]
@@ -330,8 +529,9 @@ export const resolveConfig = (config: CfAuthConfig): ResolvedCfAuthConfig => {
           ? defaultOrganizationName
           : () => defaultOrganizationName ?? "My Organization",
     },
+    operations,
     apiKeys: {
-      enabled: config.apiKeys?.enabled ?? false,
+      enabled: apiKeysEnabled,
       tokenPrefix: config.apiKeys?.tokenPrefix ?? "key_",
       clientHeader: config.apiKeys?.clientHeader ?? "X-Client",
     },

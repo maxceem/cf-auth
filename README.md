@@ -12,6 +12,9 @@ multi-tenant part that every one of these apps ends up writing again:
 - Hono middleware that works out who is calling, from a session cookie **or** an
   API key.
 - A signed cookie that remembers which organization the user picked.
+- **Operations approved in a browser**: a CLI asks, a signed-in person approves
+  on your page, and the CLI collects the result. The built-in `login` gives a
+  CLI an API key of its own that way.
 
 This is a library, not a service. Your app keeps its own users, organizations
 and API keys in its **own** D1 database. There is no central server and nothing
@@ -77,11 +80,39 @@ const { cookie, organizationId } = await createTestSessions(cfAuth).human();
 
 See [the documentation](./docs/index.md#testing-your-own-app).
 
+## Logging in a CLI
+
+Turn on operations and the built-in `login` is there. Your routes call the
+service; the CLI keeps one random token and never sees a password:
+
+```ts
+const cfAuth = createCfAuth({
+  // ...the usual settings
+  apiKeys: { enabled: true },
+  operations: { enabled: true, realm: env.DEPLOYMENT_ID },
+});
+
+// The CLI asks, and prints the link and the code.
+const view = await cfAuth.operations.open({
+  kind: "login",
+  token,
+  client: { label: "CLI on mac-studio" },
+});
+// A signed-in person approves on your page.
+await cfAuth.operations.approve({ id, proof, actor: c.get("authState"), organizationId });
+// The CLI collects its key, once.
+const { outcome } = await cfAuth.operations.poll({ id, token });
+```
+
+See [Operations approved in a browser](docs/index.md#operations-approved-in-a-browser)
+for the loopback redirect, user codes, your own kinds and the sweep.
+
 ## Documentation
 
 [`docs/index.md`](docs/index.md) covers setup and migrations, the options,
-reading the auth state, organizations and roles, API keys, the organization
-cookie, audit events, and the environment variables.
+reading the auth state, organizations and roles, API keys, operations approved
+in a browser, the organization cookie, audit events, and the environment
+variables.
 
 ## License
 

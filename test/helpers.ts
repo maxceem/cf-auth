@@ -248,3 +248,73 @@ export const createTestAuth = async (overrides: TestOverrides = {}) => {
 };
 
 export type TestAuth = Awaited<ReturnType<typeof createTestAuth>>;
+
+/** The reference migrations, split into statements, in order. */
+export const migrationStatements = async (): Promise<string[]> => {
+  const fileNames = (await readdir(migrationsDirectory))
+    .filter((fileName) => fileName.endsWith(".sql"))
+    .sort((left, right) => left.localeCompare(right));
+  const statements: string[] = [];
+  for (const fileName of fileNames) {
+    const sql = await readFile(`${migrationsDirectory}${fileName}`, "utf8");
+    statements.push(
+      ...sql
+        .split(statementBreakpoint)
+        .map((value) => value.trim())
+        .filter(Boolean),
+    );
+  }
+  return statements;
+};
+
+/**
+ * A harness on a real D1 database — Miniflare's, which runs on workerd — so
+ * the `drizzle-orm/d1` driver and D1's own batch are exercised, not libsql's.
+ * The two differ in what a batch can carry, which libsql alone never shows.
+ *
+ * One Miniflare per call; `dispose` it when the file is done.
+ */
+export const createD1TestAuth = async (overrides: TestOverrides = {}) => {
+  const { Miniflare } = await import("miniflare");
+  const miniflare = new Miniflare({
+    modules: true,
+    script: "export default { fetch() { return new Response(null, { status: 404 }); } }",
+    d1Databases: { DB: crypto.randomUUID() },
+  });
+  const d1 = (await miniflare.getD1Database("DB")) as unknown as D1Database;
+  await d1.batch((await migrationStatements()).map((statement) => d1.prepare(statement)));
+
+  const events: CfAuthEvent[] = [];
+  const errors: unknown[] = [];
+  const cfAuth = createCfAuth({
+    appName: "Test App",
+    secret: testSecret,
+    baseUrl: testBaseUrl,
+    apiKeys: { enabled: true },
+    ...overrides,
+    d1,
+    onEvent: (event) => {
+      events.push(event);
+    },
+    onError: (error) => {
+      errors.push(error);
+    },
+  });
+  const sessions = createTestSessions(cfAuth);
+
+  return {
+    cfAuth,
+    d1,
+    events,
+    errors,
+    sessions,
+    actorFor: (userId: string, currentOrganizationId: string | null = null) =>
+      sessions.actorFor(userId, currentOrganizationId),
+    /** One raw statement, for arranging state a test needs. */
+    execute: async (query: string, ...args: unknown[]) =>
+      (await d1.prepare(query).bind(...args).all<Record<string, unknown>>()).results,
+    dispose: () => miniflare.dispose(),
+  };
+};
+
+export type D1TestAuth = Awaited<ReturnType<typeof createD1TestAuth>>;
