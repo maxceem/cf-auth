@@ -67,6 +67,35 @@ app.get("/api/things", (c) => {
 You also add the package's tables to your own drizzle schema and migrate them
 with your normal pipeline — the package never runs migrations itself.
 
+## Credential grants
+
+A role says what a person or service may do in an organization; a **grant**
+says how much of that one credential may use. It is `"read"` or `"manage"`,
+and what a request may do is the role and the grant together. A session is
+always `manage`. An API key is `manage` unless it was issued with
+`grant: "read"` — through `createApiKey`, `issueServiceApiKey`, or the
+`login` operation's payload `{ grant: "read" }` — and keys from before grants
+existed are `manage`.
+
+`c.get("authState").grant` carries it. cf-auth's own writes — members, keys,
+claims — need `manage` and refuse a `read` credential with
+`403 grant_insufficient`; a credential never issues a key with more than it
+holds, and a `read` one issues none. Gate your own writes the same way:
+
+```ts
+import { requireGrant, requireOrganization } from "@maxceem/cf-auth";
+
+app.post("/api/things", (c) => {
+  const state = requireGrant(c.get("authState"), "manage"); // 403 grant_insufficient for a read key
+  const { organization } = requireOrganization(state, "admin");
+  // ...
+});
+```
+
+An operation kind a caller opens takes `grant` too, `"manage"` unless it says
+`"read"`, checked when it opens and again when its write lands. See
+[Credential grants](docs/index.md#credential-grants).
+
 ## Testing
 
 Tests that just need an authenticated caller should not pay for a password hash.

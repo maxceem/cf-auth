@@ -47,6 +47,7 @@ import {
   CfAuthError,
   conflict,
   forbidden,
+  grantInsufficient,
   invalidProof,
   operationDenied,
   operationExpired,
@@ -65,11 +66,13 @@ import type { CfAuthTables } from "./schema.js";
 import { requireInteractiveSession } from "./service.js";
 import {
   createEmptyAuthState,
+  hasGrantAtLeast,
   hasRoleAtLeast,
   isOrganizationExpired,
   organizationRoles,
   type AuthState,
   type AuthUser,
+  type CredentialGrant,
   type OperationState,
   type OrganizationMembership,
   type OrganizationRole,
@@ -199,8 +202,18 @@ export interface OperationRefusalContext<Payload = unknown> {
 export interface OperationKindDefinition<Payload = unknown, Outcome = unknown, Input = unknown> {
   /** Lowercase letters, digits, `.`, `_` and `-`. */
   name: string;
-  /** How the payload is read. Leave it out for a kind that takes none. */
+  /**
+   * How the payload is read. Leave it out for a kind that takes none. A
+   * schema that answers `undefined` stores no payload, which the hooks then
+   * see as `null`.
+   */
   payload?: OperationPayloadSchema<Payload>;
+  /**
+   * What `details` shows the approval page as `payload`, from the stored one
+   * (`null` when none was stored). Default: the stored payload as it is. Use
+   * it to spell out a default the stored form leaves implicit.
+   */
+  showPayload?(payload: Payload | null): unknown;
   /**
    * How the approval page's own submission is read — a secret typed on the
    * page, say. It reaches `approve` and is never stored. Leave it out for a
@@ -213,6 +226,17 @@ export interface OperationKindDefinition<Payload = unknown, Outcome = unknown, I
    * organization.
    */
   open: "public" | { minRole: OrganizationRole };
+  /**
+   * For a kind a caller opens: the least grant the opener's credential must
+   * carry. Checked at `open`, and again inside every guarded write that
+   * rechecks the opener — approval, `complete`, `guard`, and handing over a
+   * sealed outcome — so a key that no longer carries it cannot finish what it
+   * started. A session is always `manage`. Default: `"manage"`; say `"read"`
+   * for a kind that only reads.
+   *
+   * Not for a `"public"` kind, which binds no opener credential to check.
+   */
+  grant?: CredentialGrant;
   /** Whether it is approved in a browser. Without one, the app calls `complete`. */
   browser: boolean;
   /**
@@ -664,6 +688,7 @@ export const createOperationsService = (
   const approverMinRole = (kind: OperationKind) =>
     kind.approverMinRole === undefined ? "admin" : kind.approverMinRole;
   const countsTowardPending = (kind: OperationKind) => kind.countsTowardPending ?? kind.browser;
+  const openerGrant = (kind: OperationKind): CredentialGrant => kind.grant ?? "manage";
   const countingKinds = [...kinds.values()].filter(countsTowardPending).map((kind) => kind.name);
 
   /** A row whose kind is no longer registered still answers its client, delivering once. */
@@ -693,6 +718,10 @@ export const createOperationsService = (
       return null;
     }
     const parsed = parseWith(kind.payload, value, `payload for operation kind \`${kind.name}\``);
+    // A schema that answers `undefined` stores no payload, exactly as a kind
+    // without one does — so a kind that gains a schema still hashes the
+    // requests it already stored, and a retry of one is not a conflict.
+    if (parsed === undefined) return null;
     const json = JSON.stringify(parsed ?? null);
     if (json.length > maxPayloadLength) throw validationError("Operation payload is too large");
     return json;
@@ -855,8 +884,8 @@ export const createOperationsService = (
 
   /**
    * The opener's authority, rechecked at write time: the credential that
-   * opened the operation is still live and still carries the role its kind
-   * requires to open one.
+   * opened the operation is still live and still carries the role and the
+   * grant its kind requires to open one.
    */
   const openerSql = (kind: OperationKind, row: OperationRow, now: number): SQL | undefined => {
     if (kind.open === "public") return undefined;
@@ -866,6 +895,7 @@ export const createOperationsService = (
       userId: row.openerUserId,
       credentialId: row.openerCredentialId,
       allowedRoles: rolesAtLeast(kind.open.minRole),
+      grant: openerGrant(kind),
       nowMs: now,
     });
   };
@@ -873,7 +903,13 @@ export const createOperationsService = (
   /**
    * {@link openerSql} for a stored row, whether or not its kind is still
    * registered: a row with an opener but no known kind still needs that
-   * opener's credential, at any role.
+   * opener's credential, at any role but with the `manage` grant. What the
+   * kind asked for is gone with it, so this assumes the most it could have
+   * asked — the default — rather than the least: removing a kind must never
+   * release to a `read` key what the kind would have withheld from one.
+   *
+   * Only the delivery paths (`poll`, `redeem`) reach the fallback; `approve`,
+   * `complete` and `guard` refuse an unregistered kind outright.
    */
   const openerSqlForRow = (row: OperationRow, now: number): SQL | undefined => {
     const kind = kinds.get(row.kind);
@@ -885,6 +921,7 @@ export const createOperationsService = (
       userId: row.openerUserId,
       credentialId: row.openerCredentialId,
       allowedRoles: organizationRoles,
+      grant: "manage",
       nowMs: now,
     });
   };
@@ -1061,6 +1098,7 @@ export const createOperationsService = (
         const opener = input.opener;
         if (!opener) throw unauthorized();
         const { user, organization } = requireOrganization(opener, kind.open.minRole);
+        if (!hasGrantAtLeast(opener.grant, openerGrant(kind))) throw grantInsufficient();
         const credentialId = opener.actor?.credentialId;
         if (!user || !credentialId) throw unauthorized();
         if (isOrganizationExpired(organization)) throw organizationExpired();
@@ -1199,7 +1237,7 @@ export const createOperationsService = (
         id: row.id,
         kind: row.kind,
         state: record.state,
-        payload: record.payload,
+        payload: kind.showPayload ? kind.showPayload(record.payload) : record.payload,
         client: record.client,
         organization: row.organizationId ? await repository.findOrganization(row.organizationId) : null,
         viewer: viewer ? { user: viewer.user!, memberships: viewer.memberships } : null,

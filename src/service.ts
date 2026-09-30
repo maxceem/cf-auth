@@ -5,14 +5,20 @@ import {
   CfAuthError,
   conflict,
   forbidden,
+  grantInsufficient,
   organizationExpired,
   unauthorized,
   validationError,
 } from "./errors.js";
-import type { CfAuthRepository, MembershipMutationResult } from "./repository.js";
+import {
+  normalizeCredentialGrant,
+  type CfAuthRepository,
+  type MembershipMutationResult,
+} from "./repository.js";
 import {
   canManageOrganization,
   createEmptyAuthState,
+  hasGrantAtLeast,
   isApiKeyActionSource,
   isOrganizationExpired,
   type ActionSource,
@@ -21,6 +27,7 @@ import {
   type AuthUser,
   type CfAuthEvent,
   type CreatedApiKey,
+  type CredentialGrant,
   type OrganizationMember,
   type OrganizationMembership,
   type OrganizationRole,
@@ -132,6 +139,9 @@ export const toSessionAuthState = (
     memberships,
     organization: current?.organization ?? null,
     role: current?.role ?? null,
+    // A person's own session is not a delegated credential: it carries all
+    // of their role.
+    grant: "manage",
   };
 };
 
@@ -140,6 +150,8 @@ export const toApiKeyAuthState = (
   membership: OrganizationMembership,
   apiKeyId: string,
   source: ActionSource,
+  /** The key's own grant. Default: `"manage"`, what a key issued before grants existed carries. */
+  grant: CredentialGrant = "manage",
 ): AuthState => {
   if (!isApiKeyActionSource(source)) return createEmptyAuthState();
   return {
@@ -158,6 +170,7 @@ export const toApiKeyAuthState = (
     memberships: [membership],
     organization: membership.organization,
     role: membership.role,
+    grant,
   };
 };
 
@@ -172,6 +185,12 @@ export interface IssueIdentityApiKeyInput {
   source?: string;
   /** A human-readable note about the holder. */
   label?: string | null;
+  /**
+   * How much of the service's authority the key may exercise. Default:
+   * `"manage"`. Trusted issuance has no actor to bound it, so it is taken as
+   * given.
+   */
+  grant?: CredentialGrant;
 }
 
 export interface ClaimOrganizationInput {
@@ -292,7 +311,11 @@ export interface CfAuthService {
   resolveApiKeyAuthState(plaintext: string, source?: ActionSource): Promise<AuthState>;
   /** Requires current organization membership. */
   listApiKeys(input: { organizationId: string; actor: AuthState }): Promise<ApiKeySummary[]>;
-  /** Requires a current owner or admin membership. */
+  /**
+   * Requires a current owner or admin membership and a credential with the
+   * `manage` grant. The new key's grant may not exceed the actor's: a `read`
+   * credential issues no keys at all (`403 grant_insufficient`).
+   */
   createApiKey(input: {
     organizationId: string;
     actor: AuthState;
@@ -302,8 +325,10 @@ export interface CfAuthService {
     source?: string;
     /** A human-readable note about the holder. */
     label?: string | null;
+    /** How much of the holder's authority the key may exercise. Default: `"manage"`. */
+    grant?: CredentialGrant;
   }): Promise<CreatedApiKey>;
-  /** Requires a current owner or admin membership. */
+  /** Requires a current owner or admin membership and the `manage` grant. */
   revokeApiKey(input: {
     organizationId: string;
     actor: AuthState;
@@ -311,8 +336,9 @@ export interface CfAuthService {
   }): Promise<ApiKeySummary | null>;
   /**
    * Revokes exactly the API key the caller authenticated with — a CLI logging
-   * itself out. Needs no role: holding a key is authority enough to end it.
-   * Throws `403 api_key_required` for any other credential.
+   * itself out. Needs no role and no grant: holding a key, even a `read` one,
+   * is authority enough to end it. Throws `403 api_key_required` for any other
+   * credential.
    */
   revokeOwnApiKey(input: { actor: AuthState }): Promise<ApiKeySummary>;
 }
@@ -321,14 +347,40 @@ export const createAuthService = (
   repository: CfAuthRepository,
   config: ResolvedCfAuthConfig,
 ): CfAuthService => {
-  const requireActor = (state: AuthState, organizationId: string): string => {
+  /**
+   * The acting user, once the credential may act in `organizationId` with at
+   * least the `needed` grant.
+   *
+   * Every credential but a session is bound to its own organization — whoever
+   * holds it, a person or a service, and whatever kind of credential it is,
+   * so a new kind is restricted without anyone remembering to. The grant is
+   * checked after that binding, so a key reaching into another organization
+   * is told so rather than being told its grant is too narrow.
+   */
+  const requireActor = (
+    state: AuthState,
+    organizationId: string,
+    needed: CredentialGrant,
+  ): string => {
     if (!state.authenticated || !state.user) throw unauthorized();
-    if (
-      state.credentialType === "apiKey" &&
-      state.organization?.id !== organizationId
-    )
-      throw forbidden("This API key is restricted to another organization");
+    requireOwnOrganization(state, organizationId);
+    if (!hasGrantAtLeast(state.grant, needed)) throw grantInsufficient();
     return state.user.id;
+  };
+  const requireOwnOrganization = (state: AuthState, organizationId: string) => {
+    if (state.credentialType !== "session" && state.organization?.id !== organizationId)
+      throw forbidden("This API key is restricted to another organization");
+  };
+  /**
+   * The refusals a claim owes a credential before asking whether it is a
+   * session, in {@link requireActor}'s order: a credential naming another
+   * organization is told so first, then a narrow one about its grant — which
+   * it can do something about — before being told it is not a session.
+   */
+  const refuseClaimCredential = (state: AuthState, organizationId: string) => {
+    if (!state.authenticated) return;
+    requireOwnOrganization(state, organizationId);
+    if (!hasGrantAtLeast(state.grant, "manage")) throw grantInsufficient();
   };
   const requireInteractive = (state: AuthState): string => {
     if (
@@ -358,6 +410,7 @@ export const createAuthService = (
       expiresAt,
       source: normalizeApiKeySource(input.source),
       label: normalizeApiKeyLabel(input.label),
+      grant: normalizeCredentialGrant(input.grant),
     });
     return { ...summary, plaintext: token.plaintext };
   };
@@ -601,6 +654,7 @@ export const createAuthService = (
     },
 
     claimOrganizationStatements(input) {
+      refuseClaimCredential(input.actor, input.organizationId);
       const { userId, sessionId } = requireInteractiveSession(input.actor);
       const statements = repository.claimOrganizationStatements({
         organizationId: input.organizationId,
@@ -621,6 +675,7 @@ export const createAuthService = (
     },
 
     async claimOrganization(input) {
+      refuseClaimCredential(input.actor, input.organizationId);
       const userId = requireInteractive(input.actor);
       const sessionId = input.actor.actor?.credentialId;
 
@@ -657,7 +712,7 @@ export const createAuthService = (
 
     async listOrganizationMembers(input) {
       await requireManager(
-        requireActor(input.actor, input.organizationId),
+        requireActor(input.actor, input.organizationId, "read"),
         input.organizationId,
       );
       return repository.listMembers(input.organizationId);
@@ -665,7 +720,7 @@ export const createAuthService = (
 
     async addOrganizationMember(input) {
       const actorMembership = await requireManager(
-        requireActor(input.actor, input.organizationId),
+        requireActor(input.actor, input.organizationId, "manage"),
         input.organizationId,
       );
 
@@ -688,7 +743,7 @@ export const createAuthService = (
 
     async updateOrganizationMemberRole(input) {
       const actorMembership = await requireManager(
-        requireActor(input.actor, input.organizationId),
+        requireActor(input.actor, input.organizationId, "manage"),
         input.organizationId,
       );
       const target = await repository.findMembership(input.userId, input.organizationId);
@@ -733,7 +788,7 @@ export const createAuthService = (
 
     async removeOrganizationMember(input) {
       const actorMembership = await requireManager(
-        requireActor(input.actor, input.organizationId),
+        requireActor(input.actor, input.organizationId, "manage"),
         input.organizationId,
       );
       const target = await repository.findMembership(input.userId, input.organizationId);
@@ -788,21 +843,25 @@ export const createAuthService = (
           new Date(membership.organization.expiresAt).getTime() <= Date.now())
       )
         return createEmptyAuthState();
-      return toApiKeyAuthState(user, membership, stored.id, source);
+      return toApiKeyAuthState(user, membership, stored.id, source, stored.grant);
     },
 
     async listApiKeys(input) {
       requireApiKeysEnabled();
       // Reading key metadata (never the token) is safe for any member.
-      await requireMember(requireActor(input.actor, input.organizationId), input.organizationId);
+      await requireMember(requireActor(input.actor, input.organizationId, "read"), input.organizationId);
       return repository.listApiKeys(input.organizationId);
     },
 
     async createApiKey(input) {
       requireApiKeysEnabled();
-      const actorUserId = requireActor(input.actor, input.organizationId);
+      const actorUserId = requireActor(input.actor, input.organizationId, "manage");
       await requireManager(actorUserId, input.organizationId);
       const name = ensureNonEmpty(input.name, "API key name");
+      const grant = normalizeCredentialGrant(input.grant);
+      // A credential hands on no more than it holds. Only `manage` gets this
+      // far, so today this never refuses; it keeps the rule where issuance is.
+      if (!hasGrantAtLeast(input.actor.grant, grant)) throw grantInsufficient();
       const apiKey = await issueKey({
         organizationId: input.organizationId,
         userId: actorUserId,
@@ -810,6 +869,7 @@ export const createAuthService = (
         ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
         ...(input.source !== undefined ? { source: input.source } : {}),
         ...(input.label !== undefined ? { label: input.label } : {}),
+        grant,
       });
 
       await emit({
@@ -825,7 +885,7 @@ export const createAuthService = (
 
     async revokeApiKey(input) {
       requireApiKeysEnabled();
-      const actorUserId = requireActor(input.actor, input.organizationId);
+      const actorUserId = requireActor(input.actor, input.organizationId, "manage");
       await requireManager(actorUserId, input.organizationId);
       const existing = await repository.findApiKeyById(input.apiKeyId, input.organizationId);
 
@@ -856,6 +916,8 @@ export const createAuthService = (
 
     async revokeOwnApiKey({ actor }) {
       requireApiKeysEnabled();
+      // No grant check, deliberately: a credential may always end itself, and
+      // a `read` key logging out must not need `manage` to do it.
       if (!actor.authenticated || !actor.user) throw unauthorized();
       const apiKeyId = actor.actor?.credentialId;
       const organizationId = actor.organization?.id;

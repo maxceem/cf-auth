@@ -2,16 +2,18 @@ import { and, asc, count, eq, gt, isNull, ne, or, sql, type SQL } from "drizzle-
 import { alias } from "drizzle-orm/sqlite-core";
 import type { CfAuthDatabase } from "./config.js";
 import { deterministicUuid } from "./crypto.js";
-import { CfAuthError, conflict } from "./errors.js";
+import { CfAuthError, conflict, validationError } from "./errors.js";
 import type { CfAuthTables } from "./schema.js";
-import type {
-  ApiKeySummary,
-  AuthSession,
-  AuthUser,
-  OrganizationMember,
-  OrganizationMembership,
-  OrganizationRole,
-  OrganizationSummary,
+import {
+  isCredentialGrant,
+  type ApiKeySummary,
+  type AuthSession,
+  type AuthUser,
+  type CredentialGrant,
+  type OrganizationMember,
+  type OrganizationMembership,
+  type OrganizationRole,
+  type OrganizationSummary,
 } from "./types.js";
 
 const toIso = (value: Date | string | number) =>
@@ -139,6 +141,13 @@ export interface ClaimOrganizationWrite {
 
 export type ApiKeyAuthRecord = ApiKeySummary;
 
+/** A key's `grant`: `read` or `manage`, `manage` unless the caller names one. */
+export const normalizeCredentialGrant = (value: unknown): CredentialGrant => {
+  if (value === undefined) return "manage";
+  if (!isCredentialGrant(value)) throw validationError('A grant must be "read" or "manage"');
+  return value;
+};
+
 /**
  * All database access used by cf-auth, expressed as plain drizzle queries over
  * the configured tables. Kept deliberately small so a host app could swap in
@@ -228,6 +237,8 @@ export interface CfAuthRepository {
     expiresAt: Date | null;
     source: string;
     label: string | null;
+    /** Default: `"manage"`. */
+    grant?: CredentialGrant;
   }): Promise<ApiKeySummary>;
   listApiKeys(organizationId: string): Promise<ApiKeySummary[]>;
   /**
@@ -403,6 +414,7 @@ export const createCfAuthRepository = (
     enabled: apiKey.enabled,
     source: apiKey.source,
     label: apiKey.label,
+    grant: apiKey.grant,
     createdAt: apiKey.createdAt,
     revokedAt: apiKey.revokedAt,
     expiresAt: apiKey.expiresAt,
@@ -416,6 +428,7 @@ export const createCfAuthRepository = (
     enabled: boolean | number;
     source: string;
     label: string | null;
+    grant: string;
     createdAt: Date;
     revokedAt: Date | null;
     expiresAt: Date | null;
@@ -429,6 +442,9 @@ export const createCfAuthRepository = (
       enabled: Boolean(row.enabled),
       source: row.source,
       label: row.label,
+      // Only cf-auth writes this column and it writes only the two values; a
+      // value put there by hand fails closed, as the least grant.
+      grant: isCredentialGrant(row.grant) ? row.grant : "read",
       createdAt: toIso(row.createdAt),
       expiresAt: row.expiresAt ? toIso(row.expiresAt) : null,
       revokedAt: row.revokedAt ? toIso(row.revokedAt) : null,
@@ -970,7 +986,10 @@ export const createCfAuthRepository = (
     async createApiKey(input) {
       const id = crypto.randomUUID();
       const createdAt = new Date();
-      await db.insert(apiKey).values({ id, ...input, createdAt, revokedAt: null });
+      // One validated value for the row and the answer, so neither can say
+      // something the other does not.
+      const grant = normalizeCredentialGrant(input.grant);
+      await db.insert(apiKey).values({ id, ...input, grant, createdAt, revokedAt: null });
       return {
         id,
         userId: input.userId,
@@ -980,6 +999,7 @@ export const createCfAuthRepository = (
         enabled: input.enabled,
         source: input.source,
         label: input.label,
+        grant,
         expiresAt: input.expiresAt?.toISOString() ?? null,
         createdAt: createdAt.toISOString(),
         revokedAt: null,

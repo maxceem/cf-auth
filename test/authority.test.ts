@@ -87,6 +87,44 @@ describe("credentialAuthorityCondition", () => {
     expect(await allowed(human.sessionId)).toBe(false);
   });
 
+  it("requires the manage grant of a key only when asked, and never of a session", async () => {
+    const harness = await createTestAuth();
+    const human = await harness.sessions.human({ email: "grant@example.test" });
+    const actor = await harness.actorFor(human.userId, human.organizationId);
+    const reader = await harness.cfAuth.service.createApiKey({
+      organizationId: human.organizationId,
+      actor,
+      name: "Reader",
+      grant: "read",
+    });
+    const manager = await harness.cfAuth.service.createApiKey({
+      organizationId: human.organizationId,
+      actor,
+      name: "Manager",
+    });
+    const allowed = async (credentialId: string, grant?: "read" | "manage") => {
+      const condition = credentialAuthorityCondition(harness.cfAuth.config.tables, {
+        organizationId: human.organizationId,
+        userId: human.userId,
+        credentialId,
+        allowedRoles: ["owner"],
+        nowMs: Date.now(),
+        ...(grant ? { grant } : {}),
+      });
+      const result = await harness.client.execute({
+        sql: `select ${condition.sql} as allowed`,
+        args: condition.params as (string | number | null | Uint8Array)[],
+      });
+      return Number(result.rows[0]?.allowed) === 1;
+    };
+
+    expect(await allowed(reader.id)).toBe(true);
+    expect(await allowed(reader.id, "read")).toBe(true);
+    expect(await allowed(reader.id, "manage")).toBe(false);
+    expect(await allowed(manager.id, "manage")).toBe(true);
+    expect(await allowed(human.sessionId, "manage")).toBe(true);
+  });
+
   it("uses the SQLite clock when it is later than the caller time", async () => {
     const harness = await createTestAuth();
     const human = await harness.sessions.human({ email: "clock@example.test" });

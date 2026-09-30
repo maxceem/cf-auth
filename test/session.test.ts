@@ -17,6 +17,7 @@ describe("session resolution", () => {
       memberships: [],
       organization: null,
       role: null,
+      grant: null,
     });
   });
 

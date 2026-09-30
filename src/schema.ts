@@ -1,6 +1,11 @@
 import { sql } from "drizzle-orm";
 import { check, index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
-import { operationStates, organizationMemberStatuses, organizationRoles } from "./types.js";
+import {
+  credentialGrants,
+  operationStates,
+  organizationMemberStatuses,
+  organizationRoles,
+} from "./types.js";
 
 export interface CfAuthTablesOptions {
   /**
@@ -186,6 +191,17 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
       source: text("source").notNull().default("console"),
       /** A human-readable note about the holder, e.g. `CLI on mac-studio`. Display only. */
       label: text("label"),
+      /**
+       * How much of its holder's authority the key may exercise: `read` or
+       * `manage`. Enforced by cf-auth's services and operation guards; keys
+       * that predate it are `manage`.
+       *
+       * No CHECK constraint: adding one to an existing table makes drizzle-kit
+       * rebuild the table with an INSERT that reads this column before it
+       * exists, in every app's generated migration. cf-auth validates every
+       * value it writes, and reads anything else as `read`, the least grant.
+       */
+      grant: text("grant", { enum: credentialGrants }).notNull().default("manage"),
     },
     (table) => [
       uniqueIndex(ix("api_key_token_hash_unique")).on(table.tokenHash),

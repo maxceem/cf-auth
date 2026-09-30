@@ -5,7 +5,13 @@ import type { SQL } from "drizzle-orm";
 import { validationError } from "./errors.js";
 import type { OperationKind } from "./operations.js";
 import { cfAuthTables, type CfAuthTables } from "./schema.js";
-import { organizationRoles, type AuthUser, type CfAuthEvent, type OrganizationRole } from "./types.js";
+import {
+  isCredentialGrant,
+  organizationRoles,
+  type AuthUser,
+  type CfAuthEvent,
+  type OrganizationRole,
+} from "./types.js";
 
 /**
  * Any async drizzle SQLite database — `drizzle-orm/d1` in production,
@@ -286,6 +292,16 @@ export const validateOperationKind = (kind: OperationKind, label?: string): void
   label ??= `operations.kinds[${kind.name}]`;
   if (kind.open !== "public" && !organizationRoles.includes(kind.open?.minRole)) {
     throw validationError(`\`${label}.open\` must be "public" or { minRole }`);
+  }
+  if (kind.grant !== undefined) {
+    if (kind.open === "public") {
+      throw validationError(
+        `\`${label}.grant\` applies to a kind a caller opens; a public kind binds no credential`,
+      );
+    }
+    if (!isCredentialGrant(kind.grant)) {
+      throw validationError(`\`${label}.grant\` must be "read" or "manage"`);
+    }
   }
   if (
     kind.approverMinRole !== undefined &&

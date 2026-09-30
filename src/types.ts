@@ -41,6 +41,21 @@ export type OperationState = (typeof operationStates)[number];
 /** Which credential proved the caller's identity. */
 export type AuthCredentialType = "session" | "apiKey";
 
+/**
+ * How much of its holder's authority a credential may exercise, least first.
+ *
+ * Distinct from {@link OrganizationRole}: the role says what the person or
+ * service may do in the organization, the grant says how much of that one
+ * credential may use. What a request may do is the role and the grant
+ * together. A `read` credential reads; only a `manage` one writes. A person's
+ * own session is always `manage`.
+ */
+export const credentialGrants = ["read", "manage"] as const;
+export type CredentialGrant = (typeof credentialGrants)[number];
+
+export const isCredentialGrant = (value: unknown): value is CredentialGrant =>
+  (credentialGrants as readonly unknown[]).includes(value);
+
 export type IdentityKind = "human" | "service";
 export type AuthActor = {
   type: "user";
@@ -108,6 +123,12 @@ export interface AuthState {
   organization: OrganizationSummary | null;
   /** The caller's role inside {@link AuthState.organization}. */
   role: OrganizationRole | null;
+  /**
+   * How much of that role this credential may exercise: `"manage"` for a
+   * session, the key's own grant for an API key, null when unauthenticated.
+   * See {@link CredentialGrant}.
+   */
+  grant: CredentialGrant | null;
 }
 
 export interface ApiKeySummary {
@@ -131,6 +152,8 @@ export interface ApiKeySummary {
   source: string;
   /** A human-readable note about the holder, e.g. `CLI on mac-studio`. */
   label: string | null;
+  /** How much of its holder's authority the key may exercise. Keys issued before grants existed are `manage`. */
+  grant: CredentialGrant;
   createdAt: string;
   revokedAt: string | null;
 }
@@ -201,6 +224,17 @@ export const hasRoleAtLeast = (
   minimum: OrganizationRole,
 ): boolean => (role ? roleRank[role] >= roleRank[minimum] : false);
 
+const grantRank: Record<CredentialGrant, number> = {
+  manage: 2,
+  read: 1,
+};
+
+/** True when `grant` covers `needed`: `manage` covers both, `read` only `read`, null neither. */
+export const hasGrantAtLeast = (
+  grant: CredentialGrant | null | undefined,
+  needed: CredentialGrant,
+): boolean => (grant && isCredentialGrant(grant) ? grantRank[grant] >= grantRank[needed] : false);
+
 /** An unauthenticated {@link AuthState}. Safe default for anonymous requests. */
 export const createEmptyAuthState = (): AuthState => ({
   authenticated: false,
@@ -212,4 +246,5 @@ export const createEmptyAuthState = (): AuthState => ({
   memberships: [],
   organization: null,
   role: null,
+  grant: null,
 });

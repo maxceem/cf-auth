@@ -662,8 +662,10 @@ All of it is prefix-aware through `createCfAuthTables({ tablePrefix })`. The
 gateway's tables become `mgmt_oauth_token`, and so on.
 
 - **`api_key`:**
-  - `grant text not null default 'manage'`, with a check against
-    `('read','manage')`. Step 3. Existing rows migrate to `manage`.
+  - `grant text not null default 'manage'`. No database CHECK: drizzle-kit
+    would rebuild the table for one and the generated copy step is wrong;
+    cf-auth validates every value it writes, and an unknown stored value
+    reads as `read`. Step 3. Existing rows migrate to `manage`.
   - `client_id text` and `resource text`, null for keys. Step 9.
   - A connection row has `source = 'oauth'`, `name`/`label` set to the
     client's name, and `expires_at` set as in "Connection lifetime".

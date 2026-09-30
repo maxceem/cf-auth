@@ -1,15 +1,17 @@
 import type { Context, Env, MiddlewareHandler } from "hono";
 import type { ResolvedCfAuthConfig } from "./config.js";
 import type { CurrentOrganizationCookie } from "./cookies.js";
-import { forbidden, sessionRequired, unauthorized } from "./errors.js";
+import { forbidden, grantInsufficient, sessionRequired, unauthorized } from "./errors.js";
 import type { CfBetterAuth } from "./better-auth.js";
 import type { CfAuthService } from "./service.js";
 import {
   canManageOrganization,
   createEmptyAuthState,
+  hasGrantAtLeast,
   hasRoleAtLeast,
   type ActionSource,
   type AuthState,
+  type CredentialGrant,
   type AuthUser,
   type OrganizationRole,
   type OrganizationSummary,
@@ -176,6 +178,28 @@ export const requireOrganization = (
     role: state.role,
     state,
   };
+};
+
+/**
+ * Requires a credential whose grant covers `needed`, for an app gating its own
+ * writes the way cf-auth gates its services: `"manage"` for anything that
+ * changes state, `"read"` for anything that only reads.
+ *
+ * Throws 401 when unauthenticated and 403 `grant_insufficient` when the
+ * credential's grant is too narrow — a `read` key asking to write. A session
+ * always passes. It checks the grant only; pair it with
+ * {@link requireOrganization} for the role.
+ */
+export const requireGrant = (state: AuthState, needed: CredentialGrant): AuthState => {
+  if (!state.authenticated) {
+    throw unauthorized();
+  }
+
+  if (!hasGrantAtLeast(state.grant, needed)) {
+    throw grantInsufficient();
+  }
+
+  return state;
 };
 
 /** Throws 403 unless the caller is an `owner` or `admin` of the current org. */

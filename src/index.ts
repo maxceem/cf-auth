@@ -40,8 +40,11 @@ export {
   apiKeyActionSources,
   canManageOrganization,
   createEmptyAuthState,
+  credentialGrants,
+  hasGrantAtLeast,
   hasRoleAtLeast,
   isApiKeyActionSource,
+  isCredentialGrant,
   isOrganizationExpired,
   operationStates,
   organizationMemberStatuses,
@@ -57,6 +60,7 @@ export {
   type IdentityKind,
   type CfAuthEvent,
   type CreatedApiKey,
+  type CredentialGrant,
   type OperationState,
   type OrganizationMember,
   type OrganizationMemberStatus,
@@ -70,6 +74,7 @@ export {
   CfAuthError,
   conflict,
   forbidden,
+  grantInsufficient,
   invalidProof,
   isCfAuthError,
   notAMember,
@@ -87,6 +92,7 @@ export {
 
 export {
   createAuthMiddleware,
+  requireGrant,
   requireOrganization,
   requireOrganizationManager,
   requireUser,
@@ -157,6 +163,7 @@ export {
 export {
   loginOperationKindName,
   type LoginOperationOutcome,
+  type LoginOperationPayload,
   type LoginOperationRecord,
 } from "./login-operation.js";
 

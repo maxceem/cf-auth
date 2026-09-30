@@ -149,9 +149,10 @@ your own tables as one thing: one migration folder, one history.
 
 If you would rather not run drizzle-kit, the ready-made SQL for the default
 table names ships in `node_modules/@maxceem/cf-auth/drizzle/`:
-`0000_cf_auth_init.sql` creates the tables, and `0001_cf_auth_operations.sql`
-adds the `operation` table and the `source` and `label` columns of `api_key`.
-Copy them in, in order. The package's own tests apply these exact files, so
+`0000_cf_auth_init.sql` creates the tables, `0001_cf_auth_operations.sql`
+adds the `operation` table and the `source` and `label` columns of `api_key`,
+and `0002_cf_auth_api_key_grant.sql` adds its `grant` column, with every
+existing key at `manage`. Copy them in, in order. The package's own tests apply these exact files, so
 they cannot drift from the schema.
 
 ### Renaming the tables
@@ -277,6 +278,8 @@ Place it in the same conditional mutation or database batch as the protected
 write. A separate async preflight leaves a revocation or role-change race. The
 condition covers credential and membership authority only; append account,
 resource, and deadline rules required by your application to that same write.
+Pass `grant: "manage"` when the write needs it: an API key must then carry the
+`manage` grant, and a session always does. Without it, any grant will do.
 
 ### Google sign-in from preview URLs
 
@@ -315,6 +318,7 @@ interface AuthState {
   memberships: OrganizationMembership[];
   organization: OrganizationSummary | null;
   role: "owner" | "admin" | "member" | null;
+  grant: "read" | "manage" | null; // see Credential grants
 }
 ```
 
@@ -333,6 +337,7 @@ import {
   requireUser,
   requireOrganization,
   requireOrganizationManager,
+  requireGrant,
   isCfAuthError,
 } from "@maxceem/cf-auth";
 
@@ -340,6 +345,7 @@ requireUser(state); // a signed-in person only
 requireOrganization(state); // a person or an API key
 requireOrganization(state, "admin"); // and the role must be admin or above
 requireOrganizationManager(state); // and they must be owner or admin
+requireGrant(state, "manage"); // and the credential may write
 ```
 
 `requireUser` tells "nobody is here" apart from "wrong kind of caller":
@@ -438,6 +444,7 @@ const key = await cfAuth.service.createApiKey({
   actor: state,
   name: "CI pipeline",
   label: "GitHub Actions", // optional, for people reading the list
+  grant: "read", // optional, "manage" unless you say so; see Credential grants
 });
 // Securely deliver key.plaintext once; never include it in logs.
 await cfAuth.service.listApiKeys({ organizationId, actor: state });
@@ -475,13 +482,54 @@ visible in `listApiKeys` instead of looking live.
 Callers send `Authorization: Bearer <key>`. `X-Client: cli` or `mcp` is telemetry
 only. Every request resolves the owning identity and current active membership;
 role changes and membership removal take effect immediately. Authorization uses
-the current membership role; cf-auth does not add a second granular permission
-system. Expiry and revocation affect credentials, not the identity or account.
+the current membership role and the key's grant (below); cf-auth adds no finer
+permission system. Expiry and revocation affect credentials, not the identity or account.
 `tokenHint` contains the token's last four characters for safe display.
 
 `verification` keeps Better Auth's ordinary schema and is reserved for Better
 Auth. Applications that implement browser handoffs or idempotency receipts own
 that state in their own tables.
+
+### Credential grants
+
+A role says what a person or service may do in an organization. A **grant**
+says how much of that one credential may use: `"read"` or `"manage"`. What a
+request may do is the role and the grant together, so a `read` key held by an
+owner still only reads.
+
+| Credential     | `authState.grant`                                   |
+| -------------- | --------------------------------------------------- |
+| Nobody         | `null`                                              |
+| A session      | `"manage"`: a person's own session is not delegated |
+| An API key     | the grant it was issued with, `"manage"` by default |
+
+A key gets its grant when it is issued and keeps it. `createApiKey` and
+`issueServiceApiKey` take `grant`, and so does the built-in `login` through its
+payload. Keys from before grants existed are `manage`, and `ApiKeySummary`
+reports the grant of each.
+
+cf-auth enforces it itself:
+
+- Every write in the service needs `manage`: adding, re-roling and removing
+  members, creating and revoking keys, and claiming. A `read` credential gets
+  `403 grant_insufficient`. Listing members and keys needs only `read`.
+- A key may never be issued with more than the issuer holds, and a `read`
+  credential issues no keys at all, not even `read` ones.
+  `issueServiceApiKey` has no issuer to bound it and takes the grant it is
+  given; it is a trusted primitive.
+- `revokeOwnApiKey` needs no grant. A `read` key can always end itself.
+- Every credential but a session is held to its own organization before its
+  grant is looked at, so a key naming another organization is told
+  `forbidden`, not `grant_insufficient`. A claim, which also needs a session,
+  refuses in that order too: another organization, then the grant, then
+  `session_required`.
+- An operation kind a caller opens needs `grant` from the opener's credential;
+  see [Your own kinds](#your-own-kinds).
+
+Gate your own writes with `requireGrant(state, "manage")`. It throws
+`401 unauthorized` for nobody and `403 grant_insufficient` for a credential
+whose grant is too narrow, and answers the state otherwise. It checks only the
+grant; pair it with `requireOrganization` for the role.
 
 ### Provisional organizations
 
@@ -669,6 +717,17 @@ label and marked `source: "cli"`. The tool gets it sealed:
 { credential: { token: "key_..." }, organizationId, apiKeyId }
 ```
 
+A tool that only needs to read opens it with `payload: { grant: "read" }`;
+without a payload the key is `manage`. Anything else in the payload is
+`422 validation_error`. A login opened without a payload stores none, just as
+before grants existed, so a tool repeating that same `open` across an upgrade
+is answered rather than refused; no payload means `manage` wherever it is
+read. An explicit `{ grant: "manage" }` is a different request from an omitted
+one, and a repeat may not change the grant. `details` shows the payload
+always with the grant spelled out, `{ grant: "manage" }` for an omitted one,
+so your page can say what is being asked for, and the record kept in the
+clear is `{ organizationId, apiKeyId, grant }`.
+
 The key is written in the same batch that completes the operation, under a
 guard that re-reads the person's session and membership, so a person signed
 out or removed a moment earlier gets `409 conflict` rather than issuing a key.
@@ -714,8 +773,21 @@ createCfAuth({ /* ... */, operations: { enabled: true, realm, kinds: [rotateSecr
   pinned to that organization, and the credential that opened it is checked
   again when it is approved: revoke the key, and its pending requests can no
   longer be approved.
+- `grant` is the least grant the opener's credential must carry: `"manage"`
+  unless the kind says `"read"`. `open` refuses a narrower one with
+  `403 grant_insufficient`, and the guard checks it again when the write lands,
+  so a key that no longer carries it cannot finish what it started. A stored
+  operation whose kind you have since removed is held to `manage` before its
+  sealed outcome is handed over: removing a kind never releases to a `read`
+  key what the kind would have withheld. A session
+  is always `manage`. A `"public"` kind binds no credential, so it takes no
+  `grant`.
 - `payload` is a zod schema or any function that returns the value to store or
-  throws.
+  throws. Returning `undefined` stores no payload, the same as a kind that
+  takes none; the hooks then see `null`.
+- `showPayload(payload)` returns what `details` shows as `payload`, when the
+  stored form leaves a default implicit. `login` uses it to spell out
+  `manage`.
 - `approve` returns `{ outcome, seal?, record?, statements?, afterCommit? }`.
   AND `guard` into each statement's `WHERE`: it holds only while the operation
   is pending and in time and both the approver's and the opener's authority are
@@ -825,6 +897,7 @@ which is 3 — for a batch of your own or a job that budgets its queries.
 | `too_many_pending`    | 429    | Over a pending limit                                           |
 | `not_a_member`        | 403    | The approver lacks the membership or role the kind needs, or asked to attach an organization they do not belong to |
 | `session_required`    | 403    | The approver is not a signed-in person                         |
+| `grant_insufficient`  | 403    | The opener's credential lacks the grant the kind needs         |
 | `validation_error`    | 422    | A payload, input, token, id or client field was refused        |
 
 Refused input is `422 validation_error`, as everywhere else in cf-auth. Map it
