@@ -199,6 +199,29 @@ export {
   type OAuthTokenResponse,
   type OAuthTokenResult,
 } from "./oauth/service.js";
+export {
+  oauthAuthorizationRecordTtlMs,
+  oauthAuthorizeKindName,
+  oauthEndpointPaths,
+  oauthScopes,
+  type ApproveAuthorizationInput,
+  type ApproveGuestAuthorizationInput,
+  type AuthorizationServerMetadata,
+  type OAuthAuthorizationDetails,
+  type OAuthAuthorizationPayload,
+  type OAuthAuthorizationRecord,
+  type OAuthAuthorizeErrorPage,
+  type OAuthAuthorizeResult,
+  type OAuthClientIdentity,
+  type OAuthGuestProvision,
+  type OAuthGuestProvisionContext,
+  type ProtectedResourceMetadata,
+} from "./oauth/authorization.js";
+export {
+  cimdFetchTimeoutMs,
+  cimdMaxClientNameLength,
+  cimdMaxDocumentBytes,
+} from "./oauth/cimd.js";
 
 export { createOperationToken, deriveSecret } from "./crypto.js";
 

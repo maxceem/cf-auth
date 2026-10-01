@@ -166,19 +166,16 @@ errors, the guard and the seal window.
 
 ## OAuth connections
 
-This release covers OAuth **credentials only**: connections, their tokens,
-refresh, revocation and resolution. The authorization endpoint, consent and
-Client ID Metadata Documents come in the next release; until then nothing
-here issues a connection to a client by itself, and
-`grant_type=authorization_code` answers `unsupported_grant_type`.
-
-An MCP client that has signed in through OAuth 2.1 holds a **connection**: an
-`api_key` row with `source: "oauth"`, bound to one person in one organization
-with a grant, like a key. It shows up in `listApiKeys` beside the keys, with
-its client's `clientId`, and `revokeApiKey` ends it. Its tokens are prefixed
-and name the connection, `<prefix><connectionId>.<secret>`: the access token
-lives 10 minutes, the refresh token 30 days, restarted by each rotation, and
-`expires_at` on the row is the connection's lifetime, optionally capped by
+OAuth 2.1 for public clients such as MCP clients: the authorization-code
+flow with PKCE, a consent page where a person picks the account and the
+grant, refresh with rotation, and revocation. What a client ends up holding
+is a **connection**: an `api_key` row with `source: "oauth"`, bound to one
+person in one organization with a grant, like a key. It shows up in
+`listApiKeys` beside the keys, with its client's `clientId`, and
+`revokeApiKey` ends it. Its tokens are prefixed and name the connection,
+`<prefix><connectionId>.<secret>`: the access token lives 10 minutes, the
+refresh token 30 days, restarted by each rotation, and `expires_at` on the
+row is the connection's lifetime, optionally capped by
 `connectionMaxAgeMs`. Only digests are stored.
 
 ```ts
@@ -188,10 +185,22 @@ const cfAuth = createCfAuth({
     enabled: true,
     issuer: "https://console.example.com",
     tokenPrefix: { access: "agw_oat_", refresh: "agw_ort_" },
+    // Optional: clients you register yourself. Others identify themselves
+    // with a Client ID Metadata Document (an https client_id), unless cimd: false.
+    clients: [{ clientId: "my-cli", name: "My CLI", redirectUris: ["http://127.0.0.1/callback"] }],
   },
 });
 
-// Your routes: cf-auth answers the status and the RFC 6749 body; you send it.
+// Your routes: cf-auth decides, you send.
+app.get("/oauth/authorize", async (c) => {
+  const url = new URL(c.req.url);
+  const result = await cfAuth.oauth.authorize({ query: url.searchParams, rateLimitKey: clientAddress(c) });
+  if ("consent" in result) {
+    return c.redirect(`/oauth/consent?id=${result.consent.id}#${result.consent.proof}`);
+  }
+  if ("redirect" in result) return c.redirect(result.redirect);
+  return c.html(errorPage(result.error.description), result.error.status); // never back to the client
+});
 app.post("/oauth/token", async (c) => {
   const { status, body } = await cfAuth.oauth.token({ body: new URLSearchParams(await c.req.text()) });
   return c.json(body, status, { "Cache-Control": "no-store" });
@@ -200,13 +209,44 @@ app.post("/oauth/token", async (c) => {
 const state = await cfAuth.oauth.resolveAccessTokenAuthState(token, { source: "mcp" });
 ```
 
-cf-auth mounts no routes; your app mounts the token and revocation endpoints
-and the bearer gate. A refresh rotates the tokens; the previous refresh token
+**What your app mounts, and what cf-auth decides.** cf-auth mounts no
+routes. Your app mounts the discovery documents
+(`protectedResourceMetadata`, `authorizationServerMetadata`),
+`/oauth/authorize`, `/oauth/token` and `/oauth/revoke`, the consent page and
+its API (`authorizationDetails`, `approveAuthorization`,
+`approveGuestAuthorization`, `denyAuthorization`), and the bearer gate; it
+owns statuses, headers, CORS and the page. cf-auth decides everything that
+is a security rule:
+
+- whether an authorization request is valid and for which client — a
+  duplicated parameter, an unknown client or an undeclared redirect URI is
+  an error page and never a redirect, and a redirect URI matches only as
+  the same string (a loopback port aside); later errors go back to the client's
+  redirect URI with `state` and `iss`; PKCE is S256 only;
+- which clients exist: registered ones, and Client ID Metadata Documents
+  fetched within fixed bounds (https only, no address or localhost hosts,
+  no redirects, 5 s, JSON, a public client that names itself, and a body of
+  at most 64 KiB: from a byte stream at most 64 KiB plus one byte is ever
+  requested, while a platform that delivers larger chunks without BYOB
+  support may hand over more before the cancel). Its declared name is
+  untrusted text: render it escaped;
+- what a consent may do: the person's session and membership are re-read in
+  the batch that completes it, and "continue without an account" runs your
+  admission rule, then your rate limit, then provisions your account inside
+  that same batch, whose first write judges and latches the admission so
+  provisioning cannot undo it (an empty-deployment rule works);
+- when a code is good: once, for 10 minutes, with its verifier; a code
+  presented again revokes the connection it issued.
+
+Both approvals are idempotent: approving again, by either door, answers the
+same redirect byte for byte, because the code is kept sealed under the
+browser proof. A refresh rotates the tokens; the previous refresh token
 replays the same response for 30 s, and after that its return revokes the
-whole connection. See [OAuth connections](docs/index.md#oauth-connections).
+whole connection. See [OAuth connections](docs/index.md#oauth-connections)
+and [Authorization](docs/index.md#authorization).
 
 Upgrading: apply migration `0004_cf_auth_oauth_token.sql` even with OAuth
-off. A custom `CfAuthRepository` must also implement the new
+off; the authorization flow needs no further migration. A custom `CfAuthRepository` must also implement the new
 `findOAuthAccess`: one coherent `SELECT` of the connection's current
 generation — the maximum generation across all its token rows, unrotated
 only — with its grant, user, membership and organization, the supplied

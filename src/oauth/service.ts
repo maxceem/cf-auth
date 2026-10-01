@@ -8,6 +8,10 @@
  * a connection too. Its tokens live in `oauth_token`, at most two generations
  * per connection. Every write here is one batch.
  *
+ * The authorization request, consent and the code exchange live in
+ * `./authorization.ts`; this service hands them its issuance and revocation
+ * and answers them under `cfAuth.oauth`.
+ *
  * Nothing here is an HTTP route: `token` and `revoke` answer the status and
  * the RFC 6749 §5.2 body for the app's own route to send.
  */
@@ -16,6 +20,7 @@ import type { BatchItem } from "drizzle-orm/batch";
 import { alias } from "drizzle-orm/sqlite-core";
 import { sqliteNowMs } from "../authority.js";
 import type { ResolvedCfAuthConfig, ResolvedOAuthConfig } from "../config.js";
+import { createOperationsEngine, type CfAuthOperations, type OperationKind } from "../operations.js";
 import { openTextForToken, randomToken, sealTextForToken, sha256Hex, timingSafeEqual } from "../crypto.js";
 import { CfAuthError, validationError } from "../errors.js";
 import { guardedInsert } from "../guarded-insert.js";
@@ -30,7 +35,18 @@ import {
   type CredentialGrant,
   type OAuthActionSource,
 } from "../types.js";
-import { oauthConnectionLiveSql } from "./authority.js";
+import {
+  createOAuthAuthorization,
+  createOAuthAuthorizeKind,
+  type ApproveAuthorizationInput,
+  type ApproveGuestAuthorizationInput,
+  type AuthorizationServerMetadata,
+  type OAuthAuthorizationDetails,
+  type OAuthAuthorizeResult,
+  type ProtectedResourceMetadata,
+} from "./authorization.js";
+import { oauthConnectionLiveSql, oauthMembershipLiveSql, oauthOrganizationLiveSql } from "./authority.js";
+import { duplicateDescription, duplicatedParameter, formParams, type FormParams } from "./params.js";
 import { connectionIdPattern, issueGeneration, parseOAuthToken, resolveToken, type IssuedGeneration, type OAuthTokenRow } from "./tokens.js";
 
 /** How long after a rotation the previous refresh token replays its response. Fixed. */
@@ -107,8 +123,43 @@ export interface OAuthConnectionStatements {
 
 export interface CfAuthOAuth {
   /**
-   * `POST /token`, form-encoded. Only `grant_type=refresh_token` in this
-   * release; `authorization_code` answers `unsupported_grant_type`.
+   * `GET /.well-known/oauth-protected-resource<path>`: the RFC 9728 document
+   * for the issuer (`""`) or one of `resourcePaths` (`"/mcp"`), whose
+   * `resource` is the URL it is published for.
+   */
+  protectedResourceMetadata(path?: string): ProtectedResourceMetadata;
+  /** `GET /.well-known/oauth-authorization-server`: the RFC 8414 document. */
+  authorizationServerMetadata(): AuthorizationServerMetadata;
+  /**
+   * `GET /oauth/authorize`: validates the request and opens the pending
+   * authorization. Answers the consent reference, an error redirect to the
+   * client, or an error page when the client or its redirect URI cannot be
+   * trusted. `rateLimitKey` is the browser's address, for the pending cap.
+   */
+  authorize(input: { query: URLSearchParams; rateLimitKey: string | null }): Promise<OAuthAuthorizeResult>;
+  /** What the consent page shows, for the holder of the browser proof. */
+  authorizationDetails(input: {
+    id: string;
+    proof: string;
+    viewer: AuthState | null | undefined;
+  }): Promise<OAuthAuthorizationDetails>;
+  /**
+   * The signed-in person allows the client into one of their accounts, with
+   * the grant they chose. Idempotent: a completed authorization answers its
+   * redirect again, whichever door completed it.
+   */
+  approveAuthorization(input: ApproveAuthorizationInput): Promise<{ redirect: string }>;
+  /**
+   * "Continue without an account": proof, then an already completed
+   * authorization's redirect, then `admit`, then `rateLimit`, then
+   * `provision` inside the batch that completes it.
+   */
+  approveGuestAuthorization(input: ApproveGuestAuthorizationInput): Promise<{ redirect: string; organizationId: string }>;
+  /** The person declines: the `access_denied` redirect. */
+  denyAuthorization(input: { id: string; proof: string }): Promise<{ redirect: string }>;
+  /**
+   * `POST /token`, form-encoded: `grant_type=authorization_code` exchanges a
+   * code for a new connection, once; `grant_type=refresh_token` rotates.
    */
   token(input: { body: URLSearchParams }): Promise<OAuthTokenResult>;
   /** `POST /revoke` (RFC 7009): either token ends the whole connection. */
@@ -150,42 +201,42 @@ const fail = (error: OAuthErrorCode, description: string): { status: 400 | 401; 
   body: { error, error_description: description },
 });
 
-type FormParams = Pick<URLSearchParams, "get" | "getAll" | "keys">;
-
-const formParams = (body: unknown): FormParams | null =>
-  body !== null &&
-  typeof body === "object" &&
-  typeof (body as FormParams).get === "function" &&
-  typeof (body as FormParams).getAll === "function" &&
-  typeof (body as FormParams).keys === "function"
-    ? (body as FormParams)
-    : null;
-
-/**
- * The description of a repeated parameter. A name is echoed only when it is
- * plainly a parameter name, so the description stays within the characters
- * RFC 6749 §5.2 allows; anything else gets a fixed text.
- */
-const duplicateDescription = (name: string) =>
-  /^[A-Za-z0-9_.-]{1,64}$/.test(name)
-    ? `Parameter ${name} is given more than once`
-    : "A parameter is given more than once";
-
-/** Any parameter given more than once is `invalid_request` (RFC 6749 §3.1, §3.2). */
-const duplicatedParameter = (params: FormParams): string | null => {
-  for (const name of new Set(params.keys())) if (params.getAll(name).length > 1) return name;
-  return null;
-};
-
 const maxClientIdLength = 2048;
 const maxClientNameLength = 200;
 
+/** The built-in kinds the OAuth service needs registered on the engine: none while it is off. */
+export const oauthBuiltInKinds = (config: ResolvedCfAuthConfig): OperationKind[] =>
+  config.oauth ? [createOAuthAuthorizeKind(config.oauth)] : [];
+
+/**
+ * The OAuth service, on an engine of its own that registers
+ * `cf-auth:oauth.authorize`. `createCfAuth` builds one engine for both
+ * `cfAuth.operations` and this service instead.
+ */
 export const createOAuthService = (
   config: ResolvedCfAuthConfig,
   repository: CfAuthRepository,
+): CfAuthOAuth =>
+  createOAuthServiceForEngine(
+    config,
+    repository,
+    config.oauth
+      ? createOperationsEngine(config, repository, { builtInKinds: oauthBuiltInKinds(config) }).internal
+      : null,
+  );
+
+/**
+ * The OAuth service on a given engine door, which must admit internal kinds
+ * and have {@link oauthBuiltInKinds} registered. Not exported from the
+ * package index.
+ */
+export const createOAuthServiceForEngine = (
+  config: ResolvedCfAuthConfig,
+  repository: CfAuthRepository,
+  internalOperations: CfAuthOperations | null,
 ): CfAuthOAuth => {
   const { db, tables } = config;
-  const { apiKey, oauthToken, organization, organizationUser } = tables;
+  const { apiKey, oauthToken } = tables;
 
   const settings = (): ResolvedOAuthConfig => {
     if (!config.oauth) {
@@ -274,27 +325,11 @@ export const createOAuthService = (
     return membership !== null && !isOrganizationExpired(membership.organization, now);
   };
 
-  /**
-   * The organization exists and is inside its deadline when the write lands,
-   * by the later of the caller's clock and the database's: `expires_at` is
-   * ISO text, read as epoch milliseconds, as the operation engine reads it.
-   */
-  const organizationLiveSql = (organizationId: string, now: number): SQL => {
-    const live = alias(organization, "cf_auth_oauth_organization");
-    return sql`exists (select 1 from ${organization} as ${sql.identifier("cf_auth_oauth_organization")}
-      where ${live.id} = ${organizationId}
-        and (${live.expiresAt} is null
-          or cast(unixepoch(${live.expiresAt}, 'subsec') * 1000 as integer) > ${sqliteNowMs(now)}))`;
-  };
+  const organizationLiveSql = (organizationId: string, now: number): SQL =>
+    oauthOrganizationLiveSql(tables, { organizationId, nowMs: now });
 
-  /** The user's membership is active, at any role. */
-  const membershipLiveSql = (userId: string, organizationId: string): SQL => {
-    const member = alias(organizationUser, "cf_auth_oauth_member");
-    return sql`exists (select 1 from ${organizationUser} as ${sql.identifier("cf_auth_oauth_member")}
-      where ${member.userId} = ${userId}
-        and ${member.organizationId} = ${organizationId}
-        and ${member.status} = 'active')`;
-  };
+  const membershipLiveSql = (userId: string, organizationId: string): SQL =>
+    oauthMembershipLiveSql(tables, { userId, organizationId });
 
   /** The connection's whole authority: {@link oauthConnectionLiveSql} under this issuer. */
   const connectionAuthoritySql = (connection: Connection, now: number): SQL =>
@@ -553,10 +588,6 @@ export const createOAuthService = (
     return rotate(oauth, connection, resolved.generation, presented, now);
   };
 
-  /** The `authorization_code` grant: the code exchange arrives with the authorization endpoint. */
-  const exchangeCode = async (): Promise<OAuthTokenResult> =>
-    fail("unsupported_grant_type", "The authorization_code grant is not available on this server yet");
-
   const prepareConnection = async (
     oauth: ResolvedOAuthConfig,
     input: CreateOAuthConnectionInput & { condition?: SQL },
@@ -668,7 +699,35 @@ export const createOAuthService = (
     ] as unknown as BatchItem<"sqlite">[];
   };
 
+  const authorization = createOAuthAuthorization({
+    config,
+    repository,
+    get operations(): CfAuthOperations {
+      if (!internalOperations) throw validationError("OAuth is disabled; set `oauth.enabled: true` to use it");
+      return internalOperations;
+    },
+    settings,
+    connections: {
+      connectionStatements: (input) => prepareConnection(settings(), input),
+      async revokeConnectionById(connectionId) {
+        const connection = await loadConnection(connectionId);
+        const now = Date.now();
+        if (connection && rowLive(connection, now)) {
+          await revokeConnection(connection, now, { requireAuthority: false });
+        }
+      },
+    },
+  });
+
   return {
+    protectedResourceMetadata: (path) => authorization.protectedResourceMetadata(path),
+    authorizationServerMetadata: () => authorization.authorizationServerMetadata(),
+    authorize: (input) => authorization.authorize(input),
+    authorizationDetails: (input) => authorization.authorizationDetails(input),
+    approveAuthorization: (input) => authorization.approveAuthorization(input),
+    approveGuestAuthorization: (input) => authorization.approveGuestAuthorization(input),
+    denyAuthorization: (input) => authorization.denyAuthorization(input),
+
     async token({ body }) {
       const oauth = settings();
       const params = formParams(body);
@@ -678,7 +737,7 @@ export const createOAuthService = (
       const grantType = params.get("grant_type");
       if (!grantType) return fail("invalid_request", "grant_type is required");
       if (grantType === "refresh_token") return refresh(oauth, params);
-      if (grantType === "authorization_code") return exchangeCode();
+      if (grantType === "authorization_code") return authorization.exchangeCode(oauth, params);
       return fail("unsupported_grant_type", "grant_type must be authorization_code or refresh_token");
     },
 

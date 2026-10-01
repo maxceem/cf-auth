@@ -522,7 +522,7 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         expect(await snapshot(manage.connectionId)).toEqual(rebound);
       });
 
-      it("answers invalid_request, unsupported_grant_type and the step 10 seam", async () => {
+      it("answers invalid_request and unsupported_grant_type, and an incomplete code exchange touches nothing", async () => {
         const { tokens, connectionId } = await connect();
         const before = await snapshot(connectionId);
         const body = refreshBody(tokens.refresh_token);
@@ -547,7 +547,7 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         expect(
           (await h.cfAuth.oauth.token({ body: new URLSearchParams({ grant_type: "authorization_code", code: "x" }) }))
             .body,
-        ).toMatchObject({ error: "unsupported_grant_type" });
+        ).toMatchObject({ error: "invalid_request" });
         // Nothing above touched the connection.
         expect(await snapshot(connectionId)).toEqual(before);
         ok(await refresh(tokens.refresh_token));

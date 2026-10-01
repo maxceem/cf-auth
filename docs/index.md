@@ -1041,8 +1041,9 @@ client afterwards. Anyone else, and any operation without an organization, is
 ### Internal kinds
 
 cf-auth's own flows register kinds of their own, named in the reserved
-`cf-auth:` namespace (`cf-auth:oauth.authorize`, say) and marked `internal:
-true`. They share the table, the limits and the sweep, but `cfAuth.operations`
+`cf-auth:` namespace and marked `internal: true` — today one,
+`cf-auth:oauth.authorize`, registered while `oauth.enabled` (see
+[Authorization](#authorization)). They share the table, the limits and the sweep, but `cfAuth.operations`
 does not admit them: `open` and `reserve` refuse one with `422
 validation_error`, every call that looks one up by id, token, handle or user
 code answers `404 operation_not_found` (or null, for `findByToken` and
@@ -1118,12 +1119,13 @@ approves gets a **connection**: an `api_key` row with `source: "oauth"`, so
 everything that binds a key binds it too. It belongs to one person in one
 organization, carries a grant, is listed by `listApiKeys` and ended by
 `revokeApiKey`. Its tokens are issued, rotated, revoked and resolved here.
-cf-auth mounts no routes: your app mounts the token and revocation endpoints
-and the bearer gate, and sends what these functions answer.
-
-This release covers the credentials. The authorization endpoint, consent and
-Client ID Metadata Documents arrive in the next one; until then
-`grant_type=authorization_code` answers `unsupported_grant_type`.
+A client gets one through the authorization-code flow with PKCE: the
+authorization request, a consent page where a person picks the account and
+the grant (or continues without an account), and the code exchange. Clients
+are registered in configuration or identify themselves with a Client ID
+Metadata Document. cf-auth mounts no routes: your app mounts the discovery
+documents, the authorization, token and revocation endpoints, the consent
+page and its API, and the bearer gate, and sends what these functions answer.
 
 ```ts
 oauth?: {
@@ -1133,7 +1135,7 @@ oauth?: {
   accessTokenTtlMs?: number;          // default 10 minutes
   refreshTokenTtlMs?: number;         // default 30 days, restarted by each rotation
   connectionMaxAgeMs?: number | null; // absolute cap from creation; default null
-  authorizationTtlMs?: number;        // default 10 minutes (used by the authorization endpoint)
+  authorizationTtlMs?: number;        // default 10 minutes: a pending authorization, and a code from completion
   tokenPrefix: { access: string; refresh: string };
   clients?: { clientId: string; name: string; redirectUris: string[] }[];
   cimd?: false | { fetch?: typeof fetch; allowUrl?: (url: URL) => boolean | Promise<boolean> };
@@ -1297,6 +1299,290 @@ connection_refused` if the guard refused.
 scheduled handler. Revoking through `revoke`, reuse or `revokeApiKey` already
 deletes them.
 
+### Authorization
+
+What your app mounts, all on the issuer's origin, and what answers each:
+
+| Route | Function |
+| ----- | -------- |
+| `GET /.well-known/oauth-protected-resource` | `protectedResourceMetadata("")` |
+| `GET /.well-known/oauth-protected-resource/mcp` | `protectedResourceMetadata("/mcp")` (one per `resourcePaths` entry) |
+| `GET /.well-known/oauth-authorization-server` | `authorizationServerMetadata()` |
+| `GET /oauth/authorize` | `authorize` |
+| `POST /oauth/token` | `token` |
+| `POST /oauth/revoke` | `revoke` |
+| Your consent page's API | `authorizationDetails`, `approveAuthorization`, `approveGuestAuthorization`, `denyAuthorization` |
+
+The authorization server document names `<issuer>/oauth/authorize`,
+`/oauth/token` and `/oauth/revoke` (`oauthEndpointPaths`), so mount them
+there. What cf-auth decides: whether a request is valid and for which client,
+what a consent may do, when a code is good and what it issues. What your app
+decides: the HTTP layer (statuses, `Cache-Control: no-store` on token and
+revocation responses, CORS, `frame-ancestors 'none'` on the consent page,
+checking the consent API's `Origin`), the consent page itself, and for the
+guest door, the deployment's admission rule, the rate limit and what an
+account is.
+
+```ts
+cfAuth.oauth.protectedResourceMetadata(path?: string): ProtectedResourceMetadata;
+cfAuth.oauth.authorizationServerMetadata(): AuthorizationServerMetadata;
+cfAuth.oauth.authorize({ query: URLSearchParams, rateLimitKey: string | null }):
+  Promise<{ consent: { id: string; proof: string } } | { redirect: string }
+        | { error: { status: 400 | 429; code: "invalid_request" | "invalid_client" | "too_many_pending"; description: string } }>;
+cfAuth.oauth.authorizationDetails({ id, proof, viewer: AuthState | null }): Promise<{
+  id: string; state: OperationState;
+  client: { id: string; name: string; domain: string | null; source: "cimd" | "registered" };
+  redirectHost: string; requestedGrant: "read" | "manage"; expiresAt: string;
+  viewer: { user: AuthUser; memberships: OrganizationMembership[] } | null }>;
+cfAuth.oauth.approveAuthorization({ id, proof, actor: AuthState, organizationId: string, grant: "read" | "manage" }):
+  Promise<{ redirect: string }>;
+cfAuth.oauth.approveGuestAuthorization({ id, proof,
+  admit: () => Promise<SQL | null>,
+  rateLimit: () => Promise<void>,
+  provision: (ctx: { operationId: string; guard: SQL; db; tables; now: number }) =>
+    { userId: string; organizationId: string; statements: unknown[] } | Promise<…> }):
+  Promise<{ redirect: string; organizationId: string }>;
+cfAuth.oauth.denyAuthorization({ id, proof }): Promise<{ redirect: string }>;
+```
+
+**`authorize`**, `GET /oauth/authorize`. Required: `response_type=code`,
+`client_id`, `redirect_uri`, `code_challenge`, `code_challenge_method=S256`
+and `resource`; optional: `state` and `scope`. It answers one of three
+shapes, which your route turns into a response:
+
+- `{ error }`, an **error page**: show it, and send nothing to the client.
+  This is the answer whenever the client or its redirect URI cannot be
+  trusted. In order: a parameter given more than once (checked first, before
+  the client is resolved: a duplicated `redirect_uri` could not be told from
+  the real one); a missing `client_id` or `redirect_uri`; an unknown client,
+  a refused metadata document, or an https `client_id` while CIMD is off
+  (`invalid_client`); a `redirect_uri` the client does not declare. It also
+  answers `429 too_many_pending` when the browser's address (`rateLimitKey`)
+  already has `operations.limits.pendingPerOpener` authorizations pending.
+- `{ redirect }`, an **error redirect** to the client's `redirect_uri`, with
+  `error`, `error_description`, `state` when one was sent, and `iss`:
+  `unsupported_response_type` for a `response_type` other than `code`;
+  `invalid_request` for a missing parameter, a method other than `S256`
+  (`plain` included), a `code_challenge` that is not exactly 43 base64url
+  characters, or a `state` over 2048 characters (not echoed);
+  `invalid_target` for a `resource` other than `<issuer>` or
+  `<issuer><path>` for a `resourcePaths` entry; `invalid_scope` for a
+  `scope` other than `read` or `manage`.
+- `{ consent: { id, proof } }`: the authorization is open. Send the browser
+  to your consent page as `/oauth/consent?id=<id>#<proof>`; the proof travels
+  in the fragment, so it never reaches a server log.
+
+A `redirect_uri` matches a declared one as a string, byte for byte — never
+by parsing and normalising it, so `http://127.1/callback`,
+`http://127.0.0.1/x/../callback` and `http://127.0.0.1/callback#` do not
+match `http://127.0.0.1/callback`. The one exception is RFC 8252 §7.3's:
+when both are loopback `http` URIs — the scheme in any letter case, the
+host written exactly `127.0.0.1`, `[::1]` or `localhost` — the port alone
+may differ: they are compared with the port removed from both and
+everything else as written, so `HTTP://localhost:3000/cb` matches
+`HTTP://localhost:4000/cb` but not `http://localhost:3000/cb`. A presented URI with any fragment, even an
+empty one, never matches; a non-loopback URI with another port does not
+either. Both `resource` spellings are normalised to the issuer. `scope`
+defaults to `manage`; it is what the client asks for, and the consent page
+decides.
+
+**`authorizationDetails`** answers what the consent page shows: the
+client's name with its domain (the `client_id` host for a CIMD client,
+`null` for a registered one), where the browser will be sent, the grant
+asked for, when the authorization lapses, and the signed-in person with every
+membership — an interactive human session only, so an API key or an OAuth
+state is shown as nobody. The name is the client's own claim; the domain is
+what the fetch verified.
+
+**`approveAuthorization`** is the signed-in person's "allow": `actor` must be
+an interactive human session (`403 session_required` otherwise), an active
+member of `organizationId` at any role (`403 not_a_member`), in an
+organization inside its deadline (`403 organization_expired`); `grant` is
+the person's choice, `read` or `manage`, whatever the client asked for. The
+batch that completes the authorization re-reads that session, membership and
+deadline; if any has ended it is refused with `409 conflict` and nothing is
+written.
+
+**`approveGuestAuthorization`** is "continue without an account", in exactly
+this order:
+
+1. the proof, or nothing else runs;
+2. an authorization already completed, by either door, answers its redirect
+   (and its `organizationId`) without calling anything below, so a retry
+   after a lost response is never admitted or counted again;
+3. `admit()`: throw to refuse; answer `null`, or an SQL condition the
+   completing batch must satisfy (an emptiness rule such as `not exists
+   (select 1 from organization)`, say). A refusal never reaches the rate
+   limit;
+4. `rateLimit()`: throw when exceeded;
+5. `provision(ctx)`: answer the account's `userId` and `organizationId` and
+   the statements that create them — drizzle query builders, each guarded
+   with `ctx.guard`. Derive the ids from `ctx.operationId`, so a retry names
+   the same rows. cf-auth commits them in the batch that completes the
+   authorization:
+   - the batch's **first** write judges the admission condition, with the
+     engine's guard (the authorization still pending and in time), and
+     latches the judgement on the operation row by writing a random claim
+     of this call's own into its `execution_claim`, the column a
+     reservation's execution claims its row with;
+   - `ctx.guard` and every later statement ask for that claim, never the
+     admission again, so provisioning may change what the admission read —
+     the account's own organization makes an emptiness rule false, and
+     that must not undo it;
+   - the completion requires the claim, and `userId` an active member of
+     `organizationId`, which is inside its deadline, and clears the claim.
+     Otherwise the whole batch, the latch included, rolls back (`409
+     conflict`): of two guests bootstrapping an empty deployment, the
+     second one's latch finds the first one's organization and nothing of
+     it lands.
+
+A guest connection is always `manage`, since it is the account's only way
+in: the record keeps `requestedGrant` beside `grant` so the page can say
+so when the client asked for `read`.
+
+**Both approvals are idempotent**, and either answers the other's result: a
+person's approval racing a guest's, two guest clicks, or a retry after the
+code was exchanged all answer the same redirect, byte for byte, and one
+account. The redirect is `redirect_uri` with `code`, `state` when one was
+sent, and `iss`. How it is rebuilt: the code is 32 random bytes made when
+the authorization opens; the operation's id is `oauth-` and the code's
+SHA-256 (hex), so the exchange finds it by the code's digest; and the
+payload keeps the code sealed with AES-256-GCM under a key derived by
+HKDF-SHA256 from the browser proof, which the database holds only a digest
+of. Whoever presents the proof again reopens it; nothing else can, not even
+with the database and `secret`. The engine's own token for the operation is
+a separate random value nothing keeps, so the code does not lead to the
+proof either.
+
+**`denyAuthorization`** denies it and answers the `access_denied` redirect,
+with `state` and `iss`; a repeat answers the same. Approving a denied
+authorization is `409 operation_denied`; approving one past its deadline,
+`410 operation_expired`; denying a completed one, `409 already_completed`.
+A wrong proof is `403 invalid_proof` and an unknown id, or an operation of
+another kind, `404 operation_not_found`, everywhere.
+
+**The code exchange**, `token` with `grant_type=authorization_code`:
+`code`, `redirect_uri`, `client_id` and `code_verifier` are required, and
+`resource` optional. Before anything is looked up: a parameter given twice,
+a missing one, or a `code_verifier` that is not 43–128 characters of
+`[A-Za-z0-9-._~]` is `invalid_request`, and a `resource` that is not one of
+the two spellings is `invalid_target`. Then:
+
+- an unknown code — never issued, not approved yet, denied, or swept — is
+  `invalid_grant`;
+- `client_id` and `redirect_uri` must equal the authorization's, and
+  `S256(code_verifier)` its challenge; otherwise `invalid_grant`, nothing
+  written, and the code stays good, so presenting a stolen code without its
+  verifier ends nothing;
+- a code already exchanged is `invalid_grant`, and the connection it issued
+  is revoked — sequentially or concurrently, expired or not;
+- a code past `codeExpiresAt` (completion + `authorizationTtlMs`) is
+  `invalid_grant`, and nothing is revoked;
+- otherwise one batch writes the connection (the record's user,
+  organization, grant and client; `label` the client's name; `client_id`
+  the client's id) and its first generation, and stamps the record's
+  `exchangedAt` and `connectionId`. Every statement in it is conditional on
+  the authorization being completed, unexchanged and inside `codeExpiresAt`
+  by either clock, and the connection's on the membership and organization
+  being live. Of two exchanges racing, one lands; the other finds
+  `exchangedAt` set and revokes what the first issued.
+
+The response is the token response of [the functions](#the-functions), with
+`scope` the grant.
+
+**The discovery documents.** `protectedResourceMetadata(path)` answers
+RFC 9728's document for `<issuer>` (`""`, the default) or `<issuer><path>`
+for a `resourcePaths` entry, `resource` being exactly that URL, with
+`authorization_servers: [<issuer>]`, `scopes_supported: ["read",
+"manage"]` and `bearer_methods_supported: ["header"]`; any other path is
+`422 validation_error`. `authorizationServerMetadata()` answers RFC 8414's:
+`issuer`; the three endpoints; `response_types_supported: ["code"]`;
+`grant_types_supported: ["authorization_code", "refresh_token"]`;
+`code_challenge_methods_supported: ["S256"]`;
+`token_endpoint_auth_methods_supported` and
+`revocation_endpoint_auth_methods_supported: ["none"]`;
+`scopes_supported: ["read", "manage"]`;
+`authorization_response_iss_parameter_supported: true`; and
+`client_id_metadata_document_supported`, true unless `cimd: false`. Serve
+both with `Access-Control-Allow-Origin: *`.
+
+#### Clients
+
+Public clients only, from two sources:
+
+- **Registered**, from `oauth.clients`: `clientId`, `name` (trusted
+  configuration) and `redirectUris`. A registered id wins over a document.
+- **Client ID Metadata Documents** (CIMD), on unless `cimd: false`: a
+  `client_id` that is an https URL is fetched once per authorization, with
+  `cimd.fetch` (default the global `fetch`). The bounds, in order:
+  1. the URL is https, with no userinfo, no fragment and a path other than
+     `/`;
+  2. its host is a name: a literal IPv4 or IPv6 address (in any spelling
+     the URL parser normalises), `localhost` and `*.localhost` are refused
+     without a fetch;
+  3. `cimd.allowUrl(url)`, when set, must answer `true`; a throw is a
+     refusal;
+  4. one `GET` with `redirect: "manual"` (workerd refuses `"error"`), a 5 s
+     `AbortSignal.timeout` and `accept: application/json`; a fetch that
+     throws is refused;
+  5. any status but 200 is refused, so no redirect is followed;
+  6. the media type must be `application/json` or `application/*+json`;
+  7. a body over 64 KiB is refused and its stream cancelled before
+     anything is parsed: a larger `content-length` is refused before
+     reading; a byte stream (Workers' and Node's are) is read with a BYOB
+     reader into one buffer of 64 KiB plus one byte, so at most that much
+     is ever requested from it; only a body that cannot be read BYOB is
+     read chunk by chunk, and a platform that delivers larger chunks
+     without BYOB support may hand over more than that before the cancel;
+  8. the body must be a JSON object whose `client_id` equals the URL;
+  9. `token_endpoint_auth_method`, if present, must be `none`;
+     `grant_types`, if present, within `authorization_code` and
+     `refresh_token`; `response_types`, if present, within `code` — nothing
+     is downgraded;
+  10. `client_name` must be a non-empty string, at most 200 characters once
+      trimmed. It is trimmed and bounded, not HTML-escaped or otherwise
+      sanitised: whoever renders it — your consent page, the access page —
+      must treat it as untrusted text;
+  11. `redirect_uris` must list at least one URI, every one absolute with no
+      fragment (not even an empty one) and `https`, `http` (in any letter
+      case) on a host written exactly `127.0.0.1`, `[::1]` or `localhost`
+      (any port), or a
+      private-use scheme in reverse-DNS form
+      (`com.example.app:/cb`).
+
+  A refusal is `invalid_client` on an error page, and its description names
+  the field or the bound, never a value from the document. Your per-address
+  rate limit on `/oauth/authorize` runs before `authorize`, so it bounds
+  fetches; the pending cap applies after the fetch, when the authorization
+  opens.
+
+#### The `cf-auth:oauth.authorize` kind
+
+A pending authorization is an operation of the built-in internal kind
+`cf-auth:oauth.authorize`, registered when `oauth.enabled` and refused by
+every entry point of `cfAuth.operations` (see
+[Internal kinds](#internal-kinds)). It is public, approved by the browser
+proof (the doors carry the person's or the guest's authority into the
+completing batch themselves), has no user code, counts toward
+`pendingPerOpener` under `rateLimitKey`, is pending for
+`authorizationTtlMs` and is kept for a day from opening — longer only when
+`authorizationTtlMs` is over 12 hours, to twice it, so the record always
+outlives the code. Its payload is the client, the redirect URI, the
+challenge, the requested grant, the `state`, the normalised resource and the
+sealed code. Its completion record, kept in the clear, is
+`OAuthAuthorizationRecord`:
+
+```ts
+{ door: "person" | "guest"; userId; organizationId; grant; requestedGrant;
+  client: { id, name, domain, source }; redirectUri; codeChallenge; resource;
+  codeExpiresAt: number;            // completion + authorizationTtlMs, epoch ms
+  exchangedAt: number | null;       // set by the exchange
+  connectionId: string | null }     // the connection the exchange issued
+```
+
+It needs no migration. The operation sweep deletes it a day after it
+opened, after which its code is unknown.
+
 ### Storage
 
 Migration `0004_cf_auth_oauth_token.sql` adds `api_key.client_id` and
@@ -1331,12 +1617,33 @@ Send every token and revocation response with `Cache-Control: no-store`.
 
 | `error`                  | Status | When                                                                 |
 | ------------------------ | ------ | -------------------------------------------------------------------- |
-| `invalid_request`        | 400    | A parameter given twice, a required one missing, a body that is not form parameters |
+| `invalid_request`        | 400    | A parameter given twice, a required one missing, a body that is not form parameters, a malformed `code_verifier` |
 | `invalid_client`         | 401    | `client_id` is not the client the connection was issued to; nothing changes |
-| `invalid_grant`          | 400    | An unknown refresh token; a dead connection; refreshed within 5 s ("slow down: refreshed too recently"); reuse, which revokes the connection |
+| `invalid_grant`          | 400    | An unknown refresh token; a dead connection; refreshed within 5 s ("slow down: refreshed too recently"); reuse, which revokes the connection. An unknown, unapproved, expired or swept code; a `client_id`, `redirect_uri` or verifier that is not the authorization's; a code already exchanged, which revokes the connection it issued |
 | `invalid_scope`          | 400    | `scope` is not exactly the connection's grant                        |
 | `invalid_target`         | 400    | `resource` is not the issuer or one of its paths, or not the connection's |
-| `unsupported_grant_type` | 400    | Any `grant_type` but `refresh_token` in this release                |
+| `unsupported_grant_type` | 400    | A `grant_type` other than `authorization_code` and `refresh_token`  |
+
+The authorization endpoint answers its own errors, never thrown:
+
+| Answer        | `error` / `code`            | When |
+| ------------- | --------------------------- | ---- |
+| Error page    | `invalid_request` (400)     | A parameter given twice; no `client_id` or `redirect_uri`; one too long; a `redirect_uri` the client does not declare |
+| Error page    | `invalid_client` (400)      | An unknown client; a refused metadata document; an https `client_id` while CIMD is off |
+| Error page    | `too_many_pending` (429)    | The browser's address has too many authorizations pending |
+| Redirect      | `invalid_request`           | A missing parameter; a method other than `S256`; a malformed challenge; a `state` over 2048 characters |
+| Redirect      | `unsupported_response_type` | `response_type` is not `code` |
+| Redirect      | `invalid_target`            | `resource` is not the issuer or one of its paths |
+| Redirect      | `invalid_scope`             | `scope` is not `read` or `manage` |
+| Redirect      | `access_denied`             | `denyAuthorization` |
+
+The consent functions throw `CfAuthError`s: `invalid_proof` (403),
+`operation_not_found` (404), `session_required` (403), `not_a_member`
+(403), `organization_expired` (403), `operation_denied` (409),
+`operation_expired` (410), `already_completed` (409, denying a completed
+authorization), `conflict` (409, the completing batch found its authority
+or admission gone and rolled back) and `validation_error` (422). Whatever
+`admit`, `rateLimit` or `provision` throws is passed through.
 
 ---
 

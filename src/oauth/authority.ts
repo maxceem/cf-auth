@@ -43,3 +43,31 @@ export const oauthConnectionLiveSql = (
         or cast(unixepoch(${organization.expiresAt}, 'subsec') * 1000 as integer) > ${now})
   )`;
 };
+
+/**
+ * The organization exists and is inside its deadline when the statement runs,
+ * by the later of `nowMs` and the database's clock: `expires_at` is ISO text,
+ * read as epoch milliseconds, as the operation engine reads it.
+ */
+export const oauthOrganizationLiveSql = (
+  tables: CfAuthTables,
+  input: { organizationId: string; nowMs: number },
+): SQL => {
+  const live = alias(tables.organization, "cf_auth_oauth_organization");
+  return sql`exists (select 1 from ${tables.organization} as ${sql.identifier("cf_auth_oauth_organization")}
+    where ${live.id} = ${input.organizationId}
+      and (${live.expiresAt} is null
+        or cast(unixepoch(${live.expiresAt}, 'subsec') * 1000 as integer) > ${sqliteNowMs(input.nowMs)}))`;
+};
+
+/** The user's membership in the organization is active, at any role. */
+export const oauthMembershipLiveSql = (
+  tables: CfAuthTables,
+  input: { userId: string; organizationId: string },
+): SQL => {
+  const member = alias(tables.organizationUser, "cf_auth_oauth_member");
+  return sql`exists (select 1 from ${tables.organizationUser} as ${sql.identifier("cf_auth_oauth_member")}
+    where ${member.userId} = ${input.userId}
+      and ${member.organizationId} = ${input.organizationId}
+      and ${member.status} = 'active')`;
+};

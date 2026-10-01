@@ -827,6 +827,14 @@ const rolesAtLeast = (minimum: OrganizationRole) =>
   organizationRoles.filter((role) => hasRoleAtLeast(role, minimum));
 
 /** Reads a value with a kind's schema, turning a throw into `422 validation_error`. */
+/**
+ * The browser proof an operation opened with `token` carries: what the
+ * approval URL's fragment holds. Exported for cf-auth's own flows, which need
+ * it before they open an operation; never from the package index.
+ */
+export const operationBrowserProof = (token: string, realm: string): Promise<string> =>
+  hmacHex(token, `cf-auth:operation-browser:${realm}`);
+
 const parseWith = <Value>(schema: OperationPayloadSchema<Value>, value: unknown, what: string): Value => {
   try {
     return typeof schema === "function" ? schema(value) : schema.parse(value);
@@ -916,8 +924,7 @@ export const createOperationsEngine = (
     return row.browserProofHash === null ? "reveal" : "once";
   };
 
-  const browserProofFor = (token: string) =>
-    hmacHex(token, `cf-auth:operation-browser:${settings.realm}`);
+  const browserProofFor = (token: string) => operationBrowserProof(token, settings.realm);
   const userCodeFor = (token: string) => deriveUserCode(token, settings.realm);
   const userCodeContext = (id: string) => `${id}:user-code`;
   let userCodeKey: Promise<string> | undefined;

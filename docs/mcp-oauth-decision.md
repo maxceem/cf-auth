@@ -333,6 +333,36 @@ How the functions behave:
   it; only these functions reach it, so no generic operation route can submit
   an approval input for it.
 
+**Step 10 as built (deviations from the text above, stated explicitly):**
+
+- `authorize` answers a third shape, `{ error: { status, code, description } }`,
+  for the error page the prose below requires, and `{ error: { status: 429,
+  code: "too_many_pending" } }` when the pending cap refuses; it throws only
+  while OAuth is off. `protectedResourceMetadata` takes `""` or any
+  `resourcePaths` entry, not only `"/mcp"`.
+- The code is the authorization's own random value (32 bytes, base64url),
+  made when it opens; the operation's id is `oauth-` and the code's SHA-256
+  (hex), so the exchange finds it by digest through the primary key. The
+  payload's sealed code is sealed under a key derived from the browser proof
+  rather than `secret`, and the engine's operation token is a separate value
+  nothing keeps. No engine-sealed outcome holds the code, and the record
+  holds no code digest: the id is that digest.
+- The completion record also holds `requestedGrant`, `resource` and, once
+  exchanged, `connectionId` (what a replay revokes).
+- The record is kept for `max(1 day, 2 × authorizationTtlMs)` from opening,
+  so with an `authorizationTtlMs` over 12 hours it still outlives the code.
+- A replayed code revokes only when the presentation carries the
+  authorization's `client_id`, `redirect_uri` and verifier: a code alone
+  ends nothing.
+- The guest door's admission condition is judged once, by the first write
+  of the completing batch, which latches it in `operation.execution_claim`;
+  provisioning and the completion are conditioned on that claim rather than
+  on the admission again, since an emptiness rule turns false as soon as
+  the account's own rows land.
+- Redirect URIs match as strings, not parsed URLs; only a loopback port may
+  differ. The CIMD body is read with a BYOB reader into 64 KiB + 1 bytes
+  where the body is a byte stream, chunk by chunk only otherwise.
+
 ### Authorization request (step 10)
 
 `GET /oauth/authorize`:
