@@ -1,8 +1,9 @@
 import type { Context, Env, MiddlewareHandler } from "hono";
 import type { ResolvedCfAuthConfig } from "./config.js";
 import type { CurrentOrganizationCookie } from "./cookies.js";
-import { forbidden, grantInsufficient, sessionRequired, unauthorized } from "./errors.js";
+import { forbidden, grantInsufficient, sessionRequired, unauthorized, validationError } from "./errors.js";
 import type { CfBetterAuth } from "./better-auth.js";
+import type { CfAuthOAuth } from "./oauth/service.js";
 import type { CfAuthService } from "./service.js";
 import {
   canManageOrganization,
@@ -11,6 +12,7 @@ import {
   hasRoleAtLeast,
   type ActionSource,
   type AuthState,
+  type OAuthActionSource,
   type CredentialGrant,
   type AuthUser,
   type OrganizationRole,
@@ -40,6 +42,11 @@ export interface AuthMiddlewareOptions {
    */
   apiKeys?: boolean;
   /**
+   * Resolve bearer tokens carrying `oauth.tokenPrefix.access` as OAuth
+   * access tokens. Defaults to whether `oauth.enabled` is on.
+   */
+  oauth?: boolean;
+  /**
    * Re-sync the current-organization cookie when the resolved org differs from
    * the cookie. Default: `true`.
    */
@@ -51,18 +58,31 @@ const deriveApiKeySource = (value: string | null | undefined): ActionSource => {
   return normalized === "cli" || normalized === "mcp" ? normalized : "api";
 };
 
+/** An OAuth token is presented to the MCP endpoint or the management API: `mcp`, else `api`. */
+const deriveOAuthSource = (value: string | null | undefined): OAuthActionSource =>
+  value?.trim().toLowerCase() === "mcp" ? "mcp" : "api";
+
 export const createAuthMiddleware = (
   config: ResolvedCfAuthConfig,
   deps: {
     auth: CfBetterAuth;
     service: CfAuthService;
+    /** Needed only when OAuth is on; `createCfAuth` passes it. */
+    oauth?: CfAuthOAuth;
     currentOrganizationCookie: CurrentOrganizationCookie;
   },
 ) => {
-  const { auth, service, currentOrganizationCookie } = deps;
+  const { auth, service, oauth, currentOrganizationCookie } = deps;
 
   return <E extends Env = CfAuthEnv>(options: AuthMiddlewareOptions = {}): MiddlewareHandler<E> => {
     const apiKeysEnabled = options.apiKeys ?? config.apiKeys.enabled;
+    const oauthAccessPrefix =
+      (options.oauth ?? config.oauth !== null) && config.oauth ? config.oauth.tokenPrefix.access : null;
+    if (oauthAccessPrefix !== null && !oauth) {
+      throw validationError(
+        "OAuth bearer routing needs `deps.oauth`; pass `createOAuthService(...)`, or `middleware({ oauth: false })`",
+      );
+    }
     const syncCookie = options.syncCurrentOrganizationCookie ?? true;
 
     return async (c, next) => {
@@ -73,6 +93,21 @@ export const createAuthMiddleware = (
       };
 
       const authorization = c.req.header("Authorization");
+
+      // A bearer token is routed by its prefix: the OAuth access prefix to
+      // the connection's tokens, everything else to API keys.
+      if (oauthAccessPrefix !== null && authorization?.startsWith(bearerPrefix)) {
+        const token = authorization.slice(bearerPrefix.length).trim();
+        if (token.startsWith(oauthAccessPrefix)) {
+          setState(
+            await oauth!.resolveAccessTokenAuthState(token, {
+              source: deriveOAuthSource(c.req.header(config.apiKeys.clientHeader)),
+            }),
+          );
+          await next();
+          return;
+        }
+      }
 
       if (apiKeysEnabled && authorization?.startsWith(bearerPrefix)) {
         const token = authorization.slice(bearerPrefix.length).trim();

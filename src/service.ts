@@ -26,6 +26,7 @@ import {
   type AuthState,
   type AuthUser,
   type CfAuthEvent,
+  type OAuthActionSource,
   type CreatedApiKey,
   type CredentialGrant,
   type OrganizationMember,
@@ -43,12 +44,19 @@ const ensureNonEmpty = (value: string | null | undefined, label: string) => {
   return normalized;
 };
 
-/** A key's `source`: a short lowercase word, `console` unless the caller names one. */
+/**
+ * A key's `source`: a short lowercase word, `console` unless the caller names
+ * one. `oauth` is refused: it marks an OAuth connection, which only cf-auth's
+ * OAuth service issues.
+ */
 export const normalizeApiKeySource = (value: string | undefined): string => {
   if (value === undefined) return "console";
   const normalized = value.trim();
   if (!/^[a-z][a-z0-9_.-]{0,31}$/.test(normalized)) {
     throw validationError("API key source must be a short lowercase word, e.g. `cli`");
+  }
+  if (normalized === "oauth") {
+    throw validationError("API key source `oauth` is reserved for OAuth connections");
   }
   return normalized;
 };
@@ -164,6 +172,39 @@ export const toApiKeyAuthState = (
       id: user.id,
       kind: user.kind,
       credentialId: apiKeyId,
+      actionSource: source,
+    },
+    user,
+    memberships: [membership],
+    organization: membership.organization,
+    role: membership.role,
+    grant,
+  };
+};
+
+/**
+ * The state an OAuth connection's access token proves: a delegated
+ * credential, like a key, bound to the connection's one organization and
+ * carrying its grant. `source` is the endpoint's, `mcp` or `api`.
+ */
+export const toOAuthAuthState = (
+  user: AuthUser,
+  membership: OrganizationMembership,
+  connectionId: string,
+  source: OAuthActionSource,
+  grant: CredentialGrant,
+): AuthState => {
+  if (source !== "mcp" && source !== "api") return createEmptyAuthState();
+  return {
+    authenticated: true,
+    credentialType: "oauth",
+    assurance: "credential",
+    source,
+    actor: {
+      type: "user",
+      id: user.id,
+      kind: user.kind,
+      credentialId: connectionId,
       actionSource: source,
     },
     user,
@@ -328,17 +369,20 @@ export interface CfAuthService {
     /** How much of the holder's authority the key may exercise. Default: `"manage"`. */
     grant?: CredentialGrant;
   }): Promise<CreatedApiKey>;
-  /** Requires a current owner or admin membership and the `manage` grant. */
+  /**
+   * Requires a current owner or admin membership and the `manage` grant. On
+   * an OAuth connection it revokes the connection and deletes its tokens.
+   */
   revokeApiKey(input: {
     organizationId: string;
     actor: AuthState;
     apiKeyId: string;
   }): Promise<ApiKeySummary | null>;
   /**
-   * Revokes exactly the API key the caller authenticated with — a CLI logging
-   * itself out. Needs no role and no grant: holding a key, even a `read` one,
-   * is authority enough to end it. Throws `403 api_key_required` for any other
-   * credential.
+   * Revokes exactly the API key, or OAuth connection, the caller
+   * authenticated with — a CLI logging itself out. Needs no role and no
+   * grant: holding a key, even a `read` one, is authority enough to end it.
+   * Throws `403 api_key_required` for a session.
    */
   revokeOwnApiKey(input: { actor: AuthState }): Promise<ApiKeySummary>;
 }
@@ -909,6 +953,7 @@ export const createAuthService = (
         organizationId: input.organizationId,
         apiKeyId: apiKey.id,
         name: apiKey.name,
+        ...(apiKey.source === "oauth" ? { credentialType: "oauth" as const } : {}),
       });
 
       return apiKey;
@@ -921,7 +966,11 @@ export const createAuthService = (
       if (!actor.authenticated || !actor.user) throw unauthorized();
       const apiKeyId = actor.actor?.credentialId;
       const organizationId = actor.organization?.id;
-      if (actor.credentialType !== "apiKey" || !apiKeyId || !organizationId) {
+      if (
+        (actor.credentialType !== "apiKey" && actor.credentialType !== "oauth") ||
+        !apiKeyId ||
+        !organizationId
+      ) {
         throw new CfAuthError(
           "api_key_required",
           "Only an API key can revoke itself; sign-in sessions sign out instead",
@@ -938,6 +987,7 @@ export const createAuthService = (
         organizationId,
         apiKeyId: apiKey.id,
         name: apiKey.name,
+        ...(apiKey.source === "oauth" ? { credentialType: "oauth" as const } : {}),
       });
 
       return apiKey;

@@ -164,12 +164,61 @@ none of these entry points accepts one. See
 [Reservations and reveals](docs/index.md#reservations-and-reveals) for the
 errors, the guard and the seal window.
 
+## OAuth connections
+
+This release covers OAuth **credentials only**: connections, their tokens,
+refresh, revocation and resolution. The authorization endpoint, consent and
+Client ID Metadata Documents come in the next release; until then nothing
+here issues a connection to a client by itself, and
+`grant_type=authorization_code` answers `unsupported_grant_type`.
+
+An MCP client that has signed in through OAuth 2.1 holds a **connection**: an
+`api_key` row with `source: "oauth"`, bound to one person in one organization
+with a grant, like a key. It shows up in `listApiKeys` beside the keys, with
+its client's `clientId`, and `revokeApiKey` ends it. Its tokens are prefixed
+and name the connection, `<prefix><connectionId>.<secret>`: the access token
+lives 10 minutes, the refresh token 30 days, restarted by each rotation, and
+`expires_at` on the row is the connection's lifetime, optionally capped by
+`connectionMaxAgeMs`. Only digests are stored.
+
+```ts
+const cfAuth = createCfAuth({
+  // ...the usual settings, with apiKeys and operations on, on D1 or libsql
+  oauth: {
+    enabled: true,
+    issuer: "https://console.example.com",
+    tokenPrefix: { access: "agw_oat_", refresh: "agw_ort_" },
+  },
+});
+
+// Your routes: cf-auth answers the status and the RFC 6749 body; you send it.
+app.post("/oauth/token", async (c) => {
+  const { status, body } = await cfAuth.oauth.token({ body: new URLSearchParams(await c.req.text()) });
+  return c.json(body, status, { "Cache-Control": "no-store" });
+});
+// Your bearer gate; the middleware also routes the access prefix here by itself.
+const state = await cfAuth.oauth.resolveAccessTokenAuthState(token, { source: "mcp" });
+```
+
+cf-auth mounts no routes; your app mounts the token and revocation endpoints
+and the bearer gate. A refresh rotates the tokens; the previous refresh token
+replays the same response for 30 s, and after that its return revokes the
+whole connection. See [OAuth connections](docs/index.md#oauth-connections).
+
+Upgrading: apply migration `0004_cf_auth_oauth_token.sql` even with OAuth
+off. A custom `CfAuthRepository` must also implement the new
+`findOAuthAccess`: one coherent `SELECT` of the connection's current
+generation — the maximum generation across all its token rows, unrotated
+only — with its grant, user, membership and organization, the supplied
+condition enforced inside the query, and digest verification left to the
+service. See [Storage](docs/index.md#storage).
+
 ## Documentation
 
 [`docs/index.md`](docs/index.md) covers setup and migrations, the options,
 reading the auth state, organizations and roles, API keys, operations approved
-in a browser and reservations, the organization cookie, audit events, and the
-environment variables.
+in a browser and reservations, OAuth connections, the organization cookie,
+audit events, and the environment variables.
 
 ## License
 

@@ -254,6 +254,20 @@ export interface CfAuthRepository {
   revokeApiKey(apiKeyId: string, organizationId: string): Promise<ApiKeySummary | null>;
   findApiKeyById(apiKeyId: string, organizationId: string): Promise<ApiKeySummary | null>;
   findActiveApiKeyByHash(tokenHash: string, now: Date): Promise<ApiKeyAuthRecord | null>;
+  /**
+   * An OAuth connection's current generation with everything an access
+   * token's state is built from — the connection's grant, its user, and the
+   * membership with its organization — read in one statement, where
+   * `condition` holds. Used by the OAuth service, which passes the liveness
+   * rule as `condition` and then verifies the token's digest against
+   * `accessTokenHash`.
+   */
+  findOAuthAccess(input: { connectionId: string; condition: SQL }): Promise<{
+    accessTokenHash: string;
+    grant: string;
+    user: AuthUser;
+    membership: OrganizationMembership;
+  } | null>;
 }
 
 export const createCfAuthRepository = (
@@ -261,7 +275,7 @@ export const createCfAuthRepository = (
   tables: CfAuthTables,
   options: CfAuthRepositoryOptions = {},
 ): CfAuthRepository => {
-  const { user, session, organization, organizationUser, apiKey } = tables;
+  const { user, session, organization, organizationUser, apiKey, oauthToken } = tables;
 
   const onError =
     options.onError ??
@@ -415,6 +429,7 @@ export const createCfAuthRepository = (
     source: apiKey.source,
     label: apiKey.label,
     grant: apiKey.grant,
+    clientId: apiKey.clientId,
     createdAt: apiKey.createdAt,
     revokedAt: apiKey.revokedAt,
     expiresAt: apiKey.expiresAt,
@@ -429,6 +444,7 @@ export const createCfAuthRepository = (
     source: string;
     label: string | null;
     grant: string;
+    clientId: string | null;
     createdAt: Date;
     revokedAt: Date | null;
     expiresAt: Date | null;
@@ -445,6 +461,7 @@ export const createCfAuthRepository = (
       // Only cf-auth writes this column and it writes only the two values; a
       // value put there by hand fails closed, as the least grant.
       grant: isCredentialGrant(row.grant) ? row.grant : "read",
+      clientId: row.clientId,
       createdAt: toIso(row.createdAt),
       expiresAt: row.expiresAt ? toIso(row.expiresAt) : null,
       revokedAt: row.revokedAt ? toIso(row.revokedAt) : null,
@@ -1000,6 +1017,7 @@ export const createCfAuthRepository = (
         source: input.source,
         label: input.label,
         grant,
+        clientId: null,
         expiresAt: input.expiresAt?.toISOString() ?? null,
         createdAt: createdAt.toISOString(),
         revokedAt: null,
@@ -1044,25 +1062,84 @@ export const createCfAuthRepository = (
     },
 
     async revokeApiKey(apiKeyId, organizationId) {
-      await db
-        .update(apiKey)
-        .set({
-          enabled: false,
-          revokedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(apiKey.id, apiKeyId),
-            eq(apiKey.organizationId, organizationId),
-            sql`${apiKey.revokedAt} is null`,
+      // An OAuth connection is a key row too: revoking it also deletes its
+      // token generations, in the same batch.
+      const revokedKey = alias(apiKey, "cf_auth_revoked_key");
+      await runAtomically(
+        db,
+        [
+          db
+            .update(apiKey)
+            .set({
+              enabled: false,
+              revokedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(apiKey.id, apiKeyId),
+                eq(apiKey.organizationId, organizationId),
+                sql`${apiKey.revokedAt} is null`,
+              ),
+            ),
+          db.delete(oauthToken).where(
+            and(
+              eq(oauthToken.apiKeyId, apiKeyId),
+              sql`exists (select 1 from ${apiKey} as ${sql.identifier("cf_auth_revoked_key")}
+                where ${revokedKey.id} = ${apiKeyId}
+                  and ${revokedKey.organizationId} = ${organizationId}
+                  and ${revokedKey.revokedAt} is not null)`,
+            ),
           ),
-        );
+        ],
+        async () => undefined,
+        onError,
+      );
       const row = await db
         .select(apiKeyColumns)
         .from(apiKey)
         .where(and(eq(apiKey.id, apiKeyId), eq(apiKey.organizationId, organizationId)))
         .get();
       return row ? toApiKeySummary(row) : null;
+    },
+
+    async findOAuthAccess({ connectionId, condition }) {
+      const newest = alias(oauthToken, "cf_auth_oauth_newest");
+      const row = await db
+        .select({
+          accessTokenHash: oauthToken.accessTokenHash,
+          grant: apiKey.grant,
+          user: userColumns,
+          ...membershipColumns,
+        })
+        .from(oauthToken)
+        .innerJoin(apiKey, eq(apiKey.id, oauthToken.apiKeyId))
+        .innerJoin(user, eq(user.id, apiKey.userId))
+        .innerJoin(
+          organizationUser,
+          and(
+            eq(organizationUser.userId, apiKey.userId),
+            eq(organizationUser.organizationId, apiKey.organizationId),
+          ),
+        )
+        .innerJoin(organization, eq(organization.id, apiKey.organizationId))
+        .where(
+          and(
+            eq(oauthToken.apiKeyId, connectionId),
+            isNull(oauthToken.rotatedAt),
+            // The current generation is the newest one.
+            sql`${oauthToken.generation} = (select max(${newest.generation}) from ${oauthToken} as ${sql.identifier("cf_auth_oauth_newest")}
+              where ${newest.apiKeyId} = ${connectionId})`,
+            condition,
+          ),
+        )
+        .get();
+      if (!row) return null;
+      return {
+        accessTokenHash: row.accessTokenHash,
+        grant: row.grant,
+        user: toAuthUser(row.user),
+        membership: toMembership(row),
+      };
     },
 
     async findActiveApiKeyByHash(tokenHash, now) {
@@ -1072,6 +1149,9 @@ export const createCfAuthRepository = (
         .where(
           and(
             eq(apiKey.tokenHash, tokenHash),
+            // A connection's token_hash digests nothing ever revealed; its
+            // tokens resolve through the OAuth service only.
+            ne(apiKey.source, "oauth"),
             eq(apiKey.enabled, true),
             isNull(apiKey.revokedAt),
             or(isNull(apiKey.expiresAt), gt(apiKey.expiresAt, now)),

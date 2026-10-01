@@ -11,6 +11,7 @@ database.
 - [Organizations](#organizations)
 - [API keys](#api-keys)
 - [Operations approved in a browser](#operations-approved-in-a-browser)
+- [OAuth connections](#oauth-connections)
 - [The organization cookie](#the-organization-cookie)
 - [Audit events](#audit-events)
 - [Environment](#environment)
@@ -125,6 +126,7 @@ export const {
   organizationUser,
   apiKey,
   operation,
+  oauthToken,
 } = cfAuthTables;
 
 // Your own tables use `organization.id` as the tenant key.
@@ -151,8 +153,12 @@ If you would rather not run drizzle-kit, the ready-made SQL for the default
 table names ships in `node_modules/@maxceem/cf-auth/drizzle/`:
 `0000_cf_auth_init.sql` creates the tables, `0001_cf_auth_operations.sql`
 adds the `operation` table and the `source` and `label` columns of `api_key`,
-and `0002_cf_auth_api_key_grant.sql` adds its `grant` column, with every
-existing key at `manage`. Copy them in, in order. The package's own tests apply these exact files, so
+`0002_cf_auth_api_key_grant.sql` adds its `grant` column, with every
+existing key at `manage`, `0003_cf_auth_operation_execution_claim.sql` adds
+`operation.execution_claim`, and `0004_cf_auth_oauth_token.sql` adds the
+`oauth_token` table and the `client_id` and `resource` columns of `api_key`
+(see [OAuth connections](#oauth-connections)). Each is plain `CREATE` and
+`ALTER TABLE ... ADD`; none rebuilds a table. Copy them in, in order. The package's own tests apply these exact files, so
 they cannot drift from the schema.
 
 ### Renaming the tables
@@ -192,6 +198,7 @@ ones worth knowing about.
 | `accountLinking.implicit`               | `false`             | Whether a Google sign-in may join an existing password account. See below.                |
 | `apiKeys`                               | off                 | `{ enabled: true, tokenPrefix: "sk_live_" }`.                                             |
 | `operations`                            | off                 | `{ enabled: true, realm }`. See [Operations](#operations-approved-in-a-browser).          |
+| `oauth`                                 | off                 | `{ enabled: true, issuer, tokenPrefix }`. See [OAuth connections](#oauth-connections).    |
 | `organizations.defaultOrganizationName` | `"My Organization"` | A string, or a function of the user.                                                      |
 | `cookies.prefix`                        | from `appName`      | See below.                                                                                |
 | `onEvent`                               | —                   | Called for sign-ups and key changes. See [Audit events](#audit-events).                   |
@@ -311,7 +318,7 @@ The middleware sets `c.get("authState")`:
 ```ts
 interface AuthState {
   authenticated: boolean;
-  credentialType: "session" | "apiKey" | null;
+  credentialType: "session" | "apiKey" | "oauth" | null;
   source: "web" | "api" | "cli" | "mcp" | "system" | null;
   actor: AuthActor | null;
   user: AuthUser | null; // populated for sessions and keys
@@ -324,9 +331,11 @@ interface AuthState {
 
 It looks for, in order:
 
-1. `Authorization: Bearer <token>` — read as an API key when you turned keys on.
-   You get `credentialType: "apiKey"`, no user, and the key's organization with
-   the role `owner`.
+1. `Authorization: Bearer <token>` — an OAuth access token when OAuth is on and
+   the token carries `oauth.tokenPrefix.access` (see
+   [OAuth connections](#oauth-connections)); otherwise read as an API key when
+   you turned keys on. You get `credentialType: "oauth"` or `"apiKey"`, the
+   credential's owner, and its one organization with the owner's role there.
 2. The session cookie. You get `credentialType: "session"`, all the user's
    organizations, and the one named by the organization cookie — or their oldest
    one.
@@ -460,7 +469,8 @@ gets `403 api_key_required`.
 Every key records where it came from. `source` is a short word — `console`
 unless you pass another, `cli` for the keys the built-in `login` operation
 issues — and `label` is optional free text such as `CLI on mac-studio`. Both are
-for display only; nothing authorizes on them.
+for display only; nothing authorizes on them. `oauth` is reserved: it marks
+an [OAuth connection](#oauth-connections), and no caller may issue a key with it.
 Session and API-key callers use the same membership role. Keys never acquire
 browser assurance, including keys belonging to a human. Applications expose
 their own authorized management routes around these server methods when needed.
@@ -502,6 +512,7 @@ owner still only reads.
 | Nobody         | `null`                                              |
 | A session      | `"manage"`: a person's own session is not delegated |
 | An API key     | the grant it was issued with, `"manage"` by default |
+| An OAuth connection | the grant the person approved                  |
 
 A key gets its grant when it is issued and keeps it. `createApiKey` and
 `issueServiceApiKey` take `grant`, and so does the built-in `login` through its
@@ -1100,6 +1111,235 @@ to 400 in your error handler if that is what your API answers with.
 
 ---
 
+## OAuth connections
+
+OAuth 2.1 for public clients, such as MCP clients. A client the person
+approves gets a **connection**: an `api_key` row with `source: "oauth"`, so
+everything that binds a key binds it too. It belongs to one person in one
+organization, carries a grant, is listed by `listApiKeys` and ended by
+`revokeApiKey`. Its tokens are issued, rotated, revoked and resolved here.
+cf-auth mounts no routes: your app mounts the token and revocation endpoints
+and the bearer gate, and sends what these functions answer.
+
+This release covers the credentials. The authorization endpoint, consent and
+Client ID Metadata Documents arrive in the next one; until then
+`grant_type=authorization_code` answers `unsupported_grant_type`.
+
+```ts
+oauth?: {
+  enabled?: boolean;                  // default false; needs apiKeys, operations and a batching database
+  issuer: string;                     // the issuer and the one protected resource: an origin, no path
+  resourcePaths?: string[];           // also accepted as `resource`; default ["/mcp"]
+  accessTokenTtlMs?: number;          // default 10 minutes
+  refreshTokenTtlMs?: number;         // default 30 days, restarted by each rotation
+  connectionMaxAgeMs?: number | null; // absolute cap from creation; default null
+  authorizationTtlMs?: number;        // default 10 minutes (used by the authorization endpoint)
+  tokenPrefix: { access: string; refresh: string };
+  clients?: { clientId: string; name: string; redirectUris: string[] }[];
+  cimd?: false | { fetch?: typeof fetch; allowUrl?: (url: URL) => boolean | Promise<boolean> };
+}
+```
+
+`createCfAuth` refuses, with `422 validation_error`:
+
+- `oauth` without `apiKeys.enabled`, without `operations.enabled`, or on a
+  database whose drizzle instance has no `batch` (D1 and libsql have one):
+  the rotation, the revocation and the code exchange are each one atomic
+  batch;
+- an `issuer` that is not exactly an origin — `https`, or `http` on
+  `127.0.0.1`, `[::1]` or `localhost` — with no path, trailing slash, query,
+  fragment or credentials;
+- a missing `tokenPrefix`; prefixes other than 1 to 32 letters, digits, `_`
+  or `-`; equal access and refresh prefixes; either equal to
+  `apiKeys.tokenPrefix`; or an access prefix an API key could begin with,
+  since a bearer token is routed by it;
+- a `resourcePaths` entry that is not a path with a leading slash and no
+  trailing one, or a repeated one; a lifetime that is not positive;
+- a registered client without an id, a name or a redirect URI, an id given
+  twice, or a redirect URI that is not absolute with no fragment and one of
+  `https`, `http` on a loopback host, or a private-use scheme in reverse-DNS
+  form (`com.example.app:/cb`); a `cimd` that is neither `false` nor
+  `{ fetch?, allowUrl? }` of functions.
+
+`cfAuth.config.oauth` is the resolved block, or `null` while it is off. Every
+function under `cfAuth.oauth` throws `422 validation_error` while it is off.
+
+### Tokens and lifetimes
+
+A token names its connection: `<prefix><connectionId>.<secret>`, where the
+secret is 32 random bytes, base64url. A presented token is looked up only
+inside the connection it names, against that connection's current and
+previous generation, by the SHA-256 digest of the whole token. A token
+matching neither is unknown, and an unknown token changes nothing anywhere:
+knowing a connection id gives nothing.
+
+| What                  | Lifetime                                                          |
+| --------------------- | ----------------------------------------------------------------- |
+| Access token          | `accessTokenTtlMs`, 10 minutes; dead once its generation rotates  |
+| Refresh token and connection | `refreshTokenTtlMs`, 30 days from the last rotation, held in `api_key.expires_at`, capped at creation + `connectionMaxAgeMs` |
+| Refresh grace         | 30 s after a rotation, fixed                                       |
+| Rotation rate limit   | one rotation per 5 s per connection, fixed                         |
+
+`api_key.expires_at` is the connection's whole lifetime. Resolution, refresh,
+revocation and listing read it and nothing else, and so does every operation
+guard, so an operation a connection opened loses its authority when the
+connection expires.
+
+### The functions
+
+```ts
+cfAuth.oauth.token({ body: URLSearchParams }):
+  Promise<{ status: 200; body: OAuthTokenResponse } | { status: 400 | 401; body: OAuthErrorBody }>;
+cfAuth.oauth.revoke({ body: URLSearchParams }):
+  Promise<{ status: 200; body: null } | { status: 400 | 401; body: OAuthErrorBody }>;
+cfAuth.oauth.resolveAccessTokenAuthState(token: string, { source: "mcp" | "api" }): Promise<AuthState>;
+cfAuth.oauth.sweepStatements(now?: number): BatchItem<"sqlite">[]; // oauthSweepStatementCount, 1
+cfAuth.oauth.sweep(now?: number): Promise<void>;
+cfAuth.oauth.connectionStatements(input & { condition?: SQL }): Promise<OAuthConnectionStatements>;
+cfAuth.oauth.createConnection(input): Promise<OAuthTokenResponse>;
+// input: { userId, organizationId, clientId, clientName, resource, grant, now?, id? }
+```
+
+**`token`**, `POST /token`, form-encoded, `grant_type=refresh_token`:
+`refresh_token` and `client_id` are required, `resource` and `scope`
+optional. A `resource` must be `<issuer>` or `<issuer><path>` for one of
+`resourcePaths`, and the connection's own once normalised; a `scope` must
+name exactly the connection's grant, since narrowing is not supported. The
+response is `{ access_token, token_type: "Bearer", expires_in, refresh_token,
+scope }`, `scope` always the grant. What the presented refresh token is
+decides the rest:
+
+- **The current generation's** rotates it, in one batch conditional on the
+  generation being unrotated, the connection, membership and organization
+  live, by the later of the request's clock and the database's: the generation is marked rotated and keeps the new response, sealed;
+  the next generation is inserted; the one before is deleted; `expires_at`
+  advances. Within 5 s of the last rotation it is refused instead,
+  `invalid_grant` "slow down: refreshed too recently", and the token stays
+  valid.
+- **The previous generation's**, within 30 s of its rotation, replays that
+  rotation's response byte for byte. It is sealed with AES-256-GCM under a
+  key derived by HKDF-SHA256 from the presented refresh token, which the
+  database holds only a digest of, so only that token's holder can open it.
+  The loser of two concurrent presentations gets the same replay.
+- **The previous generation's after 30 s** is reuse: the connection is
+  revoked and every generation deleted, and the answer is `invalid_grant`.
+  So is a rotation that lost to one more than 30 s old, or whose generation
+  later rotations had already moved past while the connection stayed live;
+  a rotation that lost because the connection ended changes nothing. Which
+  of these applies is decided from one statement that reads the generation,
+  the connection, the membership and the organization together, and the
+  revocation itself lands only while all of them are still live.
+- A connection that is revoked, past `expires_at`, bound to another issuer,
+  or whose membership or organization has ended answers `invalid_grant` and
+  changes nothing.
+
+**`revoke`** (RFC 7009), form-encoded, `token` and `client_id` required:
+either token ends the whole connection, row and generations, and
+`token_type_hint` is ignored. An unknown token, or one whose connection is
+already revoked or expired — also when it expires just before the write — is
+`200` with no change.
+
+**`resolveAccessTokenAuthState`** answers an empty state unless the token is
+the current generation's access token, unexpired, on a live connection
+(enabled, unrevoked, before `expires_at`) bound to this issuer, whose
+membership is active and organization unexpired — all read in one statement,
+then the token's digest verified against it.
+
+The state carries
+`assurance: "credential"`, `credentialType: "oauth"`, the `source` you pass —
+the endpoint's, never the request's — `actor.credentialId` set to the
+connection's id, the one membership, organization and role read now, and the
+connection's grant. It is a delegated credential exactly like a key: held to
+its organization and its grant by every service, refused by `requireUser`
+and `listOrganizations`, and able to end itself with `revokeOwnApiKey`. The
+middleware sends a bearer token with the access prefix here, with `source`
+`mcp` when `X-Client: mcp` and `api` otherwise, and every other bearer token
+to API keys; pass `middleware({ oauth: false })` to turn that off for a mount.
+`createAuthMiddleware` takes the OAuth service as an optional `deps.oauth`
+(`createOAuthService(config, repository)`), required only when OAuth routing
+is on.
+
+**Where connection liveness is checked.** One predicate,
+`oauthConnectionLiveSql`, requires the row to be an OAuth connection,
+enabled, unrevoked, bound to this issuer, with an `expires_at` that is set
+and in the future; the membership to be active; and the organization to be
+inside its deadline — judged by the later of the request's clock and the
+database's. Unlike the shared `credentialAuthoritySql` it has no session
+branch and accepts no missing expiry. It applies in exactly four places:
+
+- access-token resolution (`resolveAccessTokenAuthState`), inside its one
+  statement;
+- the snapshot that decides a replay or reuse, both for a previous-generation
+  token and for the recovery after a rotation that wrote nothing;
+- the rotation's guarded write;
+- the reuse revocation's guarded write.
+
+Issuance has no connection row to test yet: its guard checks the user's
+active membership and the organization's deadline on their own. A voluntary
+`revoke`, and the sweep, use row liveness only — `revoke` updates a row
+that is enabled, unrevoked and before `expires_at` by the database clock,
+and the sweep deletes the generations of rows revoked or past `expires_at`
+— on purpose: ending or cleaning up a connection must not depend on its
+membership or organization still being live.
+
+**`connectionStatements`** is the issuance primitive, a trusted boundary like
+`issueServiceApiKey`: the connection row (`name` and `label` the client's
+name, `client_id`, `resource` the issuer, `grant`, `expires_at`, and a
+`token_hash` digesting a value never revealed, so no API-key lookup can match
+it) and its first generation, as statements for a batch of yours, guarded by
+your `condition`, the user's active membership and the organization's
+deadline. `afterCommit` emits `api_key.created` with `credentialType:
+"oauth"`. `createConnection` runs them on their own and throws `409
+connection_refused` if the guard refused.
+
+**The sweep** deletes the generations of connections that are revoked or past
+`expires_at`. It is separate from the operation sweep; run both from your
+scheduled handler. Revoking through `revoke`, reuse or `revokeApiKey` already
+deletes them.
+
+### Storage
+
+Migration `0004_cf_auth_oauth_token.sql` adds `api_key.client_id` and
+`api_key.resource` (null for keys) and the `oauth_token` table: `id`,
+`api_key_id` (cascading), `generation`, `access_token_hash` (unique),
+`access_expires_at`, `refresh_token_hash` (unique), `rotated_at`,
+`sealed_response` and `created_at`, unique on `(api_key_id, generation)`. A
+connection keeps at most two rows: the current generation and the previous
+one. `ApiKeySummary.clientId` is the client's id for a connection and `null`
+for a key.
+
+**Upgrading a custom repository.** If you implement `CfAuthRepository`
+yourself rather than using `createCfAuthRepository`, it now needs
+`findOAuthAccess({ connectionId, condition })` — also with OAuth off, since
+the interface requires it. Its contract:
+
+- one coherent `SELECT`: the generation, the connection's grant, its user,
+  and the membership with its organization, read together, never assembled
+  from separate reads;
+- only the connection's current generation: the row whose `generation` is
+  the maximum across all of that connection's `oauth_token` rows, and only if
+  it is unrotated (`rotated_at` null);
+- the supplied `condition` enforced inside that same query (it is the
+  liveness rule and the access token's expiry);
+- answer `{ accessTokenHash, grant, user, membership }` or `null`, and leave
+  the token's digest verification to the OAuth service.
+
+### OAuth errors
+
+`token` and `revoke` answer RFC 6749 §5.2 bodies, `{ error, error_description }`.
+Send every token and revocation response with `Cache-Control: no-store`.
+
+| `error`                  | Status | When                                                                 |
+| ------------------------ | ------ | -------------------------------------------------------------------- |
+| `invalid_request`        | 400    | A parameter given twice, a required one missing, a body that is not form parameters |
+| `invalid_client`         | 401    | `client_id` is not the client the connection was issued to; nothing changes |
+| `invalid_grant`          | 400    | An unknown refresh token; a dead connection; refreshed within 5 s ("slow down: refreshed too recently"); reuse, which revokes the connection |
+| `invalid_scope`          | 400    | `scope` is not exactly the connection's grant                        |
+| `invalid_target`         | 400    | `resource` is not the issuer or one of its paths, or not the connection's |
+| `unsupported_grant_type` | 400    | Any `grant_type` but `refresh_token` in this release                |
+
+---
+
 ## The organization cookie
 
 A signed cookie remembers which organization the user is working in, so their
@@ -1148,13 +1388,17 @@ createCfAuth({
     switch (event.type) {
       case "user.signup": // { userId, email }
       case "organization.created": // { userId, organizationId, role, name }
-      case "api_key.created": // { actorUserId, organizationId, apiKeyId, name }
-      case "api_key.revoked": // { actorUserId, organizationId, apiKeyId, name }
+      case "api_key.created": // { actorUserId, organizationId, apiKeyId, name, credentialType? }
+      case "api_key.revoked": // { actorUserId, organizationId, apiKeyId, name, credentialType? }
         await writeAuditLog(event);
     }
   },
 });
 ```
+
+`credentialType` is `"oauth"` when the row is an OAuth connection, and absent
+for an API key. A connection's `actorUserId` is the person it was issued to,
+also when the connection ends itself through `revoke` or reuse detection.
 
 If `onEvent` fails it never breaks sign-in. The error goes to `onError`.
 

@@ -19,10 +19,14 @@ export {
   type EmailAndPasswordConfig,
   type GoogleOAuthConfig,
   type LoginOperationConfig,
+  type OAuthCimdConfig,
+  type OAuthClientConfig,
+  type OAuthConfig,
   type OAuthProxyConfig,
   type OperationsConfig,
   type OrganizationsConfig,
   type ResolvedCfAuthConfig,
+  type ResolvedOAuthConfig,
   type ResolvedOperationsConfig,
   type UserHooksConfig,
 } from "./config.js";
@@ -46,6 +50,7 @@ export {
   isApiKeyActionSource,
   isCredentialGrant,
   isOrganizationExpired,
+  oauthActionSources,
   operationStates,
   organizationMemberStatuses,
   organizationRoles,
@@ -59,6 +64,7 @@ export {
   type AuthUser,
   type IdentityKind,
   type CfAuthEvent,
+  type OAuthActionSource,
   type CreatedApiKey,
   type CredentialGrant,
   type OperationState,
@@ -113,6 +119,7 @@ export {
 export {
   createAuthService,
   toApiKeyAuthState,
+  toOAuthAuthState,
   toSessionAuthState,
   type CfAuthService,
   type ClaimOrganizationInput,
@@ -177,6 +184,21 @@ export {
   type LoginOperationPayload,
   type LoginOperationRecord,
 } from "./login-operation.js";
+
+export {
+  createOAuthService,
+  oauthRefreshGraceMs,
+  oauthRotationIntervalMs,
+  oauthSweepStatementCount,
+  type CfAuthOAuth,
+  type CreateOAuthConnectionInput,
+  type OAuthConnectionStatements,
+  type OAuthErrorBody,
+  type OAuthErrorCode,
+  type OAuthRevokeResult,
+  type OAuthTokenResponse,
+  type OAuthTokenResult,
+} from "./oauth/service.js";
 
 export { createOperationToken, deriveSecret } from "./crypto.js";
 

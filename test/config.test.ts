@@ -218,10 +218,11 @@ describe("resolveConfig", () => {
 });
 
 describe("schema", () => {
-  it("exposes the eight tables an app must migrate", () => {
+  it("exposes the nine tables an app must migrate", () => {
     expect(Object.keys(cfAuthTables).sort()).toEqual([
       "account",
       "apiKey",
+      "oauthToken",
       "operation",
       "organization",
       "organizationUser",
@@ -234,6 +235,7 @@ describe("schema", () => {
   it("uses unprefixed physical table names by default", () => {
     expect(Object.values(cfAuthTables).map(getTableName).sort()).toEqual([
       "api_key",
+      "oauth_token",
       "operation",
       "organization",
       "organization_user",
@@ -249,6 +251,7 @@ describe("schema", () => {
 
     expect(Object.values(prefixed).map(getTableName).sort()).toEqual([
       "auth_api_key",
+      "auth_oauth_token",
       "auth_operation",
       "auth_organization",
       "auth_organization_user",

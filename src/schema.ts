@@ -12,7 +12,7 @@ export interface CfAuthTablesOptions {
    * Prefix applied to every physical table and index name, e.g. `"auth_"`
    * produces `auth_user`, `auth_user_session`, ... Defaults to `""` (unprefixed:
    * `user`, `user_session`, `user_account`, `verification`, `organization`,
-   * `organization_user`, `api_key`, `operation`).
+   * `organization_user`, `api_key`, `operation`, `oauth_token`).
    *
    * If you set this, you must regenerate the reference migration — see the
    * README "Migrations" section.
@@ -202,6 +202,18 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
        * value it writes, and reads anything else as `read`, the least grant.
        */
       grant: text("grant", { enum: credentialGrants }).notNull().default("manage"),
+      /**
+       * The OAuth client an OAuth connection (`source = 'oauth'`) was issued
+       * to: a registered client id or a Client ID Metadata Document URL. Null
+       * for a key.
+       */
+      clientId: text("client_id"),
+      /**
+       * The protected resource a connection's tokens are bound to, normalised
+       * to the issuer origin. Access-token resolution refuses a connection
+       * whose resource is not the deployment's issuer. Null for a key.
+       */
+      resource: text("resource"),
     },
     (table) => [
       uniqueIndex(ix("api_key_token_hash_unique")).on(table.tokenHash),
@@ -289,6 +301,47 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
     ],
   );
 
+  // --- OAuth connection tokens -----------------------------------------------
+  // An OAuth connection is an `api_key` row (`source = 'oauth'`); its tokens
+  // live here, at most two generations per connection: the current one and
+  // the one it replaced. Only SHA-256 digests of the tokens are stored. The
+  // connection's lifetime is `api_key.expires_at`; a generation holds only
+  // its access token's own expiry.
+
+  const oauthToken = sqliteTable(
+    t("oauth_token"),
+    {
+      id: text("id").primaryKey(),
+      apiKeyId: text("api_key_id")
+        .notNull()
+        .references(() => apiKey.id, { onDelete: "cascade" }),
+      /** 1 for the generation the code exchange issued, then one more per rotation. */
+      generation: integer("generation").notNull(),
+      accessTokenHash: text("access_token_hash").notNull(),
+      accessExpiresAt: integer("access_expires_at", { mode: "timestamp_ms" }).notNull(),
+      refreshTokenHash: text("refresh_token_hash").notNull(),
+      /** When this generation's refresh token was exchanged for the next; null while current. */
+      rotatedAt: integer("rotated_at", { mode: "timestamp_ms" }),
+      /**
+       * The response of the rotation that replaced this generation, sealed
+       * under a key derived from this generation's refresh token, so only its
+       * holder can open the replay inside the grace window.
+       */
+      sealedResponse: text("sealed_response"),
+      createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+    },
+    // The (api_key_id, generation) index also serves every lookup and
+    // cascade by connection, as its leftmost column.
+    (table) => [
+      uniqueIndex(ix("oauth_token_access_token_hash_unique")).on(table.accessTokenHash),
+      uniqueIndex(ix("oauth_token_refresh_token_hash_unique")).on(table.refreshTokenHash),
+      uniqueIndex(ix("oauth_token_api_key_id_generation_unique")).on(
+        table.apiKeyId,
+        table.generation,
+      ),
+    ],
+  );
+
   return {
     user,
     session,
@@ -298,6 +351,7 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
     organizationUser,
     apiKey,
     operation,
+    oauthToken,
   };
 };
 
@@ -308,8 +362,9 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
  *
  * ```ts
  * import { cfAuthTables } from "@maxceem/cf-auth/schema";
- * export const { user, session, account, verification, organization, organizationUser, apiKey, operation } =
- *   cfAuthTables;
+ * export const {
+ *   user, session, account, verification, organization, organizationUser, apiKey, operation, oauthToken,
+ * } = cfAuthTables;
  * export const myAppTable = sqliteTable("my_app", { ... });
  * ```
  */
@@ -338,4 +393,5 @@ export const {
   organizationUser: organizationUserTable,
   apiKey: apiKeyTable,
   operation: operationTable,
+  oauthToken: oauthTokenTable,
 } = cfAuthTables;

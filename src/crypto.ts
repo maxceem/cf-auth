@@ -184,40 +184,83 @@ export const normalizeUserCode = (value: string): string | null => {
   return normalized;
 };
 
+const aesKey = (bytes: Uint8Array): Promise<CryptoKey> =>
+  crypto.subtle.importKey("raw", bytes, "AES-GCM", false, ["encrypt", "decrypt"]);
+
 const sealKey = async (secret: string): Promise<CryptoKey> =>
-  crypto.subtle.importKey(
-    "raw",
+  aesKey(
     Uint8Array.from((await deriveSecret(secret, "cf-auth:operation-seal")).match(/../g)!, (pair) =>
       Number.parseInt(pair, 16),
     ),
-    "AES-GCM",
-    false,
-    ["encrypt", "decrypt"],
   );
+
+const sealWith = async (key: CryptoKey, context: string, plaintext: string): Promise<string> => {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: textEncoder.encode(context) },
+    key,
+    textEncoder.encode(plaintext),
+  );
+  return `${base64UrlEncode(iv)}.${base64UrlEncode(new Uint8Array(ciphertext))}`;
+};
+
+const openWith = async (key: CryptoKey, context: string, sealed: string): Promise<string> => {
+  const [iv, ciphertext] = sealed.split(".");
+  if (!iv || !ciphertext) throw new Error("Malformed sealed value");
+  const plaintext = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: base64UrlDecode(iv), additionalData: textEncoder.encode(context) },
+    key,
+    base64UrlDecode(ciphertext),
+  );
+  return new TextDecoder().decode(plaintext);
+};
 
 /**
  * Encrypts `plaintext` with AES-256-GCM under a subkey of `secret`, bound to
  * `context` (the operation id) so a sealed value cannot be moved to another
  * row and opened there. Returns `iv.ciphertext`, both base64url.
  */
-export const sealText = async (secret: string, context: string, plaintext: string): Promise<string> => {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv, additionalData: textEncoder.encode(context) },
-    await sealKey(secret),
-    textEncoder.encode(plaintext),
-  );
-  return `${base64UrlEncode(iv)}.${base64UrlEncode(new Uint8Array(ciphertext))}`;
-};
+export const sealText = async (secret: string, context: string, plaintext: string): Promise<string> =>
+  sealWith(await sealKey(secret), context, plaintext);
 
 /** Opens a value from {@link sealText}; throws if it was sealed for another context or key. */
-export const openText = async (secret: string, context: string, sealed: string): Promise<string> => {
-  const [iv, ciphertext] = sealed.split(".");
-  if (!iv || !ciphertext) throw new Error("Malformed sealed value");
-  const plaintext = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: base64UrlDecode(iv), additionalData: textEncoder.encode(context) },
-    await sealKey(secret),
-    base64UrlDecode(ciphertext),
+export const openText = async (secret: string, context: string, sealed: string): Promise<string> =>
+  openWith(await sealKey(secret), context, sealed);
+
+/**
+ * An AES-256-GCM key derived from a bearer token by HKDF-SHA256 (no salt,
+ * `info` naming the purpose). The database keeps only the token's SHA-256
+ * digest, from which this key cannot be computed, so whatever is sealed under
+ * it opens only for whoever presents the token itself.
+ */
+const tokenSealKey = async (token: string, info: string): Promise<CryptoKey> => {
+  const material = await crypto.subtle.importKey("raw", textEncoder.encode(token), "HKDF", false, [
+    "deriveBits",
+  ]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: textEncoder.encode(info) },
+    material,
+    256,
   );
-  return new TextDecoder().decode(plaintext);
+  return aesKey(new Uint8Array(bits));
 };
+
+/**
+ * Seals `plaintext` so only the holder of `token` can open it: AES-256-GCM
+ * under {@link tokenSealKey}, with `context` as additional data. Returns
+ * `iv.ciphertext`, both base64url.
+ */
+export const sealTextForToken = async (
+  token: string,
+  info: string,
+  context: string,
+  plaintext: string,
+): Promise<string> => sealWith(await tokenSealKey(token, info), context, plaintext);
+
+/** Opens a value from {@link sealTextForToken}; throws for any other token, purpose or context. */
+export const openTextForToken = async (
+  token: string,
+  info: string,
+  context: string,
+  sealed: string,
+): Promise<string> => openWith(await tokenSealKey(token, info), context, sealed);

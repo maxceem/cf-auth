@@ -38,8 +38,16 @@ export const isApiKeyActionSource = (value: ActionSource): value is ApiKeyAction
 export const operationStates = ["pending", "completed", "denied", "expired", "retired"] as const;
 export type OperationState = (typeof operationStates)[number];
 
-/** Which credential proved the caller's identity. */
-export type AuthCredentialType = "session" | "apiKey";
+/**
+ * Which credential proved the caller's identity: a person's own session, an
+ * API key, or an OAuth connection's access token. Every type but `session` is
+ * a delegated credential, bound to one organization and carrying a grant.
+ */
+export type AuthCredentialType = "session" | "apiKey" | "oauth";
+
+/** Where an OAuth access token may be presented: the MCP endpoint, or the management API. */
+export const oauthActionSources = ["mcp", "api"] as const;
+export type OAuthActionSource = (typeof oauthActionSources)[number];
 
 /**
  * How much of its holder's authority a credential may exercise, least first.
@@ -114,7 +122,10 @@ export interface AuthState {
   authenticated: boolean;
   assurance: "interactive" | "credential" | null;
   credentialType: AuthCredentialType | null;
-  /** Where the request came from (`web` for sessions, `api`/`cli`/`mcp` for API keys). */
+  /**
+   * Where the request came from: `web` for sessions, `api`/`cli`/`mcp` for API
+   * keys, and for an OAuth connection the endpoint's own, `mcp` or `api`.
+   */
   source: ActionSource | null;
   actor: AuthActor | null;
   user: AuthUser | null;
@@ -125,7 +136,8 @@ export interface AuthState {
   role: OrganizationRole | null;
   /**
    * How much of that role this credential may exercise: `"manage"` for a
-   * session, the key's own grant for an API key, null when unauthenticated.
+   * session, the row's own grant for an API key or an OAuth connection, null
+   * when unauthenticated.
    * See {@link CredentialGrant}.
    */
   grant: CredentialGrant | null;
@@ -148,12 +160,17 @@ export interface ApiKeySummary {
    * this to `false` too, so `enabled && !revokedAt` is the live key.
    */
   enabled: boolean;
-  /** Where the key was issued from, e.g. `console`, `cli` or `bootstrap`. */
+  /**
+   * Where the key was issued from, e.g. `console`, `cli` or `bootstrap`; `oauth`
+   * for an OAuth connection, which no caller may claim for a key of its own.
+   */
   source: string;
   /** A human-readable note about the holder, e.g. `CLI on mac-studio`. */
   label: string | null;
   /** How much of its holder's authority the key may exercise. Keys issued before grants existed are `manage`. */
   grant: CredentialGrant;
+  /** The OAuth client a connection was issued to (`source: "oauth"`); null for a key. */
+  clientId: string | null;
   createdAt: string;
   revokedAt: string | null;
 }
@@ -183,6 +200,8 @@ export type CfAuthEvent =
       organizationId: string;
       apiKeyId: string;
       name: string;
+      /** `"oauth"` when the row is an OAuth connection; absent for an API key. */
+      credentialType?: "oauth";
     }
   | {
       type: "api_key.revoked";
@@ -190,6 +209,8 @@ export type CfAuthEvent =
       organizationId: string;
       apiKeyId: string;
       name: string;
+      /** `"oauth"` when the row is an OAuth connection; absent for an API key. */
+      credentialType?: "oauth";
     };
 
 const roleRank: Record<OrganizationRole, number> = {

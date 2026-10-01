@@ -54,6 +54,8 @@ describe("initial schema", () => {
       "source",
       "label",
       "grant",
+      "client_id",
+      "resource",
     ]);
   });
 });

@@ -3,6 +3,7 @@ import { createBetterAuthInstance, type CfBetterAuth } from "./better-auth.js";
 import { resolveConfig, type CfAuthConfig, type ResolvedCfAuthConfig } from "./config.js";
 import { createCurrentOrganizationCookie, type CurrentOrganizationCookie } from "./cookies.js";
 import { createAuthMiddleware, type AuthMiddlewareOptions, type CfAuthEnv } from "./middleware.js";
+import { createOAuthService, type CfAuthOAuth } from "./oauth/service.js";
 import { createOperationsService, type CfAuthOperations } from "./operations.js";
 import { createCfAuthRepository, type CfAuthRepository } from "./repository.js";
 import { createAuthService, type CfAuthService } from "./service.js";
@@ -20,6 +21,12 @@ export interface CfAuth {
    * refuses while `operations.enabled` is off.
    */
   readonly operations: CfAuthOperations;
+  /**
+   * OAuth connections: `token`, `revoke`, `resolveAccessTokenAuthState`, the
+   * sweep and the issuance primitive. Every method refuses while
+   * `oauth.enabled` is off.
+   */
+  readonly oauth: CfAuthOAuth;
   /** Low-level drizzle queries, exposed for apps that need direct access. */
   readonly repository: CfAuthRepository;
   /** Signed current-organization cookie helpers. */
@@ -71,10 +78,12 @@ export const createCfAuth = (config: CfAuthConfig): CfAuth => {
   service = createAuthService(repository, resolved);
 
   const operations = createOperationsService(resolved, repository);
+  const oauth = createOAuthService(resolved, repository);
   const currentOrganizationCookie = createCurrentOrganizationCookie(resolved);
   const middleware = createAuthMiddleware(resolved, {
     auth,
     service,
+    oauth,
     currentOrganizationCookie,
   });
 
@@ -86,6 +95,7 @@ export const createCfAuth = (config: CfAuthConfig): CfAuth => {
     auth,
     service,
     operations,
+    oauth,
     repository,
     currentOrganizationCookie,
     basePath: resolved.basePath,
