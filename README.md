@@ -245,13 +245,48 @@ replays the same response for 30 s, and after that its return revokes the
 whole connection. See [OAuth connections](docs/index.md#oauth-connections)
 and [Authorization](docs/index.md#authorization).
 
-Upgrading: apply migration `0004_cf_auth_oauth_token.sql` even with OAuth
-off; the authorization flow needs no further migration. A custom `CfAuthRepository` must also implement the new
-`findOAuthAccess`: one coherent `SELECT` of the connection's current
-generation — the maximum generation across all its token rows, unrotated
-only — with its grant, user, membership and organization, the supplied
-condition enforced inside the query, and digest verification left to the
-service. See [Storage](docs/index.md#storage).
+Upgrading from 0.7.0: see [Upgrading to 0.8.0](#upgrading-to-080).
+
+## Upgrading to 0.8.0
+
+Every deployment, whether or not it turns OAuth on:
+
+- **Apply three migrations, in order**: `0002_cf_auth_api_key_grant.sql`
+  (`api_key.grant`, every existing key at `manage`),
+  `0003_cf_auth_operation_execution_claim.sql` (`operation.execution_claim`)
+  and `0004_cf_auth_oauth_token.sql` (the `oauth_token` table and
+  `api_key.client_id` and `api_key.resource`). If you generate with
+  drizzle-kit instead, export `oauthToken` from `cfAuthTables` beside the
+  other tables and generate. cf-auth's queries name these columns with OAuth
+  off too.
+- **A custom `CfAuthRepository`** (one you wrote rather than
+  `createCfAuthRepository`) must add `findOAuthAccess` — see
+  [Storage](docs/index.md#storage) for its contract — store the `grant`
+  `createApiKey` is given, and return `grant` and `clientId` on every
+  `ApiKeySummary`.
+- **A refused completion rolls back its whole batch.** When `approve`,
+  `complete`, `execute` or `amend` finds its guard refused, the engine now
+  makes the batch fail on purpose (`NOT NULL constraint failed:
+  operation.id`), so none of the `statements` you passed stay written;
+  `approve`, `complete` and `execute` throw (`409 conflict` while the
+  operation is still pending), and `amend` answers `false`. Drop any code
+  that relied on its statements landing when the completion did not, and
+  expect that error if you alert on database errors.
+- **The `cf-auth:` kind namespace is reserved.** `open` and `reserve` refuse
+  such a kind with `422 validation_error`, a lookup of one of its rows answers
+  `404 operation_not_found` (or `null`), and `internal` is refused in
+  `operations.kinds`. Kind names could never contain `:`, so your own kinds
+  are unaffected.
+- `AuthState` gained `grant`, and `credentialType` may be `"oauth"`: an
+  exhaustive switch, or an `AuthState` you build by hand in a test, needs the
+  new case or field.
+
+OAuth itself is optional and off by default. To offer it, add an `oauth`
+block to `createCfAuth` with `enabled: true`, an `issuer` origin and a
+`tokenPrefix` for access and refresh tokens, plus `clients` you register
+yourself if you want any; it needs `apiKeys` and `operations` on and a D1 or
+libsql database, then mount the routes listed under
+[OAuth connections](#oauth-connections).
 
 ## Documentation
 

@@ -161,6 +161,11 @@ existing key at `manage`, `0003_cf_auth_operation_execution_claim.sql` adds
 `ALTER TABLE ... ADD`; none rebuilds a table. Copy them in, in order. The package's own tests apply these exact files, so
 they cannot drift from the schema.
 
+**Upgrading from 0.7.0.** Apply `0002`, `0003` and `0004`, even with OAuth
+off. The other changes — `findOAuthAccess` on a custom repository, a refused
+completion rolling back its batch, the reserved `cf-auth:` kind namespace —
+are listed in [Upgrading to 0.8.0](../README.md#upgrading-to-080).
+
 ### Renaming the tables
 
 Table names are fixed by default. To put them behind a prefix, make your own set
