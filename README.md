@@ -136,12 +136,40 @@ const { outcome } = await cfAuth.operations.poll({ id, token });
 See [Operations approved in a browser](docs/index.md#operations-approved-in-a-browser)
 for the loopback redirect, user codes, your own kinds and the sweep.
 
+## Reservations
+
+A write a client may retry, but that must happen once, is reserved first and
+executed later with the handle the server gave out. A repeat replays the
+record instead of running again. A secret in the outcome is released on a
+page, once, to an admin — so a tool that answers an agent forwards the record
+and a reveal reference, never the outcome:
+
+```ts
+const { id, handle } = await cfAuth.operations.reserve({ kind: "app.create", opener, input });
+const result = await cfAuth.operations.execute(
+  { handle, kind: "app.create", opener },
+  ({ input, guard, db }) => ({ outcome, record, statements: [/* guarded with `guard` */] }),
+);
+// Only these reach the client: `result.outcome` (first run only) stays on the server.
+const answer = { record: result.record, replayed: result.replayed, revealAt: `/reveal/${id}` };
+
+const { record } = await cfAuth.operations.status({ id, opener }); // never the sealed outcome
+const { outcome } = await cfAuth.operations.reveal({ id, actor: c.get("authState") }); // on the page
+```
+
+Give every such kind whose outcome is a secret `deliver: "reveal"`, so that no
+`poll` route hands the outcome to whoever holds the handle; only `reveal`
+releases it. Kinds cf-auth registers for its own flows are internal, named `cf-auth:…`, and
+none of these entry points accepts one. See
+[Reservations and reveals](docs/index.md#reservations-and-reveals) for the
+errors, the guard and the seal window.
+
 ## Documentation
 
 [`docs/index.md`](docs/index.md) covers setup and migrations, the options,
 reading the auth state, organizations and roles, API keys, operations approved
-in a browser, the organization cookie, audit events, and the environment
-variables.
+in a browser and reservations, the organization cookie, audit events, and the
+environment variables.
 
 ## License
 

@@ -250,6 +250,7 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
       outcome: text("outcome"),
       sealedOutcome: text("sealed_outcome"),
       sealedUntil: integer("sealed_until", { mode: "timestamp_ms" }),
+      /** Who approved, denied or executed it: attribution only, never a lock. */
       decidedByUserId: text("decided_by_user_id").references(() => user.id, {
         onDelete: "set null",
       }),
@@ -260,6 +261,12 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
       expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
       /** When the sweep may delete the record, whatever its state. */
       retainUntil: integer("retain_until", { mode: "timestamp_ms" }).notNull(),
+      /**
+       * The random value an `execute` in progress holds the reservation with.
+       * Its completion and its release both require it, so nothing that
+       * happens to a user row can unlock an execution that is running.
+       */
+      executionClaim: text("execution_claim"),
     },
     (table) => [
       uniqueIndex(ix("operation_poll_token_hash_unique")).on(table.pollTokenHash),

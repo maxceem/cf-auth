@@ -112,6 +112,8 @@ export interface OperationsConfig {
   };
   /** How long a sealed outcome waits to be collected. Default: 15 minutes. */
   sealTtlMs?: number;
+  /** How long a reservation (`reserve`) waits to be executed. Default: 15 minutes. */
+  reserveTtlMs?: number;
 }
 
 export interface EmailAndPasswordConfig {
@@ -257,6 +259,7 @@ export interface ResolvedOperationsConfig {
   login: Required<LoginOperationConfig> | null;
   limits: { pendingPerOrganization: number; pendingPerOpener: number };
   sealTtlMs: number;
+  reserveTtlMs: number;
 }
 
 const minute = 60_000;
@@ -266,9 +269,22 @@ export const operationDefaults = {
   pendingTtlMs: 15 * minute,
   recordTtlMs: 90 * day,
   sealTtlMs: 15 * minute,
+  reserveTtlMs: 15 * minute,
 } as const;
 
 const operationKindName = /^[a-z][a-z0-9._-]{0,63}$/;
+
+/**
+ * The namespace of cf-auth's own internal kinds. A stored operation whose kind
+ * starts with it is internal whatever an engine has registered, so a row of an
+ * internal kind stays out of reach of the public entry points even for an
+ * engine built without that kind. An app's kind name cannot contain `:`.
+ */
+export const internalOperationKindPrefix = "cf-auth:";
+
+/** Whether a kind name is in cf-auth's internal namespace. */
+export const isInternalOperationKind = (name: string): boolean =>
+  name.startsWith(internalOperationKindPrefix);
 
 const positiveNumber = (value: number | undefined, fallback: number, label: string) => {
   if (value === undefined) return fallback;
@@ -282,14 +298,34 @@ const positiveInteger = (value: number | undefined, fallback: number, label: str
   return resolved;
 };
 
-/** Checks one kind's own settings; exported so the built-in kinds go through the same rules. */
-export const validateOperationKind = (kind: OperationKind, label?: string): void => {
-  if (!operationKindName.test(kind.name ?? "")) {
+/**
+ * Checks one kind's own settings; exported so the built-in kinds go through the
+ * same rules. Only a built-in kind may be `internal`: nothing outside cf-auth
+ * can drive one, so an app declaring it would register a kind it cannot use.
+ * An internal kind is named `cf-auth:<name>`, and only an internal kind is.
+ */
+export const validateOperationKind = (
+  kind: OperationKind,
+  label?: string,
+  options: { builtIn?: boolean } = {},
+): void => {
+  const rawName = typeof kind.name === "string" ? kind.name : "";
+  const internalName = options.builtIn === true && isInternalOperationKind(rawName);
+  const baseName = internalName ? rawName.slice(internalOperationKindPrefix.length) : rawName;
+  if (!operationKindName.test(baseName)) {
     throw validationError(
       `Operation kind name \`${String(kind.name)}\` must be lowercase letters, digits, \`.\`, \`_\` or \`-\``,
     );
   }
   label ??= `operations.kinds[${kind.name}]`;
+  if (kind.internal !== undefined && (kind.internal !== true || !options.builtIn)) {
+    throw validationError(`\`${label}.internal\` is reserved for cf-auth's own built-in kinds`);
+  }
+  if ((kind.internal === true) !== internalName) {
+    throw validationError(
+      `\`${label}\`: a kind is internal exactly when its name starts with \`${internalOperationKindPrefix}\``,
+    );
+  }
   if (kind.open !== "public" && !organizationRoles.includes(kind.open?.minRole)) {
     throw validationError(`\`${label}.open\` must be "public" or { minRole }`);
   }
@@ -316,8 +352,13 @@ export const validateOperationKind = (kind: OperationKind, label?: string): void
   if (kind.countsTowardPending !== undefined && typeof kind.countsTowardPending !== "boolean") {
     throw validationError(`\`${label}.countsTowardPending\` must be a boolean`);
   }
-  if (kind.deliver !== undefined && kind.deliver !== "once" && kind.deliver !== "window") {
-    throw validationError(`\`${label}.deliver\` must be "once" or "window"`);
+  if (kind.deliver !== undefined && kind.deliver !== "once" && kind.deliver !== "window" && kind.deliver !== "reveal") {
+    throw validationError(`\`${label}.deliver\` must be "once", "window" or "reveal"`);
+  }
+  if (kind.deliver === "reveal" && kind.browser) {
+    throw validationError(
+      `\`${label}.deliver\`: "reveal" is for a kind without a browser step; a browser kind's client collects its outcome`,
+    );
   }
   if (!kind.browser && (kind.userCode || kind.approve || kind.refusal || kind.input || kind.approver)) {
     throw validationError(
@@ -407,6 +448,11 @@ const resolveOperations = (
       ),
     },
     sealTtlMs: positiveNumber(input.sealTtlMs, operationDefaults.sealTtlMs, "operations.sealTtlMs"),
+    reserveTtlMs: positiveNumber(
+      input.reserveTtlMs,
+      operationDefaults.reserveTtlMs,
+      "operations.reserveTtlMs",
+    ),
   };
 };
 

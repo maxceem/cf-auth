@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { createClient, type Client } from "@libsql/client";
 import { drizzle } from "drizzle-orm/libsql";
 import { Hono } from "hono";
-import { afterEach } from "vitest";
+import { afterEach, vi } from "vitest";
 import { createCfAuth } from "../src/cf-auth.js";
 import { createTestSessions } from "../src/testing.js";
 import type { CfAuthConfig, CfAuthDatabase } from "../src/config.js";
@@ -318,3 +318,53 @@ export const createD1TestAuth = async (overrides: TestOverrides = {}) => {
 };
 
 export type D1TestAuth = Awaited<ReturnType<typeof createD1TestAuth>>;
+
+/**
+ * Pauses a reveal at one of two points until the test opens it: `"decrypt"`,
+ * the read of the sealed outcome, or `"update"`, immediately before the write
+ * that takes it — the next `db.update(...)` builder is held when awaited. What
+ * the test changes while it is paused must be judged by that write.
+ */
+export const holdReveal = (db: CfAuthDatabase, at: "decrypt" | "update") => {
+  let enter!: () => void;
+  let open!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    enter = resolve;
+  });
+  const opened = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  const pause = async () => {
+    enter();
+    await opened;
+  };
+  if (at === "decrypt") {
+    const decrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+    vi.spyOn(crypto.subtle, "decrypt").mockImplementationOnce(async (...args: Parameters<SubtleCrypto["decrypt"]>) => {
+      await pause();
+      return decrypt(...args);
+    });
+  } else {
+    // Every builder step answers a proxy, so awaiting the finished statement
+    // pauses before it runs.
+    const holding = <T extends object>(target: T): T =>
+      new Proxy(target, {
+        get(object, property) {
+          const value = Reflect.get(object, property, object) as unknown;
+          if (typeof value !== "function") return value;
+          if (property === "then") {
+            return (resolve: (value: unknown) => unknown, reject: (reason: unknown) => unknown) =>
+              pause().then(() => (value as PromiseLike<unknown>["then"]).call(object, resolve, reject));
+          }
+          return (...args: unknown[]) => {
+            const result = (value as (...args: unknown[]) => unknown).apply(object, args);
+            return result !== null && typeof result === "object" ? holding(result) : result;
+          };
+        },
+      });
+    const update = db.update.bind(db);
+    vi.spyOn(db, "update").mockImplementationOnce(((table: Parameters<typeof db.update>[0]) =>
+      holding(update(table))) as typeof db.update);
+  }
+  return { entered, open };
+};

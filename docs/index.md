@@ -677,7 +677,10 @@ An outcome can be **sealed**: stored encrypted under a key derived from
 after 15 minutes (`operations.sealTtlMs`). A kind with `deliver: "window"`
 hands it to every `poll` or `redeem` that asks until those 15 minutes are up,
 for a tool that may lose a response and must be able to ask again; the sweep
-drops it after. The answer that hands it over carries
+drops it after. A kind with `deliver: "reveal"` never hands it to the tool at
+all: only [`reveal`](#reservations-and-reveals) releases it, to a person on a
+page. Collecting an outcome drops the outcome only; the seal window itself
+runs on until the sweep clears it. The answer that hands it over carries
 `outcome`; every answer carries `record`, the part kept in the clear, and
 `collect`, which says whether a sealed outcome is still waiting and how to get
 it. Rotating `secret` makes sealed outcomes still waiting unreadable, so the
@@ -816,10 +819,17 @@ createCfAuth({ /* ... */, operations: { enabled: true, realm, kinds: [rotateSecr
   with it, so the page and the answer never disagree.
 - `deliverable({ operation, record, tables, now })` may return a SQL condition
   a sealed outcome must still meet to be handed over — that the credential it
-  carries is still live, say. When it fails, `poll` and `redeem` drop the
-  outcome and answer `410 operation_expired`. `login` uses it for its key.
+  carries is still live, say. When it fails, `poll`, `redeem` and `reveal`
+  drop that outcome and answer `410 operation_expired`. `login` uses it for
+  its key.
+- `deliver` is `"once"` (default: to the first `poll` or `redeem`),
+  `"window"` (to every one until the seal window ends) or `"reveal"` (to
+  nobody but a person calling `reveal`; `poll`, `findByToken` and a retried
+  `open` answer the record without the outcome, `redeem` answers `409
+  already_completed`, and none of them consumes it). `"reveal"` is for a kind
+  without a browser step.
 - `userCode` adds a code to type; `requireClientLabel` makes `client.label`
-  mandatory; `deliver` is `"once"` or `"window"`; `countsTowardPending` (see
+  mandatory; `countsTowardPending` (see
   [Limits](#limits)); `pendingTtlMs` (15 minutes)
   is how long it may wait; `recordTtlMs` (90 days) how long the record is
   kept.
@@ -851,6 +861,186 @@ which one won. Sealing a new outcome on an operation that had a loopback
 redirect drops the redirect — its redeem code went with the first outcome — so
 the new one is collected by `poll`.
 
+### Reservations and reveals
+
+Some writes are made by a client that may retry — an agent that lost a
+response, say — and must happen once however often it asks. A **reservation**
+splits such a write in two: `reserve` records what is asked and does nothing
+else, and `execute` carries it out, once, under the handle `reserve` gave out.
+
+```ts
+// 1. The client asks. Nothing is written but the reservation.
+const { id, handle, expiresAt } = await operations.reserve({
+  kind: "app.create",
+  opener: c.get("authState"),
+  input: { name: "Weather" }, // stored as the payload, read by the kind's schema
+});
+
+// 2. The client confirms with the handle. The function runs once.
+const result = await operations.execute(
+  { handle, kind: "app.create", opener: c.get("authState") },
+  ({ operation, input, guard, db }) => ({
+    outcome: { appId: operation.id, key: plaintext }, // always sealed
+    record: { appId: operation.id }, // kept in the clear
+    statements: [guardedInsert(db, app, { id: operation.id, name: input.name }, guard)],
+  }),
+);
+// First run: { id, state: "completed", record, outcome, replayed: false }
+// A repeat:  { id, state: "completed", record, replayed: true }
+```
+
+- Only a kind a caller opens, with no browser step, can be reserved: a
+  `"public"` kind or one with `browser: true` is `422 validation_error`. The
+  opener is held to the kind's `open` role and `grant` exactly as `open` holds
+  it, and the reservation is bound to its credential, its organization and
+  the kind.
+- The handle is 32 random bytes made by the server. It is the operation's
+  token: only its digest is stored, and whoever holds it may execute. The
+  reservation is pending for 15 minutes (`operations.reserveTtlMs`).
+- `execute` answers `404 operation_not_found` for an unknown handle, then `409
+  operation_mismatch` when the handle was reserved for another kind or in
+  another organization than the caller's, then `410 operation_expired` once
+  its 15 minutes have passed or it was retired. The caller is held to the
+  kind's role and grant too.
+- The function gets the stored `input`, the operation, `db`, `tables`, `now`
+  and a `guard` to AND into each statement. The guard holds only while the
+  reservation is pending and in time, this call still holds it, and the
+  credential that reserved it is still live with the kind's role and grant,
+  so a key revoked or downgraded to `read` in between writes nothing and
+  `execute` answers `409 conflict`.
+- The statements and the completion run as one batch, and the operation
+  completes only if the last statement changed a row. When it is refused —
+  by the guard, because an earlier statement of the batch made a later one
+  change nothing, or because a statement deleted the operation itself — the
+  whole batch rolls back: none of the statements stays written. The same
+  holds for `approve`, `complete` and `amend`.
+- The outcome is always sealed; `seal` is ignored. The call that ran the
+  function gets the `outcome`, once. A repeat inside the seal window
+  (`operations.sealTtlMs`, 15 minutes) answers the `record` only, with
+  `replayed: true` and no `outcome`; after it, `409 already_completed`.
+  Neither runs the function. The replay lasts the whole window: revealing
+  the outcome, collecting it by `poll`, or dropping it as no longer
+  deliverable spends the outcome, never the window. The record is kept at
+  least as long as the window, whatever the kind's `recordTtlMs`, so the
+  sweep never deletes one that can still be replayed.
+- A call arriving while another runs does not run the function either: the
+  first writes a claim of its own (`execution_claim`) before running
+  anything, the other answers `409 conflict`, and only the claim's holder can
+  complete or give it back. A function that throws, or a batch its guard
+  refused, gives the claim back so the handle can be tried again. A process
+  that dies mid-execution leaves the claim in place until the reservation
+  lapses.
+
+A sealed outcome that must reach a person rather than the client — a key the
+client should never see — is released on a page with `reveal`:
+
+```ts
+const { outcome } = await operations.reveal({ id, actor: c.get("authState") });
+```
+
+The actor must be a signed-in person (`403 session_required` otherwise) who is
+admin or owner in the operation's organization: a member is `403 forbidden`,
+and someone outside it gets `404 operation_not_found`. The person is the
+whole authority: the credential that opened the operation is not consulted,
+so an admin still collects what a key created after that key was downgraded
+or revoked. It works once, inside the seal window: the outcome is dropped as
+it is handed over, and a reveal after it — or after the outcome was spent any
+other way — is `409 already_revealed` inside the window and `410
+operation_expired` after it, as is one on an operation that sealed nothing.
+An outcome the kind's `deliverable` no longer accepts is `410
+operation_expired`, and dropped; an organization past its deadline is `403
+organization_expired`. The person's membership and session, the
+organization's deadline, `deliverable`, the seal deadline and the very
+ciphertext that was read are all judged in the write that takes the outcome;
+if `amend` sealed a new outcome meanwhile, the reveal answers `409 conflict`
+(or, when the old outcome was being dropped as undeliverable, `410
+operation_expired`) and leaves the new one for the next reveal. Revealing
+does not end the replay: `execute` keeps answering the record until the
+window closes. It works on any completed operation of a kind without a
+browser step — executed, or completed with `seal: true` — and refuses a kind
+with one, such as `login`, with `422 validation_error`: its outcome is
+collected by its own client.
+
+#### What a tool adapter returns
+
+The engine keeps the outcome sealed in storage, but `execute`'s first answer
+carries it to the caller, so keeping a secret from an agent is the adapter's
+job, in two parts:
+
+- **Every reservation kind whose outcome is a secret sets `deliver:
+  "reveal"`.** Otherwise the handle is a token like any other, and a generic
+  `poll` route of your app would hand the outcome to whoever holds it. With
+  `"reveal"`, no collection route releases it; only `reveal` does.
+- **The tool answers with the `record` and a reference** the person can open
+  to reveal the outcome, and never with `result.outcome`:
+
+```ts
+// The kind, registered in `operations.kinds`: its key is released only by `reveal`.
+const appCreate = defineOperationKind({
+  name: "app.create",
+  open: { minRole: "admin" },
+  browser: false,
+  deliver: "reveal",
+  payload: z.object({ name: z.string().min(1) }),
+});
+
+// An MCP tool that creates an app whose key only a person may see.
+const createAppTool = async (args: { name: string; handle?: string }, authState: AuthState) => {
+  if (!args.handle) {
+    const { id, handle, expiresAt } = await operations.reserve({
+      kind: "app.create",
+      opener: authState,
+      input: { name: args.name },
+    });
+    return { status: "confirm", handle, operationId: id, expiresAt };
+  }
+  const result = await operations.execute(
+    { handle: args.handle, kind: "app.create", opener: authState },
+    ({ operation, input, guard, db }) => {
+      const key = createKey();
+      return {
+        outcome: { appId: operation.id, key },
+        record: { appId: operation.id },
+        statements: [guardedInsert(db, app, { id: operation.id, name: input.name }, guard)],
+      };
+    },
+  );
+  // `result.outcome` is deliberately not read: the key is shown on the reveal page.
+  return {
+    status: "done",
+    record: result.record,
+    replayed: result.replayed,
+    revealUrl: `${consoleOrigin}/reveal/${result.id}`,
+  };
+};
+```
+
+The reveal page, signed in as an admin, calls `reveal({ id, actor })` and
+shows the outcome once.
+
+### Where an operation stands
+
+`status({ id, opener })` answers `{ id, kind, state, createdAt, expiresAt,
+organizationId, record }` to a caller whose current organization is the
+operation's — any role, any grant. It never includes a sealed outcome and
+never hands one over, so a `deliver: "once"` outcome is still waiting for its
+client afterwards. Anyone else, and any operation without an organization, is
+`404 operation_not_found`, so it does not disclose whether the id exists.
+
+### Internal kinds
+
+cf-auth's own flows register kinds of their own, named in the reserved
+`cf-auth:` namespace (`cf-auth:oauth.authorize`, say) and marked `internal:
+true`. They share the table, the limits and the sweep, but `cfAuth.operations`
+does not admit them: `open` and `reserve` refuse one with `422
+validation_error`, every call that looks one up by id, token, handle or user
+code answers `404 operation_not_found` (or null, for `findByToken` and
+`lookupByUserCode`), `retire` answers `false`, and `operations.kinds` leaves
+them out. What makes a stored operation internal is its kind's name, not what
+is registered, so an engine built without the kind still hides its rows. Only
+the flow that owns one drives it. Your own kind names cannot contain `:`, and
+`internal` is refused in `operations.kinds`.
+
 ### Limits
 
 `open` counts pending operations inside the insert itself, so two tools racing
@@ -864,7 +1054,8 @@ about itself. Over either limit is `429 too_many_pending`.
 Only kinds that wait on a person count: `countsTowardPending` defaults to
 `true` for a kind with a browser step and `false` for one without, which your
 own code completes — one it refuses to complete would otherwise hold a slot
-until its deadline. A kind that does not count is not capped either. Set it
+until its deadline. Reservations follow their kind, so they do not count by
+default either. A kind that does not count is not capped either. Set it
 explicitly to change either default.
 
 ### The sweep
@@ -890,15 +1081,19 @@ which is 3 — for a batch of your own or a job that budgets its queries.
 | --------------------- | ------ | ------------------------------------------------------------- |
 | `operation_not_found` | 404    | Unknown id — and a wrong token, which is answered the same way |
 | `invalid_proof`       | 403    | Wrong browser proof, user code or redeem code                 |
-| `operation_expired`   | 410    | Nobody answered in time, it was retired, a sealed outcome's window passed or it can no longer be read, or its opener's credential is gone |
+| `operation_expired`   | 410    | Nobody answered in time or a reservation lapsed unexecuted, it was retired, a sealed outcome's window passed, it can no longer be read or is no longer deliverable, or (for `poll` and `redeem`) its opener's credential is gone |
 | `operation_denied`    | 409    | It was denied                                                  |
-| `operation_pending`   | 409    | Redeeming before it was approved                               |
-| `already_completed`   | 409    | Approving or completing it again; redeeming a `once` outcome twice |
+| `operation_pending`   | 409    | Redeeming or revealing before it completed                     |
+| `already_completed`   | 409    | Approving or completing it again; redeeming a `once` outcome twice; executing it again once its seal window passed |
+| `operation_mismatch`  | 409    | Executing a handle reserved for another kind or in another organization |
+| `already_revealed`    | 409    | Revealing an outcome that was already revealed                  |
+| `conflict`            | 409    | The same token for a different request; a guarded write found its authority changed (its batch rolled back); executing a handle another call is executing; revealing after the person's session or role changed |
 | `too_many_pending`    | 429    | Over a pending limit                                           |
 | `not_a_member`        | 403    | The approver lacks the membership or role the kind needs, or asked to attach an organization they do not belong to |
-| `session_required`    | 403    | The approver is not a signed-in person                         |
+| `forbidden`           | 403    | Revealing without the admin or owner role                       |
+| `session_required`    | 403    | The approver, or the person revealing, is not a signed-in person |
 | `grant_insufficient`  | 403    | The opener's credential lacks the grant the kind needs         |
-| `validation_error`    | 422    | A payload, input, token, id or client field was refused        |
+| `validation_error`    | 422    | A payload, input, token, id or client field was refused; reserving a kind that cannot be reserved; revealing a kind with a browser step |
 
 Refused input is `422 validation_error`, as everywhere else in cf-auth. Map it
 to 400 in your error handler if that is what your API answers with.

@@ -106,7 +106,7 @@ production code excluding tests.
 | 5 | CIMD on Workers within the plugin's transport requirements, without a fork, or pre-registration as a fallback | **Partial.** `fetchClientMetadataResource` is ours to supply (`cimd/index.d.mts:72-78`). The plugin itself enforces a 5 s timeout, a 5 KB streaming cap, a JSON content type, refusal of literal private or loopback hosts, and non-200 answers (`cimd/index.mjs:38-55, 250-251, 330-395`; the spike printed each refusal). It passes `redirect: "error"` (`:344`), which workerd rejects, so our transport must translate to `manual` and refuse 3xx. The contract says the transport "MUST resolve the hostname exactly once… pin the approved address… refuse redirects" (`cimd/index.d.mts:72`). The only shipped transport uses `node:dns`, `node:https`, `node:net` and `node:stream` (`cimd/node.mjs:1-5`); a Worker's `fetch` takes a hostname and cannot pin an address. Pre-registered clients are ordinary `oauthClient` rows, so that fallback works. | **Pass.** `fetchClientMetadataDocument` in `spike/b/oauth.ts` enforces the budgets and the public-client profile of section 3 before and after the fetch: HTTPS only; no userinfo, fragment or root path; no literal IPs or `localhost`; `redirect: "manual"` with a refusal of every non-200; `AbortSignal.timeout(5000)`; a streaming 64 KiB cap; a JSON media type; `client_id` equal to the URL; a non-empty `client_name`; `token_endpoint_auth_method` `none` or absent; `grant_types` and `response_types` within the supported sets; and acceptable `redirect_uris`. Asserted with a stub `fetch`, not against the network. Pre-registered clients come from config. About 100 lines. |
 | 6 | The 1.7 upgrade leaves cf-auth, Google sign-in and the engine working | **Pass.** Under 1.7.6: `pnpm typecheck` exit 0; `pnpm test` passed 20 files and 190 tests, including `operations.test.ts`, `operations-d1.test.ts`, `api-keys.test.ts` and `session.test.ts`; `pnpm build` exit 0. `POST /sign-in/social {provider:"google"}` returned an `accounts.google.com` URL (spike A6). Core table fields are unchanged in `@better-auth/core` 1.7.6 (`db/get-tables.mjs`). cf-auth uses neither better-auth's organization plugin nor its api-key plugin; it has its own tables. The only plugins it wraps are `oAuthProxy` and `openAPI` (`src/better-auth.ts`). Release notes flag two behaviour changes: "`session.delete` hooks now run on sign-out", and drizzle "throws on an invalid affected-row count". The suite shows no regression from either. | **Not needed.** B runs on 1.6.9 (the spike passes after the restore). The upgrade stays an independent choice. |
 | 7 | A token for a session-less service identity, verifying into a `manage` actor | **Fail through the standard grant; pass through `issueTokens`.** `/oauth2/authorize` with no session redirects to `loginPage` (spike: `302 /login`; `op/authorize-CLuqtSXQ.mjs:5600-5604`). `VerificationValue.sessionId` is a required string (`op/oauth-1Ud-hvZY.d.mts:2187-2190`), and the code exchange refuses a missing or expired session (`op/introspect-CbYi2MJT.mjs:2022-2033`). cf-auth refuses to create a session for a service identity ("Human login is required", spike). `issueTokens` is exported and documented as "a raw minting primitive" that takes an optional `user` and no session (`op/oauth-1Ud-hvZY.d.mts:771-823, 856-871`). The spike minted a session-less token for a service identity through a cf-auth endpoint and refreshed it; it verified as `{grant:"manage", kind:"service", role:"owner"}`. An MCP client reaches that only if cf-auth intercepts `/oauth2/token` (section 4). | **Pass.** At exchange time the connection key is written for whichever user the record names. The token endpoint needs no session (asserted: a guest connection resolves as `{kind:"service", grant:"manage"}`). |
-| 8 | Guest authorization: provision an unclaimed account inside the pending authorization, with retry safety | **Fail natively; hybrid possible.** The provider's pending authorization is the signed `oauth_query`. It is stateless, reusable until `exp`, and one consent can be submitted twice to get two codes. So the pending state and the code for a guest must live in cf-auth. The spike's before-hook on `/oauth2/token` (a before-hook may return a response and short-circuit, `better-auth/dist/api/dispatch.mjs`, `runBeforeHooks`) checked PKCE, the redirect, the client and single use. It then minted with `issueTokens`: 200, service actor, and a replay got `invalid_grant` (printed, not asserted). That is B's exchange, rebuilt against the provider's internals. | **Pass.** One `oauth.authorize` operation, opened at `/authorize`, is completed either by the person or by the guest door. The guest's `approve` inserts the service user, the organization with its deadline, and the owner membership, all under the engine's guard and the admission condition, with ids derived from the operation id. Asserted on D1 and libsql: two concurrent "continue" clicks answer the same redirect and create exactly one account; approving the same authorization twice in sequence answers a byte-equal redirect and the same account, before and after the code is exchanged; a person's approval racing a completed guest approval answers the guest's redirect. |
+| 8 | Guest authorization: provision an unclaimed account inside the pending authorization, with retry safety | **Fail natively; hybrid possible.** The provider's pending authorization is the signed `oauth_query`. It is stateless, reusable until `exp`, and one consent can be submitted twice to get two codes. So the pending state and the code for a guest must live in cf-auth. The spike's before-hook on `/oauth2/token` (a before-hook may return a response and short-circuit, `better-auth/dist/api/dispatch.mjs`, `runBeforeHooks`) checked PKCE, the redirect, the client and single use. It then minted with `issueTokens`: 200, service actor, and a replay got `invalid_grant` (printed, not asserted). That is B's exchange, rebuilt against the provider's internals. | **Pass.** One `cf-auth:oauth.authorize` operation, opened at `/authorize`, is completed either by the person or by the guest door. The guest's `approve` inserts the service user, the organization with its deadline, and the owner membership, all under the engine's guard and the admission condition, with ids derived from the operation id. Asserted on D1 and libsql: two concurrent "continue" clicks answer the same redirect and create exactly one account; approving the same authorization twice in sequence answers a byte-equal redirect and the same account, before and after the code is exchanged; a person's approval racing a completed guest approval answers the guest's redirect. |
 | 9 | The claim guard verifies the connection's stable authority without a hidden API key | **Pass if the mapping is an `api_key` row.** `credentialAuthoritySql` and the claim's provisioning guard (`src/repository.ts:554-570`) read `api_key` only. With a separate mapping table, A would need a second branch there. With an `api_key` row as the mapping, the guard applies unchanged; what remains is keeping the provider's refresh rows, and their session binding, consistent with that row, and extending the claim's `revokeAccess` path to delete them. | **Pass with no change.** The connection *is* an `api_key` row. The spike opened `claim` with the OAuth `AuthState` as opener and approved it with a human session, and the account became claimed. After the connection was revoked, the same approval failed with "authority changed". |
 | 10 | Admission rules and the bootstrap rate limit apply at consent | **Pass, in the cf-auth wrapper.** Consent goes through cf-auth's own route, so the gateway can run `DEPLOYMENT_RULES.bootstrap` and `enforceEndpointRateLimit` before anything happens. The provider offers no hook of its own before consent: `postLogin.shouldRedirect` and `signup.shouldRedirect` run only for a signed-in user (`op/oauth-1Ud-hvZY.d.mts:1477-1590`). | **Pass; the order is proven, the gateway's rules stand in.** `approveGuestAuthorization` takes the admission and the rate limit as callbacks and runs them in the order of section 3, "The guest door". Asserted with stand-in callbacks: a bad proof reaches neither; a refused admission consumes no rate-limit budget, however often it is refused; an admission condition that fails inside the batch provisions nothing; a completed authorization answers before either callback. The gateway's `DEPLOYMENT_RULES.bootstrap` and `enforceEndpointRateLimit` themselves are not exercised. `/authorize` also counts against the engine's `pendingPerOpener` under `rateLimitKey = ip`. |
 
@@ -328,7 +328,7 @@ How the functions behave:
 - **The middleware** routes a bearer token by prefix: `oauth.tokenPrefix.access`
   goes to `resolveAccessTokenAuthState`, and everything else goes to API keys,
   as today.
-- **The `oauth.authorize` kind is internal.** The engine's generic
+- **The `cf-auth:oauth.authorize` kind is internal.** The engine's generic
   `details`, `approve`, `deny`, `status` and reservation entry points refuse
   it; only these functions reach it, so no generic operation route can submit
   an approval input for it.
@@ -604,7 +604,7 @@ The completion record stores `{door: "guest", organizationId, grant}` with
 the user id and the code's validity. A racing person's approval, or a second
 guest click, answers that record's redirect; there is exactly one account.
 
-The `oauth.authorize` record is retained for 1 day. The code is single use and
+The `cf-auth:oauth.authorize` record is retained for 1 day. The code is single use and
 valid for 10 minutes, and the pending deadline, enforced by the engine's sweep
 and by every approval, is what prevents a second provisioning under the same
 authorization. The CLI bootstrap keeps its record for 180 days because there
@@ -615,16 +615,26 @@ record only has to outlive the code long enough to recognise a replay.
 ### Engine contract for step 7
 
 These are generic engine additions. Nothing in them is OAuth-specific, and
-none of them accepts the internal `oauth.authorize` kind.
+none of them accepts an internal kind such as `cf-auth:oauth.authorize`.
 
 ```ts
-operations.status(input: { id: string; opener: AuthState }): Promise<OperationStatus>;
-operations.reserve(input: { kind: string; opener: AuthState; input: unknown }): Promise<{ handle: string; expiresAt: string }>;
-operations.execute(
-  input: { handle: string; kind: string; opener: AuthState },
-  fn: (ctx: { input: unknown; guard: SQL; now: number }) => OperationApproveResult,
-): Promise<{ state: "completed"; outcome: unknown; replayed: boolean }>;
-operations.reveal(input: { id: string; actor: AuthState }): Promise<{ outcome: unknown }>;
+operations.status(input: { id: string; opener: AuthState | null | undefined }): Promise<OperationStatus>;
+// OperationStatus: { id, kind, state, createdAt, expiresAt, organizationId, record }
+
+operations.reserve(input: { kind: string; opener: AuthState | null | undefined; input?: unknown }):
+  Promise<{ id: string; handle: string; expiresAt: string }>;
+
+operations.execute<Outcome>(
+  input: { handle: string; kind: string; opener: AuthState | null | undefined },
+  fn: (ctx: { operation; input: unknown; guard: SQL; db; tables; now: number }) =>
+    OperationApproveResult<Outcome> | Promise<OperationApproveResult<Outcome>>,
+): Promise<
+  | { id: string; state: "completed"; record: unknown; outcome: Outcome; replayed: false }
+  | { id: string; state: "completed"; record: unknown; replayed: true }
+>;
+
+operations.reveal(input: { id: string; actor: AuthState | null | undefined }):
+  Promise<{ id: string; kind: string; organizationId: string; outcome: unknown }>;
 ```
 
 - **`status`** answers state, kind, expiry and the non-secret record. It is
@@ -636,18 +646,87 @@ operations.reveal(input: { id: string; actor: AuthState }): Promise<{ outcome: u
   the opener's organization and the kind, with the input stored. It runs no
   write. The handle is server-generated.
 - **`execute`** runs `fn` under the engine's guard, which re-checks the
-  opener's authority and the kind's grant at write time. A repeat within the
-  15-minute seal window replays the sealed result, with `replayed: true`,
-  and does not run `fn`. After the window a repeat answers `already_completed`
-  and still does not run `fn`. Errors:
-  - `operation_mismatch`: the handle belongs to another kind or another
-    organization;
-  - `operation_not_found`: no such handle;
-  - `operation_expired`: the handle's 15 minutes passed before it executed.
-- **`reveal`** releases a sealed outcome on a browser page. The actor must be
-  an interactive human session with the admin or owner role in the opener's
-  organization. It succeeds once, within the seal window; a second reveal is
-  `already_revealed`.
+  opener's authority and the kind's grant at write time, and this
+  execution's claim.
+  - **Claim.** Before `fn` runs, the call writes a random value into
+    `operation.execution_claim` on a pending row that holds none. The guard,
+    the completion and the release all require that value, so of two calls
+    racing on one handle only one runs `fn`, and the other answers
+    `409 conflict`. `decided_by_user_id` is attribution only: deleting the
+    user who executes cannot unlock a running execution. A process that dies
+    mid-execution leaves the claim until the reservation lapses.
+  - **Atomic completion.** `fn`'s statements and the completion run as one
+    batch, followed by an assertion statement: an `INSERT ... SELECT` of a
+    row of nulls into `operation` under `WHERE changes() = 0`, which runs
+    only when the completion matched no row and then always violates the
+    primary key's NOT NULL. It depends on nothing existing, so it fires even
+    when an earlier statement deleted the operation, directly or through a
+    cascade. The batch then rolls back whole: no statement outlives a refused
+    completion. `complete`, `approve` and `amend` carry the same assertion.
+  - **Result.** The run that executed answers
+    `{ id, state, record, outcome, replayed: false }`. A repeat within the
+    15-minute seal window answers `{ id, state, record, replayed: true }`:
+    the record only, never the outcome, and `fn` does not run. After the
+    window a repeat answers `already_completed` and still does not run `fn`.
+  - **Replay lifetime is not secret availability.** The replay deadline is
+    `sealed_until`. Revealing the outcome, a `once` poll collecting it, and
+    the cleanup of an outcome no longer deliverable null the ciphertext only
+    and never shorten `sealed_until`; only `retire` and the sweep (after the
+    deadline) clear it. A reveal after the outcome was spent answers
+    `already_revealed` inside the window and `operation_expired` after it.
+  - **Retention.** Completing with a sealed outcome moves `retain_until` to
+    at least `sealed_until` in the same write, so the sweep never deletes a
+    record whose replay window is still open.
+  - Errors:
+    - `operation_mismatch`: the handle belongs to another kind or another
+      organization;
+    - `operation_not_found`: no such handle;
+    - `operation_expired`: the handle's 15 minutes passed before it
+      executed, or it was retired.
+- **`reveal`** releases a sealed outcome on a browser page, once, within the
+  seal window; a second reveal is `already_revealed`. **Authority policy:**
+  reveal is authorized by the person, not by the credential that opened the
+  operation. It requires an interactive human session with the admin or
+  owner role in the operation's organization, an organization that has not
+  expired, and an outcome the kind still considers deliverable. It does not
+  depend on the opener credential's current grant or existence: an admin
+  still collects what a key created after that key was downgraded or
+  revoked. The person's authority, the kind's `deliverable` predicate and
+  the seal deadline (by the database's clock, `sqliteNowMs`) all sit in the
+  UPDATE that consumes the outcome, so a reveal after any of them stopped
+  holding matches no row and is refused. So does the organization: it must
+  exist and, when it has an `expires_at` (ISO text), satisfy
+  `cast(unixepoch(expires_at, 'subsec') * 1000 as integer) > sqliteNowMs(now)`
+  in that UPDATE, with the earlier read kept for a readable
+  `organization_expired`. An outcome no longer deliverable is dropped and
+  answers `operation_expired`; the drop names the exact ciphertext that was
+  judged and a completed row, so an outcome `amend` sealed meanwhile is never
+  touched. An `amend` landing before the consuming UPDATE makes that reveal
+  answer `conflict`; one landing between the refused UPDATE and the cleanup
+  makes it answer `operation_expired` (the old outcome's verdict), and the
+  replacement is preserved for the next reveal either way.
+- **Delivery modes.** A kind's `deliver` is `"once"` (to the first `poll` or
+  `redeem`), `"window"` (to every one until `sealed_until`) or `"reveal"`
+  (only through `reveal`; `poll`, `findByToken` and a retried `open` answer
+  the record without the outcome, `redeem` answers `already_completed`, and
+  none of them consumes it).
+  `"reveal"` needs a kind without a browser step. An MCP adapter must use
+  it for every reservation kind whose outcome is a secret, and the
+  gateway's step 8 kinds set it. A stored row whose kind is no longer
+  registered and that had no browser step is treated as `"reveal"`, so
+  removing a kind never opens its secret to `poll`.
+- **What a tool adapter returns.** `execute`'s first answer carries the
+  plaintext outcome to the caller; the engine does not withhold it there.
+  An MCP tool returns only `record` and a reveal reference (the operation
+  id, or a page URL built from it), never `result.outcome`, and its kinds
+  use `deliver: "reveal"` so no collection route releases the outcome to
+  the handle's holder.
+- **Internal kinds** live in the reserved namespace `cf-auth:`. A stored
+  operation whose kind starts with it is hidden from the public door whatever
+  the engine has registered, so an engine built without the kind (another
+  deployment, a feature turned off) still refuses its rows. App kind names
+  cannot contain `:`; a built-in kind is internal exactly when it is in the
+  namespace.
 - **Digest lookup**, mapping a request digest to a recent handle for the
   notice of decision 13, is the gateway's, with a 1-hour lifetime. The engine
   stores no digest.
@@ -679,8 +758,11 @@ gateway's tables become `mgmt_oauth_token`, and so on.
   - Unique on `(api_key_id, generation)`. At most two rows per connection.
   - `sweepStatements` deletes the generations of connections that are
     revoked or past `expires_at`.
-- **`operation`:** unchanged. A pending authorization is a row of the
-  built-in internal kind `oauth.authorize`. Its payload holds client,
+- **`operation`:** one column, `execution_claim text`, added by
+  `drizzle/0003_cf_auth_operation_execution_claim.sql` as a plain
+  `ALTER TABLE ... ADD` (no rebuild, no CHECK). Step 7. A pending
+  authorization is a row of the built-in internal kind
+  `cf-auth:oauth.authorize`. Its payload holds client,
   redirect, PKCE challenge, requested grant, optional state and the sealed
   code. It is public, `approver: "proof"`, pending for `authorizationTtlMs`,
   and retained for 1 day. Its completion record holds the door, user,
@@ -753,11 +835,12 @@ management app, so they stay behind `cfAuth()`:
   connection used at least monthly lives until it is revoked.
 - Refresh grace: 30 s. Rotation rate limit: one per 5 s per connection.
 - Pending authorization: 10 minutes. Code validity: 10 minutes from
-  completion. The `oauth.authorize` record is retained for 1 day.
+  completion. The `cf-auth:oauth.authorize` record is retained for 1 day.
 - Reservation handles (step 7): pending for 15 minutes. A repeated execute
-  replays the sealed result within the 15-minute seal window; after it, the
-  repeat answers `already_completed` from the record, which is kept for the
-  engine's record TTL, 90 days (`OPERATION_RECORD_TTL_MS`).
+  replays the record, never the outcome, within the 15-minute seal window,
+  revealed or not; after it, the repeat answers `already_completed` from the
+  record, which is kept for the engine's record TTL, 90 days
+  (`OPERATION_RECORD_TTL_MS`), and never less than the seal window.
 - Reveal: once, within the 15-minute seal window.
 - Digest lookup: 1 hour, gateway-side.
 - CIMD fetch: 5 s, 64 KiB.
@@ -777,7 +860,9 @@ management app, so they stay behind `cfAuth()`:
 - **Step 7 (engine additions):**
   - `status`, `reserve`, `execute` and `reveal` as in "Engine contract for
     step 7".
-  - Internal kinds, which the generic entry points refuse.
+  - Internal kinds in the `cf-auth:` namespace, which the generic entry
+    points refuse.
+  - `operation.execution_claim` (migration 0003).
 - **Step 9 (OAuth credentials):**
   - `oauth_token`, `api_key.client_id` and `api_key.resource`.
   - The token format with the connection id; two-generation storage;
@@ -792,7 +877,7 @@ management app, so they stay behind `cfAuth()`:
   - The refusal of a database without `batch`.
   - `ApiKeySummary.clientId`.
 - **Step 10 (OAuth authorization):**
-  - The built-in internal `oauth.authorize` kind.
+  - The built-in internal `cf-auth:oauth.authorize` kind.
   - `authorize` and `authorizationDetails`.
   - Both approvals, with the guest door's order, and deny.
   - The authorization-request rules: required and optional parameters,
@@ -842,14 +927,14 @@ management app, so they stay behind `cfAuth()`:
 | `requireActor` over every non-session credential, with the grant; `manage` on service mutations; issuance bounded by the issuer's grant | service | apiKey only, no grant | step 3 |
 | `OperationKindDefinition.grant`, at `open` and in the guard | kind | — | step 3 |
 | `operations.status`, `reserve`, `execute`, `reveal` | engine | — | step 7 |
-| Internal kinds, refused by the generic engine entry points | engine | — | step 7 (mechanism), step 10 (`oauth.authorize`) |
+| Internal kinds, refused by the generic engine entry points | engine | — | step 7 (mechanism), step 10 (`cf-auth:oauth.authorize`) |
 | `api_key.client_id`, `api_key.resource`; `ApiKeySummary.clientId`; `normalizeApiKeySource` refusing `"oauth"` | column, types | — | step 9 |
 | `oauth_token` table | table | — | step 9 |
 | `AuthCredentialType` `"oauth"` | credential type | — | step 9 |
 | Bearer prefix routing in the middleware; `resolveAccessTokenAuthState(token, { source })` | middleware | API keys only | step 9 |
 | `oauth` configuration, including the refusal of a database without `batch` | config | — | step 9 |
 | `cfAuth.oauth.token`, `revoke`, `sweepStatements` | service | — | step 9 |
-| The `oauth.authorize` kind; `authorize`, `authorizationDetails`, both approvals, deny; the metadata documents | kind, service | — | step 10 |
+| The `cf-auth:oauth.authorize` kind; `authorize`, `authorizationDetails`, both approvals, deny; the metadata documents | kind, service | — | step 10 |
 | `approveGuestAuthorization`'s `admit`, `rateLimit` and `provision` callbacks | hook | — | step 10 (callbacks), step 11 (gateway implementations) |
 
 Nothing in the design needs a better-auth plugin, a better-auth hook or a

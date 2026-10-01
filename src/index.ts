@@ -71,6 +71,7 @@ export {
 
 export {
   alreadyCompleted,
+  alreadyRevealed,
   CfAuthError,
   conflict,
   forbidden,
@@ -81,6 +82,7 @@ export {
   notFound,
   operationDenied,
   operationExpired,
+  operationMismatch,
   operationNotFound,
   operationPending,
   organizationExpired,
@@ -142,6 +144,10 @@ export {
   type ApproveOperationInput,
   type CfAuthOperations,
   type CompleteOperationInput,
+  type ExecuteContext,
+  type ExecutedOperation,
+  type ExecuteOperationFunction,
+  type ExecuteOperationInput,
   type OpenOperationInput,
   type OperationApproval,
   type OperationApproveContext,
@@ -156,8 +162,13 @@ export {
   type OperationPayloadSchema,
   type OperationRecord,
   type OperationRefusalContext,
+  type OperationReservation,
+  type OperationStatus,
   type OperationSweepStatements,
   type OperationView,
+  type RevealedOperation,
+  type RevealOperationInput,
+  type ReserveOperationInput,
 } from "./operations.js";
 
 export {

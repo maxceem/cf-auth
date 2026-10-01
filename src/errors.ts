@@ -85,6 +85,18 @@ export const invalidProof = (message = "The proof does not match this operation"
 export const alreadyCompleted = (message = "This operation has already been completed") =>
   new CfAuthError("already_completed", message, 409);
 
+/**
+ * A reservation handle was presented for another kind, or from another
+ * organization, than the one it was reserved for.
+ */
+export const operationMismatch = (
+  message = "This handle belongs to a different kind of operation or another organization",
+) => new CfAuthError("operation_mismatch", message, 409);
+
+/** A sealed outcome was already released to a browser page. */
+export const alreadyRevealed = (message = "This operation's outcome has already been revealed") =>
+  new CfAuthError("already_revealed", message, 409);
+
 export const tooManyPending = (message = "Too many operations are waiting for approval") =>
   new CfAuthError("too_many_pending", message, 429);
 

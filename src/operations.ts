@@ -18,7 +18,7 @@
  * statement, and a raw statement with parameters has none.
  */
 
-import { and, entityKind, eq, lte, ne, sql, type SQL } from "drizzle-orm";
+import { and, entityKind, eq, getTableName, isNull, lte, ne, sql, type SQL } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
 import { alias } from "drizzle-orm/sqlite-core";
 import {
@@ -27,7 +27,10 @@ import {
   sqliteNowMs,
 } from "./authority.js";
 import {
+  internalOperationKindPrefix,
+  isInternalOperationKind,
   operationDefaults,
+  validateOperationKind,
   type CfAuthDatabase,
   type ResolvedCfAuthConfig,
 } from "./config.js";
@@ -44,6 +47,7 @@ import {
 } from "./crypto.js";
 import {
   alreadyCompleted,
+  alreadyRevealed,
   CfAuthError,
   conflict,
   forbidden,
@@ -51,6 +55,7 @@ import {
   invalidProof,
   operationDenied,
   operationExpired,
+  operationMismatch,
   operationNotFound,
   operationPending,
   organizationExpired,
@@ -171,7 +176,8 @@ export interface OperationApproveResult<Outcome = unknown> {
    * `guardedInsert`) run in the same batch as the completion, before it.
    * Never `db.run(sql)` with parameters: D1 cannot batch it. Guard each with
    * {@link OperationApproveContext.guard}; the operation completes only if the
-   * last of them changed a row.
+   * last of them changed a row, and when it does not, the whole batch rolls
+   * back — none of them stays written.
    */
   statements?: readonly unknown[];
   /** Runs once the batch has committed, e.g. to write an audit event. Failures go to `onError`. */
@@ -237,8 +243,19 @@ export interface OperationKindDefinition<Payload = unknown, Outcome = unknown, I
    * Not for a `"public"` kind, which binds no opener credential to check.
    */
   grant?: CredentialGrant;
-  /** Whether it is approved in a browser. Without one, the app calls `complete`. */
+  /** Whether it is approved in a browser. Without one, the app calls `complete`, or `reserve` and `execute`. */
   browser: boolean;
+  /**
+   * Reserved for cf-auth's own built-in kinds, and refused in
+   * `operations.kinds`. An internal kind is named `cf-auth:<name>`, and a
+   * stored operation in that namespace is internal whatever is registered —
+   * an engine built without the kind still hides its rows. It lives in the
+   * same table and the same sweep, but every entry point of
+   * `cfAuth.operations` refuses it: `open` and `reserve` with `422
+   * validation_error`, everything that looks one up as `404
+   * operation_not_found`. Only the flow that owns it drives it.
+   */
+  internal?: true;
   /**
    * What approving needs. `"session"` (default): a signed-in person, as
    * `approverMinRole` says. `"proof"`: the browser proof alone — whoever holds
@@ -269,15 +286,23 @@ export interface OperationKindDefinition<Payload = unknown, Outcome = unknown, I
    * How a sealed outcome is handed over. `"once"` (default): to the first
    * `poll` or `redeem` that asks, then dropped. `"window"`: to every one that
    * asks until the seal expires, so a client whose response was lost can ask
-   * again; the sweep drops it after.
+   * again; the sweep drops it after. `"reveal"`: only through `reveal`, to a
+   * person on a page — `poll`, `findByToken` and a retried `open` answer the
+   * record without it, `redeem` answers `409 already_completed`, and none of
+   * them consumes it. For a kind without a
+   * browser step; use it for every reservation kind whose outcome is a secret
+   * the client must not see.
+   *
+   * Whichever it is, collecting the outcome drops only the outcome: the seal
+   * window (`sealed_until`), which also bounds `execute`'s replay, runs on.
    */
-  deliver?: "once" | "window";
+  deliver?: "once" | "window" | "reveal";
   /**
    * A condition a sealed outcome must still meet to be handed over — that the
-   * credential it carries is still live, say. Checked by every `poll` and
-   * `redeem` that would release it; when it fails, the sealed outcome is
-   * dropped and the answer is `410 operation_expired`. Return undefined to
-   * skip the check.
+   * credential it carries is still live, say. Checked by every `poll`,
+   * `redeem` and `reveal` that would release it (by `reveal` inside the very
+   * write that takes it); when it fails, that sealed outcome is dropped and
+   * the answer is `410 operation_expired`. Return undefined to skip the check.
    */
   deliverable?(context: OperationDeliverableContext): SQL | undefined;
   /** How long it may stay pending — the browser step's window. Default: 15 minutes. */
@@ -442,6 +467,123 @@ export interface AmendOperationInput {
   statements?: readonly unknown[];
 }
 
+/** What {@link CfAuthOperations.status} answers: where an operation stands, and nothing it holds sealed. */
+export interface OperationStatus {
+  id: string;
+  kind: string;
+  /** Already `expired` when a pending operation's deadline has passed, whatever the row says. */
+  state: OperationState;
+  createdAt: string;
+  expiresAt: string;
+  /** The organization it acts in. `status` shows only operations that have one. */
+  organizationId: string;
+  /** What is kept in the clear: an unsealed outcome, or a sealed one's `record`. Never the sealed outcome. */
+  record: unknown;
+}
+
+export interface ReserveOperationInput {
+  /** A kind a caller opens (not `"public"`) and that has no browser step. */
+  kind: string;
+  /** Who is reserving, held to the kind's `open` role and `grant` exactly as `open` holds an opener. */
+  opener: AuthState | null | undefined;
+  /** Stored as the operation's payload, read by the kind's `payload` schema. */
+  input?: unknown;
+}
+
+/** What {@link CfAuthOperations.reserve} answers. */
+export interface OperationReservation {
+  /** The operation's id, which `status` and `reveal` take. Not a secret. */
+  id: string;
+  /**
+   * What `execute` takes: 32 random bytes, base64url, made by the server. It
+   * is the operation's token — only its digest is stored — so hand it to the
+   * caller and nobody else.
+   */
+  handle: string;
+  /** When the reservation lapses unexecuted: `operations.reserveTtlMs` from now. */
+  expiresAt: string;
+}
+
+export interface ExecuteOperationInput {
+  /** The handle `reserve` answered with. */
+  handle: string;
+  /** The kind the caller believes it is executing; a handle reserved for another is `409 operation_mismatch`. */
+  kind: string;
+  /** Who is executing: must act in the organization the handle was reserved in. */
+  opener: AuthState | null | undefined;
+}
+
+export interface ExecuteContext<Payload = unknown> {
+  operation: OperationRecord<Payload>;
+  /** What `reserve` stored, as the kind's payload schema read it (`null` when none was stored). */
+  input: Payload;
+  /**
+   * AND this into the WHERE of every statement you return: it is true only
+   * while the reservation is still pending and inside its deadline, this
+   * execution still holds it, and the credential that reserved it is still
+   * live with the kind's role and grant.
+   */
+  guard: SQL;
+  db: CfAuthDatabase;
+  tables: CfAuthTables;
+  /** The instant the guard was built for, in epoch milliseconds. */
+  now: number;
+}
+
+/**
+ * What `execute` runs, once: the reservation's write, as statements for the
+ * completion batch. Its outcome is always sealed; its `record` is kept in the
+ * clear, and `seal` is ignored. When the completion is refused, the whole
+ * batch rolls back: none of the statements stays written.
+ */
+export type ExecuteOperationFunction<Payload = unknown, Outcome = unknown> = (
+  context: ExecuteContext<Payload>,
+) => OperationApproveResult<Outcome> | Promise<OperationApproveResult<Outcome>>;
+
+/**
+ * What {@link CfAuthOperations.execute} answers. The call that ran the function
+ * gets its `outcome` once, with `replayed: false`; a repeat inside the seal
+ * window gets only the `record`, with `replayed: true`. Neither is meant for a
+ * client that must not see a secret: hand such a client the `record` and the
+ * operation's id, and let a person `reveal` the outcome.
+ */
+export type ExecutedOperation<Outcome = unknown> =
+  | {
+      id: string;
+      state: "completed";
+      /** What is kept in the clear: the `record` the function returned. */
+      record: unknown;
+      /** What the function returned as its outcome, sealed in storage. Only on this answer. */
+      outcome: Outcome;
+      replayed: false;
+    }
+  | {
+      id: string;
+      state: "completed";
+      /** What is kept in the clear: the `record` the execution kept. */
+      record: unknown;
+      /** A repeat: the function did not run, and the sealed outcome is not handed out again. */
+      replayed: true;
+    };
+
+export interface RevealOperationInput {
+  id: string;
+  /**
+   * The person on the page: an interactive session, admin or owner in the
+   * operation's organization. Their authority is the whole of it: the
+   * credential that opened the operation is not consulted.
+   */
+  actor: AuthState | null | undefined;
+}
+
+/** What {@link CfAuthOperations.reveal} answers, once. */
+export interface RevealedOperation {
+  id: string;
+  kind: string;
+  organizationId: string;
+  outcome: unknown;
+}
+
 /** The statements {@link CfAuthOperations.sweepStatements} returns: always {@link operationSweepStatementCount}. */
 export type OperationSweepStatements = BatchItem<"sqlite">[];
 
@@ -453,7 +595,7 @@ export type OperationSweepStatements = BatchItem<"sqlite">[];
 export const operationSweepStatementCount = 3;
 
 export interface CfAuthOperations {
-  /** Every registered kind by name, the built-in `login` included. */
+  /** Every registered kind by name, the built-in `login` included and internal ones left out. */
   readonly kinds: ReadonlyMap<string, OperationKind>;
   /**
    * Opens an operation, or answers again for the one its token already opened.
@@ -513,7 +655,7 @@ export interface CfAuthOperations {
   /**
    * Changes what a completed operation holds — a renewed secret, a new
    * record — under a guard, in one batch with `statements`. Answers whether
-   * the amendment landed.
+   * the amendment landed; when it did not, none of `statements` stays written.
    */
   amend(input: AmendOperationInput): Promise<boolean>;
   /**
@@ -537,6 +679,44 @@ export interface CfAuthOperations {
   sweepStatements(now?: number): OperationSweepStatements;
   /** Runs {@link CfAuthOperations.sweepStatements} in one batch. */
   sweep(now?: number): Promise<void>;
+  /**
+   * Where an operation stands, for a caller in its organization: state, kind,
+   * expiry and the record kept in the clear. Never the sealed outcome, and it
+   * hands nothing over, so a `once` delivery is still waiting afterwards.
+   * Anyone else — another organization, nobody signed in, an operation with no
+   * organization — gets `404 operation_not_found`, so it discloses nothing.
+   */
+  status(input: { id: string; opener: AuthState | null | undefined }): Promise<OperationStatus>;
+  /**
+   * Reserves an operation of a kind with no browser step, to run later with
+   * `execute`: pending for `operations.reserveTtlMs`, bound to the opener's
+   * credential and organization and to the kind, with `input` stored as its
+   * payload. Writes nothing else. Answers a server-made handle.
+   */
+  reserve(input: ReserveOperationInput): Promise<OperationReservation>;
+  /**
+   * Runs a reservation once. `fn` builds the write under a guard that rechecks
+   * the reserving credential and this execution's claim, and the operation
+   * completes in the same batch with the outcome sealed; if the completion is
+   * refused, the batch rolls back whole. The run that executed answers the
+   * outcome; a repeat inside `operations.sealTtlMs` answers only the record,
+   * with `replayed: true`, revealed or not; after it, `409
+   * already_completed`. Neither runs `fn`, and neither does a call racing one
+   * that is running: that one answers `409 conflict`.
+   */
+  execute<Outcome = unknown>(
+    input: ExecuteOperationInput,
+    fn: ExecuteOperationFunction<unknown, Outcome>,
+  ): Promise<ExecutedOperation<Outcome>>;
+  /**
+   * Releases a sealed outcome to a page, once, inside its seal window, to a
+   * signed-in person who is admin or owner in the operation's organization,
+   * while the kind still considers it deliverable. The person is the whole
+   * authority: the credential that opened the operation is not rechecked. For
+   * kinds without a browser step; a second reveal is `409 already_revealed`.
+   * Revealing does not end `execute`'s replay of the record.
+   */
+  reveal(input: RevealOperationInput): Promise<RevealedOperation>;
 }
 
 // --- internals ---------------------------------------------------------------------
@@ -656,10 +836,28 @@ const parseWith = <Value>(schema: OperationPayloadSchema<Value>, value: unknown,
   }
 };
 
-export const createOperationsService = (
+/** The one engine behind `cfAuth.operations`, with the door cf-auth's own flows use. */
+export interface OperationsEngine {
+  /** What `cfAuth.operations` is: every entry point refuses an internal kind. */
+  operations: CfAuthOperations;
+  /**
+   * The same engine with internal kinds admitted, for the flow that owns one.
+   * Never exported from the package index; reach it only from cf-auth's own
+   * modules.
+   */
+  internal: CfAuthOperations;
+}
+
+/**
+ * Builds the engine. Not exported from the package index: `builtInKinds` is
+ * how cf-auth registers its own kinds, internal ones included, and `internal`
+ * is the only door to those.
+ */
+export const createOperationsEngine = (
   config: ResolvedCfAuthConfig,
   repository: CfAuthRepository,
-): CfAuthOperations => {
+  options: { builtInKinds?: readonly OperationKind[] } = {},
+): OperationsEngine => {
   const { db, tables } = config;
   const { operation } = tables;
   const settings = config.operations;
@@ -668,7 +866,22 @@ export const createOperationsService = (
   if (settings.login) {
     kinds.set("login", createLoginOperationKind(config, settings.login));
   }
-  for (const kind of settings.kinds) kinds.set(kind.name, kind);
+  for (const kind of [...(options.builtInKinds ?? []), ...settings.kinds]) {
+    if (options.builtInKinds?.includes(kind)) {
+      validateOperationKind(kind, `built-in operation kind ${kind.name}`, { builtIn: true });
+    }
+    if (kinds.has(kind.name)) {
+      throw validationError(`Operation kind \`${kind.name}\` is declared twice`);
+    }
+    kinds.set(kind.name, kind);
+  }
+  /**
+   * Whether a row is out of reach of a door that does not admit internal kinds.
+   * Judged by the kind's name, never by what this engine registered, so a row
+   * of an internal kind stays hidden from an engine that lacks the kind.
+   */
+  const hidden = (row: OperationRow, admitInternal: boolean) =>
+    !admitInternal && isInternalOperationKind(row.kind);
 
   const requireEnabled = () => {
     if (!settings.enabled) {
@@ -691,8 +904,17 @@ export const createOperationsService = (
   const openerGrant = (kind: OperationKind): CredentialGrant => kind.grant ?? "manage";
   const countingKinds = [...kinds.values()].filter(countsTowardPending).map((kind) => kind.name);
 
-  /** A row whose kind is no longer registered still answers its client, delivering once. */
-  const deliverMode = (row: OperationRow) => kinds.get(row.kind)?.deliver ?? "once";
+  /**
+   * How a row's sealed outcome is handed over. A row whose kind is no longer
+   * registered still answers its client, delivering once — unless it had no
+   * browser step, when it may have been a `"reveal"` kind: removing a kind
+   * must never let `poll` release what the kind kept for a person.
+   */
+  const deliverMode = (row: OperationRow): "once" | "window" | "reveal" => {
+    const kind = kinds.get(row.kind);
+    if (kind) return kind.deliver ?? "once";
+    return row.browserProofHash === null ? "reveal" : "once";
+  };
 
   const browserProofFor = (token: string) =>
     hmacHex(token, `cf-auth:operation-browser:${settings.realm}`);
@@ -744,19 +966,21 @@ export const createOperationsService = (
     (await db.select().from(operation).where(eq(operation.pollTokenHash, hash)).get()) ?? null;
 
   /** The row a token names, or `404` — the same answer for a wrong token as for a missing row. */
-  const rowForToken = async (id: string, token: string): Promise<OperationRow> => {
+  const rowForToken = async (id: string, token: string, admitInternal: boolean): Promise<OperationRow> => {
     const row = await findById(id);
     const presented = typeof token === "string" && tokenPattern.test(token) ? await sha256Hex(token) : "";
-    if (!row || !timingSafeEqual(presented, row.pollTokenHash)) throw operationNotFound();
+    if (!row || hidden(row, admitInternal) || !timingSafeEqual(presented, row.pollTokenHash))
+      throw operationNotFound();
     return row;
   };
 
   /** The row a browser addresses, once its proof or user code checks out. */
   const rowForBrowser = async (
     input: { id: string } & OperationBrowserCredential,
+    admitInternal: boolean,
   ): Promise<OperationRow> => {
     const row = await findById(input.id);
-    if (!row) throw operationNotFound();
+    if (!row || hidden(row, admitInternal)) throw operationNotFound();
     if ("proof" in input) {
       const proof = typeof input.proof === "string" && proofPattern.test(input.proof) ? input.proof : null;
       if (!proof || !row.browserProofHash || !timingSafeEqual(await sha256Hex(proof), row.browserProofHash))
@@ -833,7 +1057,8 @@ export const createOperationsService = (
       browserProof: pending && row.browserProofHash ? await browserProofFor(token) : null,
       userCode: pending && row.userCodeHash ? await userCodeFor(token) : null,
       record: parseJson(row.outcome),
-      collect: sealLive(row, now) ? (row.loopbackRedirect ? "redeem" : "poll") : null,
+      collect:
+        sealLive(row, now) && deliverMode(row) !== "reveal" ? (row.loopbackRedirect ? "redeem" : "poll") : null,
     };
   };
 
@@ -855,10 +1080,11 @@ export const createOperationsService = (
 
     // Cleared by a guarded write that names the sealed value itself, so of
     // two polls racing only the one whose write changed the row hands it over
-    // — and only while the credential that opened it is still live.
+    // — and only while the credential that opened it is still live. Only the
+    // outcome goes: the seal window, which bounds replay, runs on.
     const taken = await db
       .update(operation)
-      .set({ sealedOutcome: null, sealedUntil: null, updatedAt: new Date(now) })
+      .set({ sealedOutcome: null, updatedAt: new Date(now) })
       .where(
         and(
           eq(operation.id, row.id),
@@ -874,13 +1100,18 @@ export const createOperationsService = (
   };
 
   const operationGuard = alias(operation, "cf_auth_operation_guard");
+  const revealOrganization = alias(tables.organization, "cf_auth_reveal_organization");
 
-  /** True while the operation is in `state` — and, if pending, inside its deadline by either clock. */
-  const stateSql = (id: string, state: "pending" | "completed", now: number): SQL =>
+  /**
+   * True while the operation is in `state` — and, if pending, inside its
+   * deadline by either clock, and held by `claim` when one is given.
+   */
+  const stateSql = (id: string, state: "pending" | "completed", now: number, claim?: string): SQL =>
     sql`exists (select 1 from ${operation} as ${sql.identifier("cf_auth_operation_guard")}
       where ${operationGuard.id} = ${id}
         and ${operationGuard.state} = ${state}
-        ${state === "pending" ? sql`and ${operationGuard.expiresAt} > ${sqliteNowMs(now)}` : sql``})`;
+        ${state === "pending" ? sql`and ${operationGuard.expiresAt} > ${sqliteNowMs(now)}` : sql``}
+        ${claim !== undefined ? sql`and ${operationGuard.executionClaim} = ${claim}` : sql``})`;
 
   /**
    * The opener's authority, rechecked at write time: the credential that
@@ -926,23 +1157,40 @@ export const createOperationsService = (
     });
   };
 
-  /**
-   * Refuses to release a sealed outcome the kind no longer considers
-   * deliverable, and drops it so nothing asks again.
-   */
-  const assertDeliverable = async (row: OperationRow, now: number) => {
-    const condition = kinds.get(row.kind)?.deliverable?.({
+  /** The kind's condition for handing a sealed outcome over, or undefined when it sets none. */
+  const deliverableSql = (row: OperationRow, now: number): SQL | undefined =>
+    kinds.get(row.kind)?.deliverable?.({
       operation: toRecord(row, now),
       record: parseJson(row.outcome),
       tables,
       now,
     });
-    if (!condition || (await holds(condition))) return;
+
+  /**
+   * Drops a sealed outcome that is no longer deliverable, so nothing asks
+   * again, and says so. Only the very ciphertext that was judged, on a row
+   * still completed: an outcome sealed afresh by `amend` meanwhile is a
+   * different one, and is left alone. The seal window runs on, so `execute`
+   * still replays the record through it.
+   */
+  const dropUndeliverable = async (id: string, sealed: string, now: number): Promise<never> => {
     await db
       .update(operation)
-      .set({ sealedOutcome: null, sealedUntil: null, redeemCodeHash: null, updatedAt: new Date(now) })
-      .where(eq(operation.id, row.id));
+      .set({ sealedOutcome: null, redeemCodeHash: null, updatedAt: new Date(now) })
+      .where(
+        and(eq(operation.id, id), eq(operation.state, "completed"), eq(operation.sealedOutcome, sealed)),
+      );
     throw operationExpired("This operation's outcome is no longer valid");
+  };
+
+  /**
+   * Refuses to release a sealed outcome the kind no longer considers
+   * deliverable, and drops it so nothing asks again.
+   */
+  const assertDeliverable = async (row: OperationRow, now: number) => {
+    const condition = deliverableSql(row, now);
+    if (!condition || row.sealedOutcome === null || (await holds(condition))) return;
+    await dropUndeliverable(row.id, row.sealedOutcome, now);
   };
 
   /** Whether a condition holds right now, for a read that has no write to carry it. */
@@ -956,10 +1204,51 @@ export const createOperationsService = (
     // `changes()` is the row count of the statement right before this one.
     statements.length > 0 ? [sql`changes() > 0`] : [];
 
-  const lastReturnedOne = (results: unknown[]) => {
-    const last = results.at(-1);
-    return Array.isArray(last) && last.length === 1;
+  /**
+   * The statement that makes a refused write abort its whole batch. It goes
+   * right after the guarded write it vouches for, and inserts a row only when
+   * that write changed none (`changes() = 0`) — a row of nulls, which the
+   * primary key's NOT NULL always refuses. The error rolls back every
+   * statement before it, so a caller's statements never outlive a completion
+   * that did not land, even one whose statements deleted the operation
+   * itself. A D1 batch, like a libsql one, rolls back on an error and on
+   * nothing less.
+   */
+  const assertLanded = () => guardedInsert(db, operation, {}, sql`changes() = 0`);
+
+  const refusalMessage = `NOT NULL constraint failed: ${getTableName(operation)}.id`;
+  /** Whether a batch failed on {@link assertLanded}, wrapped by however many layers the driver adds. */
+  const isRefusedLanding = (error: unknown): boolean => {
+    for (let current = error, depth = 0; current && depth < 8; depth += 1) {
+      const message = (current as { message?: unknown }).message;
+      if (typeof message === "string" && message.includes(refusalMessage)) return true;
+      current = (current as { cause?: unknown }).cause;
+    }
+    return false;
   };
+
+  /**
+   * Runs `statements`, then `write`, then {@link assertLanded}, as one batch.
+   * Answers whether `write` changed a row; when it did not, nothing in the
+   * batch was kept.
+   */
+  const runGuarded = async (statements: readonly unknown[], write: unknown): Promise<boolean> => {
+    let results: unknown[];
+    try {
+      results = await runBatch(db, [...statements, write, assertLanded()]);
+    } catch (error) {
+      if (isRefusedLanding(error)) return false;
+      throw error;
+    }
+    const landed = results.at(-2);
+    return Array.isArray(landed) && landed.length === 1;
+  };
+
+  /**
+   * `retain_until` moved out to at least `until`, so the sweep cannot delete a
+   * record while a seal on it — and the replay it bounds — is still live.
+   */
+  const retainThrough = (until: Date): SQL => sql`max(${operation.retainUntil}, ${until.getTime()})`;
 
   /**
    * Completes the operation in one batch with the statements that carry it
@@ -974,14 +1263,18 @@ export const createOperationsService = (
       statements: readonly unknown[];
       guard: SQL;
       organizationId: string | null;
-      decidedByUserId: string | null;
+      /** Who decided it; SQL for one that may have been deleted meanwhile. */
+      decidedByUserId: string | SQL | null;
       redeemCodeHash: string | null;
+      /** The execution claim the completion must still find, which it then clears. */
+      claim?: string;
       now: number;
     },
   ): Promise<boolean> => {
     const sealed = input.seal
       ? await sealText(config.secret, row.id, JSON.stringify(input.outcome ?? null))
       : null;
+    const sealedUntil = sealed ? new Date(input.now + settings.sealTtlMs) : null;
     const stored = input.seal
       ? input.record === undefined
         ? null
@@ -994,21 +1287,24 @@ export const createOperationsService = (
         organizationId: input.organizationId,
         outcome: stored,
         sealedOutcome: sealed,
-        sealedUntil: sealed ? new Date(input.now + settings.sealTtlMs) : null,
+        sealedUntil,
         redeemCodeHash: input.redeemCodeHash,
         decidedByUserId: input.decidedByUserId,
+        executionClaim: null,
         updatedAt: new Date(input.now),
+        ...(sealedUntil ? { retainUntil: retainThrough(sealedUntil) } : {}),
       })
       .where(
         and(
           eq(operation.id, row.id),
           eq(operation.state, "pending"),
+          ...(input.claim !== undefined ? [eq(operation.executionClaim, input.claim)] : []),
           input.guard,
           ...lastChanged(input.statements),
         ),
       )
       .returning({ id: operation.id });
-    return lastReturnedOne(await runBatch(db, [...input.statements, completion]));
+    return runGuarded(input.statements, completion);
   };
 
   /** Explains a guarded write that changed nothing. */
@@ -1045,568 +1341,957 @@ export const createOperationsService = (
     }
   };
 
-  return {
-    kinds,
+  /**
+   * Holds a caller to what a kind asks of its opener — the role in its current
+   * organization, the grant, a live credential, an organization in time — and
+   * answers what the row binds.
+   */
+  const bindOpener = (
+    kind: OperationKind & { open: { minRole: OrganizationRole } },
+    opener: AuthState | null | undefined,
+  ) => {
+    if (!opener) throw unauthorized();
+    const { user, organization } = requireOrganization(opener, kind.open.minRole);
+    if (!hasGrantAtLeast(opener.grant, openerGrant(kind))) throw grantInsufficient();
+    const credentialId = opener.actor?.credentialId;
+    if (!user || !credentialId) throw unauthorized();
+    if (isOrganizationExpired(organization)) throw organizationExpired();
+    return {
+      openerUserId: user.id,
+      openerCredentialId: credentialId,
+      organizationId: organization.id,
+      openerKey: `user:${user.id}`,
+    };
+  };
 
-    async open(input) {
-      requireEnabled();
-      const kind = kindOf(input.kind);
-      if (typeof input.token !== "string" || !tokenPattern.test(input.token)) {
-        throw validationError("The operation token must be 32–256 base64url characters");
-      }
-      if (input.id !== undefined && (typeof input.id !== "string" || !idPattern.test(input.id))) {
-        throw validationError(
-          "An operation id is 1–128 letters, digits, `:`, `_`, `.` or `-`",
-        );
-      }
-      const payload = parsePayload(kind, input.payload);
+  /**
+   * The pending caps a new row of this kind must fit under, as the condition of
+   * its insert, so two openers racing for the last slot cannot both take it.
+   * Only rows of kinds that count take a slot; a kind that does not count is
+   * not held to the caps either.
+   */
+  const pendingCaps = (
+    kind: OperationKind,
+    organizationId: string | null,
+    openerKey: string | null,
+    now: number,
+  ): SQL => {
+    if (!countsTowardPending(kind)) return sql`1`;
+    const cap = alias(operation, "cf_auth_operation_cap");
+    const counting = sql.join(
+      countingKinds.map((name) => sql`${name}`),
+      sql`, `,
+    );
+    const pendingBelow = (column: SQL, value: string, limit: number) =>
+      sql`(select count(*) from ${operation} as ${sql.identifier("cf_auth_operation_cap")}
+        where ${column} = ${value} and ${cap.state} = 'pending' and ${cap.expiresAt} > ${now}
+          and ${cap.kind} in (${counting})) < ${limit}`;
+    const caps = [
+      ...(organizationId
+        ? [pendingBelow(sql`${cap.organizationId}`, organizationId, settings.limits.pendingPerOrganization)]
+        : []),
+      ...(openerKey ? [pendingBelow(sql`${cap.openerKey}`, openerKey, settings.limits.pendingPerOpener)] : []),
+    ];
+    return caps.length > 0 ? and(...caps)! : sql`1`;
+  };
 
-      const label = clientText(input.client?.label, "client.label") ?? null;
-      if (kind.requireClientLabel && !label) throw validationError("client.label is required");
-      if (label && label.length > 200) throw validationError("client.label is too long");
-      const rawMeta = input.client?.meta ?? null;
-      const meta: OperationClientMeta = {};
-      if (rawMeta) {
-        const os = clientText(rawMeta.os, "client.meta.os");
-        const ip = clientText(rawMeta.ip, "client.meta.ip");
-        const userAgent = clientText(rawMeta.userAgent, "client.meta.userAgent");
-        if (os) meta.os = os;
-        if (ip) meta.ip = ip;
-        if (userAgent) meta.userAgent = userAgent;
-      }
-      const metaJson = Object.keys(meta).length > 0 ? JSON.stringify(meta) : null;
-      const loopback = input.client?.loopbackRedirect
-        ? normalizeLoopbackRedirect(input.client.loopbackRedirect)
-        : null;
-      if (loopback && !kind.browser) {
-        throw validationError("A loopback redirect needs a kind with a browser step");
-      }
+  /**
+   * Answers a completed execution again, without running anything: its
+   * record, never its sealed outcome, for as long as the seal window lasts
+   * (`sealed_until`). A reveal spends the sealed outcome but leaves the
+   * window, so the record is replayed through it either way.
+   */
+  const replayExecution = (row: OperationRow, now: number): ExecutedOperation<never> => {
+    if (row.sealedUntil === null || row.sealedUntil.getTime() <= now) {
+      throw alreadyCompleted("This operation has already been executed and its replay window has passed");
+    }
+    return { id: row.id, state: "completed", record: parseJson(row.outcome), replayed: true };
+  };
 
-      let openerUserId: string | null = null;
-      let openerCredentialId: string | null = null;
-      let organizationId: string | null = null;
-      if (
-        input.rateLimitKey !== undefined &&
-        input.rateLimitKey !== null &&
-        (typeof input.rateLimitKey !== "string" || input.rateLimitKey.length > 256)
-      ) {
-        throw validationError("rateLimitKey must be a string of at most 256 characters");
-      }
-      // Only what the app vouches for: `client.meta` is the client's own say-so.
-      let openerKey: string | null = input.rateLimitKey ? `key:${input.rateLimitKey}` : null;
-      if (kind.open !== "public") {
-        const opener = input.opener;
-        if (!opener) throw unauthorized();
-        const { user, organization } = requireOrganization(opener, kind.open.minRole);
-        if (!hasGrantAtLeast(opener.grant, openerGrant(kind))) throw grantInsufficient();
-        const credentialId = opener.actor?.credentialId;
-        if (!user || !credentialId) throw unauthorized();
-        if (isOrganizationExpired(organization)) throw organizationExpired();
-        openerUserId = user.id;
-        openerCredentialId = credentialId;
-        organizationId = organization.id;
-        openerKey = `user:${user.id}`;
-      }
-
-      const now = Date.now();
-      const id = input.id ?? crypto.randomUUID();
-      const pollTokenHash = await sha256Hex(input.token);
-      const requestHash = await sha256Hex(
-        JSON.stringify([kind.name, payload, openerUserId, organizationId]),
+  /** Whether a stored kind can be reserved and executed: one a caller opens, with no browser step. */
+  const assertReservable = (kind: OperationKind, what: "reserved" | "executed") => {
+    if (kind.open === "public" || kind.browser) {
+      throw validationError(
+        `Operation kind \`${kind.name}\` cannot be ${what}: only a kind a caller opens, with no browser step, can`,
       );
-      const browserProofHash = kind.browser ? await sha256Hex(await browserProofFor(input.token)) : null;
-      const userCode = kind.browser && kind.userCode ? await userCodeFor(input.token) : null;
-      const codeHash = userCode ? await userCodeHash(normalizeUserCode(userCode)!) : null;
+    }
+    return { ...kind, open: kind.open };
+  };
 
-      const cap = alias(operation, "cf_auth_operation_cap");
-      // Only rows of kinds that count take a slot; a kind that does not count
-      // is not held to the caps either.
-      const counting = sql.join(
-        countingKinds.map((name) => sql`${name}`),
-        sql`, `,
-      );
-      const pendingBelow = (column: SQL, value: string, limit: number) =>
-        sql`(select count(*) from ${operation} as ${sql.identifier("cf_auth_operation_cap")}
-          where ${column} = ${value} and ${cap.state} = 'pending' and ${cap.expiresAt} > ${now}
-            and ${cap.kind} in (${counting})) < ${limit}`;
-      const caps = !countsTowardPending(kind) ? [] : [
-        ...(organizationId
-          ? [pendingBelow(sql`${cap.organizationId}`, organizationId, settings.limits.pendingPerOrganization)]
-          : []),
-        ...(openerKey
-          ? [pendingBelow(sql`${cap.openerKey}`, openerKey, settings.limits.pendingPerOpener)]
-          : []),
-      ];
+  /**
+   * One door onto the engine. `cfAuth.operations` is the one that does not
+   * admit internal kinds; cf-auth's own flows hold the one that does.
+   */
+  const door = (admitInternal: boolean): CfAuthOperations => {
+    /** A kind `open` or `reserve` may start through this door. */
+    const startableKind = (name: string): OperationKind => {
+      if (!admitInternal && typeof name === "string" && isInternalOperationKind(name)) {
+        throw validationError(`Operation kind \`${name}\` is internal to cf-auth and cannot be started here`);
+      }
+      return kindOf(name);
+    };
 
-      // Guarded by the caps, so they are judged by the insert itself: two
-      // clients racing for the last slot cannot both take it. The conflict
-      // clause covers a retry racing on the same token, which then finds the
-      // row the other one wrote.
-      await guardedInsert(
-        db,
-        operation,
-        {
-          id,
-          kind: kind.name,
-          state: "pending",
-          openerUserId,
-          openerCredentialId,
-          organizationId,
-          openerKey,
-          requestHash,
-          pollTokenHash,
-          browserProofHash,
-          userCodeHash: codeHash,
-          userCodeSealed: userCode
-            ? await sealText(config.secret, userCodeContext(id), userCode)
-            : null,
-          clientLabel: label,
-          clientMeta: metaJson,
-          loopbackRedirect: loopback,
-          payload,
-          createdAt: new Date(now),
-          updatedAt: new Date(now),
-          expiresAt: new Date(now + pendingTtl(kind)),
-          retainUntil: new Date(now + recordTtl(kind)),
-        },
-        caps.length > 0 ? and(...caps)! : sql`1`,
-      ).onConflictDoNothing();
+    /** The row an id names through this door, or `404`. */
+    const visibleRow = async (id: string): Promise<OperationRow> => {
+      const row = await findById(id);
+      if (!row || hidden(row, admitInternal)) throw operationNotFound();
+      return row;
+    };
 
-      const row = await findByTokenHash(pollTokenHash);
-      if (!row) {
-        if (input.id !== undefined && (await findById(input.id))) {
-          throw conflict("This operation id is already in use");
+    return {
+      kinds: admitInternal
+        ? kinds
+        : new Map([...kinds].filter(([name]) => !isInternalOperationKind(name))),
+
+      async open(input) {
+        requireEnabled();
+        const kind = startableKind(input.kind);
+        if (typeof input.token !== "string" || !tokenPattern.test(input.token)) {
+          throw validationError("The operation token must be 32–256 base64url characters");
         }
+        if (input.id !== undefined && (typeof input.id !== "string" || !idPattern.test(input.id))) {
+          throw validationError(
+            "An operation id is 1–128 letters, digits, `:`, `_`, `.` or `-`",
+          );
+        }
+        const payload = parsePayload(kind, input.payload);
+
+        const label = clientText(input.client?.label, "client.label") ?? null;
+        if (kind.requireClientLabel && !label) throw validationError("client.label is required");
+        if (label && label.length > 200) throw validationError("client.label is too long");
+        const rawMeta = input.client?.meta ?? null;
+        const meta: OperationClientMeta = {};
+        if (rawMeta) {
+          const os = clientText(rawMeta.os, "client.meta.os");
+          const ip = clientText(rawMeta.ip, "client.meta.ip");
+          const userAgent = clientText(rawMeta.userAgent, "client.meta.userAgent");
+          if (os) meta.os = os;
+          if (ip) meta.ip = ip;
+          if (userAgent) meta.userAgent = userAgent;
+        }
+        const metaJson = Object.keys(meta).length > 0 ? JSON.stringify(meta) : null;
+        const loopback = input.client?.loopbackRedirect
+          ? normalizeLoopbackRedirect(input.client.loopbackRedirect)
+          : null;
+        if (loopback && !kind.browser) {
+          throw validationError("A loopback redirect needs a kind with a browser step");
+        }
+
+        let openerUserId: string | null = null;
+        let openerCredentialId: string | null = null;
+        let organizationId: string | null = null;
         if (
-          codeHash &&
-          (await db
-            .select({ id: operation.id })
-            .from(operation)
-            .where(and(eq(operation.userCodeHash, codeHash), eq(operation.state, "pending")))
-            .get())
+          input.rateLimitKey !== undefined &&
+          input.rateLimitKey !== null &&
+          (typeof input.rateLimitKey !== "string" || input.rateLimitKey.length > 256)
         ) {
-          throw conflict("This token's user code is taken; open the operation with a new token");
+          throw validationError("rateLimitKey must be a string of at most 256 characters");
         }
-        throw tooManyPending();
-      }
-      // Judged on the row as stored: of two requests racing on one token, the
-      // one whose insert was ignored must not pass for the one that landed.
-      if (
-        row.kind !== kind.name ||
-        row.requestHash !== requestHash ||
-        (input.id !== undefined && row.id !== input.id)
-      ) {
-        throw conflict("This operation token is already bound to a different request");
-      }
-      // A retry is answered as a poll would be, so a client whose response
-      // was lost recovers a completed operation the same way either way.
-      return collectingView(row, input.token, now);
-    },
-
-    async poll(input) {
-      requireEnabled();
-      const row = await rowForToken(input.id, input.token);
-      return collectingView(row, input.token, Date.now());
-    },
-
-    async findByToken(input) {
-      requireEnabled();
-      if (typeof input.token !== "string" || !tokenPattern.test(input.token)) return null;
-      const row = await findByTokenHash(await sha256Hex(input.token));
-      return row ? view(row, input.token, Date.now()) : null;
-    },
-
-    async details(input) {
-      requireEnabled();
-      const row = await rowForBrowser(input);
-      const kind = kindOf(row.kind);
-      const now = Date.now();
-      const record = toRecord(row, now);
-      const viewer = interactiveViewer(input.viewer);
-      let userCode: string | null = null;
-      if (row.userCodeSealed) {
-        try {
-          userCode = await openText(config.secret, userCodeContext(row.id), row.userCodeSealed);
-        } catch {
-          // `secret` changed since it was sealed. The page still works; it
-          // just cannot echo the code the terminal shows.
-          userCode = null;
+        // Only what the app vouches for: `client.meta` is the client's own say-so.
+        let openerKey: string | null = input.rateLimitKey ? `key:${input.rateLimitKey}` : null;
+        if (kind.open !== "public") {
+          ({ openerUserId, openerCredentialId, organizationId, openerKey } = bindOpener(
+            { ...kind, open: kind.open },
+            input.opener,
+          ));
         }
-      }
-      return {
-        id: row.id,
-        kind: row.kind,
-        state: record.state,
-        payload: kind.showPayload ? kind.showPayload(record.payload) : record.payload,
-        client: record.client,
-        organization: row.organizationId ? await repository.findOrganization(row.organizationId) : null,
-        viewer: viewer ? { user: viewer.user!, memberships: viewer.memberships } : null,
-        userCode,
-        approver: approverMode(kind),
-        takesInput: kind.input !== undefined,
-        createdAt: record.createdAt,
-        expiresAt: record.expiresAt,
-        hasLoopbackRedirect: record.hasLoopbackRedirect,
-        blockedBy:
-          record.state === "pending" && kind.refusal
-            ? await kind.refusal({ operation: record, payload: record.payload, viewer })
-            : null,
-      };
-    },
 
-    async approve(input) {
-      requireEnabled();
-      const row = await rowForBrowser(input);
-      const kind = kindOf(row.kind);
-      const now = Date.now();
-      assertPending(row, now);
-      const mode = approverMode(kind);
-      if (mode === "proof" && !("proof" in input)) {
-        throw invalidProof("This operation is approved with its browser proof, not a user code");
-      }
-      const submitted = parseInput(kind, input.input);
-      const record = toRecord(row, now);
-      const requested = input.organizationId ?? null;
-      if (row.organizationId && requested && requested !== row.organizationId) {
-        throw forbidden("This operation belongs to another organization");
-      }
+        const now = Date.now();
+        const id = input.id ?? crypto.randomUUID();
+        const pollTokenHash = await sha256Hex(input.token);
+        const requestHash = await sha256Hex(
+          JSON.stringify([kind.name, payload, openerUserId, organizationId]),
+        );
+        const browserProofHash = kind.browser ? await sha256Hex(await browserProofFor(input.token)) : null;
+        const userCode = kind.browser && kind.userCode ? await userCodeFor(input.token) : null;
+        const codeHash = userCode ? await userCodeHash(normalizeUserCode(userCode)!) : null;
 
-      let actor: AuthState | null = null;
-      let user: AuthUser | null = null;
-      let membership: OrganizationMembership | null = null;
-      let organizationId = row.organizationId;
-      let approverSql: SQL | undefined;
+        // Guarded by the caps, so they are judged by the insert itself: two
+        // clients racing for the last slot cannot both take it. The conflict
+        // clause covers a retry racing on the same token, which then finds the
+        // row the other one wrote.
+        await guardedInsert(
+          db,
+          operation,
+          {
+            id,
+            kind: kind.name,
+            state: "pending",
+            openerUserId,
+            openerCredentialId,
+            organizationId,
+            openerKey,
+            requestHash,
+            pollTokenHash,
+            browserProofHash,
+            userCodeHash: codeHash,
+            userCodeSealed: userCode
+              ? await sealText(config.secret, userCodeContext(id), userCode)
+              : null,
+            clientLabel: label,
+            clientMeta: metaJson,
+            loopbackRedirect: loopback,
+            payload,
+            createdAt: new Date(now),
+            updatedAt: new Date(now),
+            expiresAt: new Date(now + pendingTtl(kind)),
+            retainUntil: new Date(now + recordTtl(kind)),
+          },
+          pendingCaps(kind, organizationId, openerKey, now),
+        ).onConflictDoNothing();
 
-      if (mode === "proof" && !row.organizationId && requested) {
-        // Nobody signed in to vouch for a membership, so there is no
-        // organization this approval could be allowed to choose.
-        throw validationError("A proof-approved operation cannot be approved into an organization");
-      }
-
-      if (mode === "session") {
-        const { userId, sessionId } = requireInteractiveSession(input.actor ?? createEmptyAuthState());
-        actor = input.actor!;
-        user = actor.user;
-        organizationId = row.organizationId ?? requested;
-        const minRole = approverMinRole(kind);
-        if (minRole !== null && !organizationId) {
-          throw validationError("organizationId is required to approve this operation");
-        }
-        // Any organization the approval acts in — fixed by the opener or
-        // chosen here — must be one the approver belongs to: with the kind's
-        // role, or any role when it names none. That is also what keeps an id
-        // nobody holds from reaching the foreign key.
-        const allowedRoles = minRole === null ? organizationRoles : rolesAtLeast(minRole);
-        if (organizationId && (minRole !== null || !row.organizationId)) {
-          membership = await repository.findMembership(userId, organizationId);
-          if (!membership || !allowedRoles.includes(membership.role)) {
-            throw new CfAuthError(
-              "not_a_member",
-              minRole === null
-                ? "Approving needs a membership in this organization"
-                : `Approving needs the ${minRole} role or higher in this organization`,
-              403,
-            );
+        const row = await findByTokenHash(pollTokenHash);
+        if (!row) {
+          if (input.id !== undefined && (await findById(input.id))) {
+            throw conflict("This operation id is already in use");
           }
-          if (isOrganizationExpired(membership.organization)) throw organizationExpired();
-          approverSql = credentialAuthoritySql(tables, {
-            organizationId,
-            userId,
-            credentialId: sessionId,
-            allowedRoles,
-            nowMs: now,
-          });
-        } else {
-          approverSql = liveHumanSessionSql(tables, { userId, sessionId, nowMs: now });
+          if (
+            codeHash &&
+            (await db
+              .select({ id: operation.id })
+              .from(operation)
+              .where(and(eq(operation.userCodeHash, codeHash), eq(operation.state, "pending")))
+              .get())
+          ) {
+            throw conflict("This token's user code is taken; open the operation with a new token");
+          }
+          throw tooManyPending();
         }
-      }
+        // Judged on the row as stored: of two requests racing on one token, the
+        // one whose insert was ignored must not pass for the one that landed.
+        if (
+          row.kind !== kind.name ||
+          row.requestHash !== requestHash ||
+          (input.id !== undefined && row.id !== input.id)
+        ) {
+          throw conflict("This operation token is already bound to a different request");
+        }
+        // A retry is answered as a poll would be, so a client whose response
+        // was lost recovers a completed operation the same way either way.
+        return collectingView(row, input.token, now);
+      },
 
-      const refusal = kind.refusal
-        ? await kind.refusal({ operation: record, payload: record.payload, viewer: interactiveViewer(input.actor) })
-        : null;
-      if (refusal) {
-        throw new CfAuthError(refusal, "This operation cannot be approved from this session", 403);
-      }
+      async poll(input) {
+        requireEnabled();
+        const row = await rowForToken(input.id, input.token, admitInternal);
+        return collectingView(row, input.token, Date.now());
+      },
 
-      const opener = openerSql(kind, row, now);
-      const guard = and(
-        stateSql(row.id, "pending", now),
-        ...(approverSql ? [approverSql] : []),
-        ...(opener ? [opener] : []),
-      )!;
+      async findByToken(input) {
+        requireEnabled();
+        if (typeof input.token !== "string" || !tokenPattern.test(input.token)) return null;
+        const row = await findByTokenHash(await sha256Hex(input.token));
+        return row && !hidden(row, admitInternal) ? view(row, input.token, Date.now()) : null;
+      },
 
-      const result: OperationApproveResult = kind.approve
-        ? await kind.approve({
-            operation: record,
-            payload: record.payload,
-            input: submitted,
-            actor,
-            user,
-            organizationId,
-            membership,
+      async details(input) {
+        requireEnabled();
+        const row = await rowForBrowser(input, admitInternal);
+        const kind = kindOf(row.kind);
+        const now = Date.now();
+        const record = toRecord(row, now);
+        const viewer = interactiveViewer(input.viewer);
+        let userCode: string | null = null;
+        if (row.userCodeSealed) {
+          try {
+            userCode = await openText(config.secret, userCodeContext(row.id), row.userCodeSealed);
+          } catch {
+            // `secret` changed since it was sealed. The page still works; it
+            // just cannot echo the code the terminal shows.
+            userCode = null;
+          }
+        }
+        return {
+          id: row.id,
+          kind: row.kind,
+          state: record.state,
+          payload: kind.showPayload ? kind.showPayload(record.payload) : record.payload,
+          client: record.client,
+          organization: row.organizationId ? await repository.findOrganization(row.organizationId) : null,
+          viewer: viewer ? { user: viewer.user!, memberships: viewer.memberships } : null,
+          userCode,
+          approver: approverMode(kind),
+          takesInput: kind.input !== undefined,
+          createdAt: record.createdAt,
+          expiresAt: record.expiresAt,
+          hasLoopbackRedirect: record.hasLoopbackRedirect,
+          blockedBy:
+            record.state === "pending" && kind.refusal
+              ? await kind.refusal({ operation: record, payload: record.payload, viewer })
+              : null,
+        };
+      },
+
+      async approve(input) {
+        requireEnabled();
+        const row = await rowForBrowser(input, admitInternal);
+        const kind = kindOf(row.kind);
+        const now = Date.now();
+        assertPending(row, now);
+        const mode = approverMode(kind);
+        if (mode === "proof" && !("proof" in input)) {
+          throw invalidProof("This operation is approved with its browser proof, not a user code");
+        }
+        const submitted = parseInput(kind, input.input);
+        const record = toRecord(row, now);
+        const requested = input.organizationId ?? null;
+        if (row.organizationId && requested && requested !== row.organizationId) {
+          throw forbidden("This operation belongs to another organization");
+        }
+
+        let actor: AuthState | null = null;
+        let user: AuthUser | null = null;
+        let membership: OrganizationMembership | null = null;
+        let organizationId = row.organizationId;
+        let approverSql: SQL | undefined;
+
+        if (mode === "proof" && !row.organizationId && requested) {
+          // Nobody signed in to vouch for a membership, so there is no
+          // organization this approval could be allowed to choose.
+          throw validationError("A proof-approved operation cannot be approved into an organization");
+        }
+
+        if (mode === "session") {
+          const { userId, sessionId } = requireInteractiveSession(input.actor ?? createEmptyAuthState());
+          actor = input.actor!;
+          user = actor.user;
+          organizationId = row.organizationId ?? requested;
+          const minRole = approverMinRole(kind);
+          if (minRole !== null && !organizationId) {
+            throw validationError("organizationId is required to approve this operation");
+          }
+          // Any organization the approval acts in — fixed by the opener or
+          // chosen here — must be one the approver belongs to: with the kind's
+          // role, or any role when it names none. That is also what keeps an id
+          // nobody holds from reaching the foreign key.
+          const allowedRoles = minRole === null ? organizationRoles : rolesAtLeast(minRole);
+          if (organizationId && (minRole !== null || !row.organizationId)) {
+            membership = await repository.findMembership(userId, organizationId);
+            if (!membership || !allowedRoles.includes(membership.role)) {
+              throw new CfAuthError(
+                "not_a_member",
+                minRole === null
+                  ? "Approving needs a membership in this organization"
+                  : `Approving needs the ${minRole} role or higher in this organization`,
+                403,
+              );
+            }
+            if (isOrganizationExpired(membership.organization)) throw organizationExpired();
+            approverSql = credentialAuthoritySql(tables, {
+              organizationId,
+              userId,
+              credentialId: sessionId,
+              allowedRoles,
+              nowMs: now,
+            });
+          } else {
+            approverSql = liveHumanSessionSql(tables, { userId, sessionId, nowMs: now });
+          }
+        }
+
+        const refusal = kind.refusal
+          ? await kind.refusal({ operation: record, payload: record.payload, viewer: interactiveViewer(input.actor) })
+          : null;
+        if (refusal) {
+          throw new CfAuthError(refusal, "This operation cannot be approved from this session", 403);
+        }
+
+        const opener = openerSql(kind, row, now);
+        const guard = and(
+          stateSql(row.id, "pending", now),
+          ...(approverSql ? [approverSql] : []),
+          ...(opener ? [opener] : []),
+        )!;
+
+        const result: OperationApproveResult = kind.approve
+          ? await kind.approve({
+              operation: record,
+              payload: record.payload,
+              input: submitted,
+              actor,
+              user,
+              organizationId,
+              membership,
+              guard,
+              db,
+              tables,
+              now,
+            })
+          : { outcome: null };
+
+        const redeemCode = row.loopbackRedirect ? randomToken(32) : null;
+        const completed = await commit(row, {
+          outcome: result.outcome,
+          seal: result.seal ?? false,
+          record: result.record,
+          statements: result.statements ?? [],
+          guard,
+          organizationId,
+          decidedByUserId: user?.id ?? null,
+          redeemCodeHash: redeemCode ? await sha256Hex(redeemCode) : null,
+          now,
+        });
+        if (!completed) await explainRefusedWrite(row.id, now);
+        await afterCommit(result.afterCommit);
+
+        let redirectUrl: string | null = null;
+        if (row.loopbackRedirect && redeemCode) {
+          const url = new URL(row.loopbackRedirect);
+          url.searchParams.set("code", redeemCode);
+          redirectUrl = url.toString();
+        }
+        return {
+          id: row.id,
+          kind: row.kind,
+          state: "completed",
+          organizationId,
+          redeemCode,
+          redirectUrl,
+        };
+      },
+
+      async deny(input) {
+        requireEnabled();
+        const row = await rowForBrowser(input, admitInternal);
+        if (approverMode(kindOf(row.kind)) === "proof" && !("proof" in input)) {
+          throw invalidProof("This operation is answered with its browser proof, not a user code");
+        }
+        const now = Date.now();
+        if (row.state === "denied") return { id: row.id, kind: row.kind, state: "denied" };
+        assertPending(row, now);
+        const actor = input.actor;
+        const decidedBy =
+          actor?.authenticated && actor.assurance === "interactive" && actor.user?.kind === "human"
+            ? actor.user.id
+            : null;
+        const denied = await db
+          .update(operation)
+          .set({ state: "denied", decidedByUserId: decidedBy, updatedAt: new Date(now) })
+          .where(and(eq(operation.id, row.id), stateSql(row.id, "pending", now)))
+          .returning({ id: operation.id });
+        if (denied.length !== 1) {
+          const current = await findById(row.id);
+          if (current?.state === "denied") return { id: row.id, kind: row.kind, state: "denied" };
+          await explainRefusedWrite(row.id, now);
+        }
+        return { id: row.id, kind: row.kind, state: "denied" };
+      },
+
+      async redeem(input) {
+        requireEnabled();
+        const row = await rowForToken(input.id, input.token, admitInternal);
+        const now = Date.now();
+        switch (effectiveState(row, now)) {
+          case "pending":
+            throw operationPending();
+          case "denied":
+            throw operationDenied();
+          case "expired":
+          case "retired":
+            throw operationExpired();
+          case "completed":
+            break;
+        }
+        if (!row.redeemCodeHash || deliverMode(row) === "reveal") {
+          throw alreadyCompleted(
+            "This operation's outcome has already been collected or is no longer available",
+          );
+        }
+        const code = typeof input.redeemCode === "string" ? input.redeemCode : "";
+        if (!tokenPattern.test(code) || !timingSafeEqual(await sha256Hex(code), row.redeemCodeHash)) {
+          throw invalidProof("The redeem code does not match this operation");
+        }
+        const sealed = row.sealedOutcome;
+        if (sealed !== null && !sealLive(row, now)) {
+          throw operationExpired("This operation's outcome is no longer available");
+        }
+        if (sealed !== null) await assertDeliverable(row, now);
+        // Opened before anything is spent, so a seal that cannot be read is
+        // reported rather than consumed.
+        const answer = {
+          id: row.id,
+          kind: row.kind,
+          organizationId: row.organizationId,
+          outcome: sealed !== null ? await openSealed({ ...row, sealedOutcome: sealed }) : parseJson(row.outcome),
+        };
+        const opener = openerSqlForRow(row, now);
+        const openerGone = () =>
+          operationExpired("The credential that opened this operation is no longer valid");
+        if (deliverMode(row) === "window") {
+          if (opener && !(await holds(opener))) throw openerGone();
+          return answer;
+        }
+
+        const taken = await db
+          .update(operation)
+          .set({ redeemCodeHash: null, sealedOutcome: null, updatedAt: new Date(now) })
+          .where(
+            and(
+              eq(operation.id, row.id),
+              eq(operation.state, "completed"),
+              eq(operation.redeemCodeHash, row.redeemCodeHash),
+              ...(opener ? [opener] : []),
+            ),
+          )
+          .returning({ id: operation.id });
+        if (taken.length !== 1) {
+          if (opener && !(await holds(opener))) throw openerGone();
+          throw alreadyCompleted("This operation's outcome has already been collected");
+        }
+        return answer;
+      },
+
+      async lookupByUserCode(input) {
+        requireEnabled();
+        const code = typeof input.userCode === "string" ? normalizeUserCode(input.userCode) : null;
+        if (!code) return null;
+        const hash = await userCodeHash(code);
+        const row = await db
+          .select()
+          .from(operation)
+          .where(and(eq(operation.userCodeHash, hash), eq(operation.state, "pending")))
+          .get();
+        const now = Date.now();
+        if (!row?.userCodeHash || !timingSafeEqual(hash, row.userCodeHash)) return null;
+        if (hidden(row, admitInternal)) return null;
+        if (effectiveState(row, now) !== "pending") return null;
+        return { id: row.id, kind: row.kind, expiresAt: iso(row.expiresAt) };
+      },
+
+      async guard(input) {
+        requireEnabled();
+        const row = await visibleRow(input.id);
+        const now = Date.now();
+        const opener = openerSql(kindOf(row.kind), row, now);
+        return and(stateSql(row.id, input.state ?? "pending", now), ...(opener ? [opener] : []))!;
+      },
+
+      async complete(input) {
+        requireEnabled();
+        const row = await visibleRow(input.id);
+        const kind = kindOf(row.kind);
+        if (kind.browser) {
+          throw validationError(`Operation kind \`${kind.name}\` is completed by approving it in a browser`);
+        }
+        const now = Date.now();
+        assertPending(row, now);
+        const opener = openerSql(kind, row, now);
+        const completed = await commit(row, {
+          outcome: input.outcome,
+          seal: input.seal ?? false,
+          record: input.record,
+          statements: input.statements ?? [],
+          guard: and(stateSql(row.id, "pending", now), ...(opener ? [opener] : []))!,
+          organizationId: row.organizationId,
+          decidedByUserId: null,
+          redeemCodeHash: null,
+          now,
+        });
+        if (!completed) await explainRefusedWrite(row.id, now);
+        const current = (await findById(row.id))!;
+        return {
+          id: current.id,
+          kind: current.kind,
+          state: effectiveState(current, now),
+          createdAt: iso(current.createdAt),
+          expiresAt: iso(current.expiresAt),
+          organizationId: current.organizationId,
+          browserProof: null,
+          userCode: null,
+          record: parseJson(current.outcome),
+          collect: sealLive(current, now) && deliverMode(current) !== "reveal" ? "poll" : null,
+        };
+      },
+
+      async amend(input) {
+        requireEnabled();
+        const row = await visibleRow(input.id);
+        switch (effectiveState(row, Date.now())) {
+          case "pending":
+            throw operationPending();
+          case "denied":
+            throw operationDenied();
+          case "expired":
+          case "retired":
+            throw operationExpired();
+          case "completed":
+            break;
+        }
+        const seal = input.seal ?? false;
+        if (input.outcome !== undefined && !seal && input.record !== undefined) {
+          throw validationError("An unsealed outcome is the record; pass one or the other");
+        }
+        const now = Date.now();
+        const changes: { [Column in keyof OperationRow]?: OperationRow[Column] | SQL } = {
+          updatedAt: new Date(now),
+        };
+        if (input.outcome !== undefined) {
+          if (seal) {
+            changes.sealedOutcome = await sealText(config.secret, row.id, JSON.stringify(input.outcome ?? null));
+            const sealedUntil = new Date(now + settings.sealTtlMs);
+            changes.sealedUntil = sealedUntil;
+            changes.retainUntil = retainThrough(sealedUntil);
+            // A loopback redirect's redeem code went with the first outcome, so
+            // a new one is collected by polling instead.
+            changes.loopbackRedirect = null;
+            changes.redeemCodeHash = null;
+          } else {
+            changes.outcome = JSON.stringify(input.outcome ?? null);
+          }
+        }
+        if (input.record !== undefined) changes.outcome = JSON.stringify(input.record);
+        const statements = input.statements ?? [];
+        const amendment = db
+          .update(operation)
+          .set(changes)
+          .where(
+            and(
+              eq(operation.id, row.id),
+              eq(operation.state, "completed"),
+              ...(input.condition ? [input.condition] : []),
+              ...lastChanged(statements),
+            ),
+          )
+          .returning({ id: operation.id });
+        return runGuarded(statements, amendment);
+      },
+
+      async retire(input) {
+        requireEnabled();
+        const retired = await db
+          .update(operation)
+          .set({
+            state: "retired",
+            sealedOutcome: null,
+            sealedUntil: null,
+            redeemCodeHash: null,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(operation.id, input.id),
+              ne(operation.state, "retired"),
+              ...(!admitInternal
+                ? [
+                    sql`substr(${operation.kind}, 1, ${internalOperationKindPrefix.length}) <> ${internalOperationKindPrefix}`,
+                  ]
+                : []),
+            ),
+          )
+          .returning({ id: operation.id });
+        return retired.length === 1;
+      },
+
+      sweepStatements,
+
+      async sweep(now) {
+        requireEnabled();
+        await runBatch(db, sweepStatements(now));
+      },
+
+      async status(input) {
+        requireEnabled();
+        const opener = input.opener;
+        const organizationId =
+          opener?.authenticated && opener.role ? (opener.organization?.id ?? null) : null;
+        const row = await findById(input.id);
+        // One answer for every way it is not yours to see, so it discloses
+        // nothing — not even that the id exists.
+        if (
+          !row ||
+          hidden(row, admitInternal) ||
+          row.organizationId === null ||
+          row.organizationId !== organizationId
+        ) {
+          throw operationNotFound();
+        }
+        return {
+          id: row.id,
+          kind: row.kind,
+          state: effectiveState(row, Date.now()),
+          createdAt: iso(row.createdAt),
+          expiresAt: iso(row.expiresAt),
+          organizationId: row.organizationId,
+          record: parseJson(row.outcome),
+        };
+      },
+
+      async reserve(input) {
+        requireEnabled();
+        const kind = assertReservable(startableKind(input.kind), "reserved");
+        const bound = bindOpener(kind, input.opener);
+        const payload = parsePayload(kind, input.input);
+        const now = Date.now();
+        const id = crypto.randomUUID();
+        // Made here, never by the caller: holding it is the whole authority to
+        // execute, so it must be as unguessable as an operation token.
+        const handle = randomToken(32);
+        const expiresAt = new Date(now + settings.reserveTtlMs);
+        const inserted = await guardedInsert(
+          db,
+          operation,
+          {
+            id,
+            kind: kind.name,
+            state: "pending",
+            ...bound,
+            requestHash: await sha256Hex(
+              JSON.stringify([kind.name, payload, bound.openerUserId, bound.organizationId]),
+            ),
+            pollTokenHash: await sha256Hex(handle),
+            payload,
+            createdAt: new Date(now),
+            updatedAt: new Date(now),
+            expiresAt,
+            // Never shorter than the reservation itself, so a pending one is
+            // not swept away before it lapses.
+            retainUntil: new Date(now + Math.max(recordTtl(kind), settings.reserveTtlMs)),
+          },
+          pendingCaps(kind, bound.organizationId, bound.openerKey, now),
+        ).returning({ id: operation.id });
+        if (inserted.length !== 1) throw tooManyPending();
+        return { id, handle, expiresAt: iso(expiresAt) };
+      },
+
+      async execute<Outcome = unknown>(
+        input: ExecuteOperationInput,
+        fn: ExecuteOperationFunction<unknown, Outcome>,
+      ): Promise<ExecutedOperation<Outcome>> {
+        requireEnabled();
+        const caller = input.opener;
+        if (!caller?.authenticated) throw unauthorized();
+        const handle = typeof input.handle === "string" && tokenPattern.test(input.handle) ? input.handle : null;
+        const row = handle ? await findByTokenHash(await sha256Hex(handle)) : null;
+        if (!row || hidden(row, admitInternal)) throw operationNotFound();
+        if (
+          row.kind !== input.kind ||
+          row.organizationId === null ||
+          row.organizationId !== caller.organization?.id
+        ) {
+          throw operationMismatch();
+        }
+        const kind = assertReservable(kindOf(row.kind), "executed");
+        // The caller is held to what reserving asked; the guard below then
+        // holds the credential that reserved it, at write time.
+        const executor = bindOpener(kind, caller);
+        const now = Date.now();
+        switch (effectiveState(row, now)) {
+          case "expired":
+          case "retired":
+            throw operationExpired();
+          case "denied":
+            throw operationDenied();
+          case "completed":
+            return replayExecution(row, now);
+          case "pending":
+            break;
+        }
+
+        // Claimed before `fn` runs, so of two calls racing on one handle only
+        // one ever runs it. The claim is a random value of this call's own,
+        // which the guard, the completion and the release all require: nothing
+        // but this call finishing or giving it back unlocks the reservation —
+        // not even deleting the user who executes it.
+        const claim = randomToken(32);
+        const claimed = await db
+          .update(operation)
+          .set({ executionClaim: claim, updatedAt: new Date(now) })
+          .where(
+            and(
+              eq(operation.id, row.id),
+              eq(operation.state, "pending"),
+              isNull(operation.executionClaim),
+              sql`${operation.expiresAt} > ${sqliteNowMs(now)}`,
+            ),
+          )
+          .returning({ id: operation.id });
+        if (claimed.length !== 1) {
+          const current = (await findById(row.id)) ?? row;
+          const state = effectiveState(current, now);
+          if (state === "completed") return replayExecution(current, now);
+          if (state === "pending" && current.executionClaim !== null) {
+            throw conflict("This operation is being executed; ask again shortly");
+          }
+          assertPending(current, now);
+          throw operationExpired();
+        }
+        /** Gives the claim back when this execution did not complete, so the handle can be tried again. */
+        const release = async () => {
+          try {
+            await db
+              .update(operation)
+              .set({ executionClaim: null })
+              .where(
+                and(
+                  eq(operation.id, row.id),
+                  eq(operation.state, "pending"),
+                  eq(operation.executionClaim, claim),
+                ),
+              );
+          } catch (error) {
+            config.onError(error, { scope: "operations.execute" });
+          }
+        };
+
+        const opener = openerSql(kind, row, now);
+        const guard = and(stateSql(row.id, "pending", now, claim), ...(opener ? [opener] : []))!;
+        let result: OperationApproveResult<Outcome>;
+        let completed: boolean;
+        try {
+          result = await fn({
+            operation: toRecord(row, now),
+            input: parseJson(row.payload),
             guard,
             db,
             tables,
             now,
-          })
-        : { outcome: null };
-
-      const redeemCode = row.loopbackRedirect ? randomToken(32) : null;
-      const completed = await commit(row, {
-        outcome: result.outcome,
-        seal: result.seal ?? false,
-        record: result.record,
-        statements: result.statements ?? [],
-        guard,
-        organizationId,
-        decidedByUserId: user?.id ?? null,
-        redeemCodeHash: redeemCode ? await sha256Hex(redeemCode) : null,
-        now,
-      });
-      if (!completed) await explainRefusedWrite(row.id, now);
-      await afterCommit(result.afterCommit);
-
-      let redirectUrl: string | null = null;
-      if (row.loopbackRedirect && redeemCode) {
-        const url = new URL(row.loopbackRedirect);
-        url.searchParams.set("code", redeemCode);
-        redirectUrl = url.toString();
-      }
-      return {
-        id: row.id,
-        kind: row.kind,
-        state: "completed",
-        organizationId,
-        redeemCode,
-        redirectUrl,
-      };
-    },
-
-    async deny(input) {
-      requireEnabled();
-      const row = await rowForBrowser(input);
-      if (approverMode(kindOf(row.kind)) === "proof" && !("proof" in input)) {
-        throw invalidProof("This operation is answered with its browser proof, not a user code");
-      }
-      const now = Date.now();
-      if (row.state === "denied") return { id: row.id, kind: row.kind, state: "denied" };
-      assertPending(row, now);
-      const actor = input.actor;
-      const decidedBy =
-        actor?.authenticated && actor.assurance === "interactive" && actor.user?.kind === "human"
-          ? actor.user.id
-          : null;
-      const denied = await db
-        .update(operation)
-        .set({ state: "denied", decidedByUserId: decidedBy, updatedAt: new Date(now) })
-        .where(and(eq(operation.id, row.id), stateSql(row.id, "pending", now)))
-        .returning({ id: operation.id });
-      if (denied.length !== 1) {
-        const current = await findById(row.id);
-        if (current?.state === "denied") return { id: row.id, kind: row.kind, state: "denied" };
-        await explainRefusedWrite(row.id, now);
-      }
-      return { id: row.id, kind: row.kind, state: "denied" };
-    },
-
-    async redeem(input) {
-      requireEnabled();
-      const row = await rowForToken(input.id, input.token);
-      const now = Date.now();
-      switch (effectiveState(row, now)) {
-        case "pending":
-          throw operationPending();
-        case "denied":
-          throw operationDenied();
-        case "expired":
-        case "retired":
-          throw operationExpired();
-        case "completed":
-          break;
-      }
-      if (!row.redeemCodeHash) {
-        throw alreadyCompleted(
-          "This operation's outcome has already been collected or is no longer available",
-        );
-      }
-      const code = typeof input.redeemCode === "string" ? input.redeemCode : "";
-      if (!tokenPattern.test(code) || !timingSafeEqual(await sha256Hex(code), row.redeemCodeHash)) {
-        throw invalidProof("The redeem code does not match this operation");
-      }
-      const sealed = row.sealedOutcome;
-      if (sealed !== null && !sealLive(row, now)) {
-        throw operationExpired("This operation's outcome is no longer available");
-      }
-      if (sealed !== null) await assertDeliverable(row, now);
-      // Opened before anything is spent, so a seal that cannot be read is
-      // reported rather than consumed.
-      const answer = {
-        id: row.id,
-        kind: row.kind,
-        organizationId: row.organizationId,
-        outcome: sealed !== null ? await openSealed({ ...row, sealedOutcome: sealed }) : parseJson(row.outcome),
-      };
-      const opener = openerSqlForRow(row, now);
-      const openerGone = () =>
-        operationExpired("The credential that opened this operation is no longer valid");
-      if (deliverMode(row) === "window") {
-        if (opener && !(await holds(opener))) throw openerGone();
-        return answer;
-      }
-
-      const taken = await db
-        .update(operation)
-        .set({ redeemCodeHash: null, sealedOutcome: null, sealedUntil: null, updatedAt: new Date(now) })
-        .where(
-          and(
-            eq(operation.id, row.id),
-            eq(operation.state, "completed"),
-            eq(operation.redeemCodeHash, row.redeemCodeHash),
-            ...(opener ? [opener] : []),
-          ),
-        )
-        .returning({ id: operation.id });
-      if (taken.length !== 1) {
-        if (opener && !(await holds(opener))) throw openerGone();
-        throw alreadyCompleted("This operation's outcome has already been collected");
-      }
-      return answer;
-    },
-
-    async lookupByUserCode(input) {
-      requireEnabled();
-      const code = typeof input.userCode === "string" ? normalizeUserCode(input.userCode) : null;
-      if (!code) return null;
-      const hash = await userCodeHash(code);
-      const row = await db
-        .select()
-        .from(operation)
-        .where(and(eq(operation.userCodeHash, hash), eq(operation.state, "pending")))
-        .get();
-      const now = Date.now();
-      if (!row?.userCodeHash || !timingSafeEqual(hash, row.userCodeHash)) return null;
-      if (effectiveState(row, now) !== "pending") return null;
-      return { id: row.id, kind: row.kind, expiresAt: iso(row.expiresAt) };
-    },
-
-    async guard(input) {
-      requireEnabled();
-      const row = await findById(input.id);
-      if (!row) throw operationNotFound();
-      const now = Date.now();
-      const opener = openerSql(kindOf(row.kind), row, now);
-      return and(stateSql(row.id, input.state ?? "pending", now), ...(opener ? [opener] : []))!;
-    },
-
-    async complete(input) {
-      requireEnabled();
-      const row = await findById(input.id);
-      if (!row) throw operationNotFound();
-      const kind = kindOf(row.kind);
-      if (kind.browser) {
-        throw validationError(`Operation kind \`${kind.name}\` is completed by approving it in a browser`);
-      }
-      const now = Date.now();
-      assertPending(row, now);
-      const opener = openerSql(kind, row, now);
-      const completed = await commit(row, {
-        outcome: input.outcome,
-        seal: input.seal ?? false,
-        record: input.record,
-        statements: input.statements ?? [],
-        guard: and(stateSql(row.id, "pending", now), ...(opener ? [opener] : []))!,
-        organizationId: row.organizationId,
-        decidedByUserId: null,
-        redeemCodeHash: null,
-        now,
-      });
-      if (!completed) await explainRefusedWrite(row.id, now);
-      const current = (await findById(row.id))!;
-      return {
-        id: current.id,
-        kind: current.kind,
-        state: effectiveState(current, now),
-        createdAt: iso(current.createdAt),
-        expiresAt: iso(current.expiresAt),
-        organizationId: current.organizationId,
-        browserProof: null,
-        userCode: null,
-        record: parseJson(current.outcome),
-        collect: sealLive(current, now) ? "poll" : null,
-      };
-    },
-
-    async amend(input) {
-      requireEnabled();
-      const row = await findById(input.id);
-      if (!row) throw operationNotFound();
-      switch (effectiveState(row, Date.now())) {
-        case "pending":
-          throw operationPending();
-        case "denied":
-          throw operationDenied();
-        case "expired":
-        case "retired":
-          throw operationExpired();
-        case "completed":
-          break;
-      }
-      const seal = input.seal ?? false;
-      if (input.outcome !== undefined && !seal && input.record !== undefined) {
-        throw validationError("An unsealed outcome is the record; pass one or the other");
-      }
-      const now = Date.now();
-      const changes: Partial<OperationRow> = { updatedAt: new Date(now) };
-      if (input.outcome !== undefined) {
-        if (seal) {
-          changes.sealedOutcome = await sealText(config.secret, row.id, JSON.stringify(input.outcome ?? null));
-          changes.sealedUntil = new Date(now + settings.sealTtlMs);
-          // A loopback redirect's redeem code went with the first outcome, so
-          // a new one is collected by polling instead.
-          changes.loopbackRedirect = null;
-          changes.redeemCodeHash = null;
-        } else {
-          changes.outcome = JSON.stringify(input.outcome ?? null);
+          });
+          completed = await commit(row, {
+            outcome: result.outcome,
+            seal: true,
+            record: result.record,
+            statements: result.statements ?? [],
+            guard,
+            organizationId: row.organizationId,
+            // Attribution only, and only while that user still exists: one
+            // deleted mid-execution leaves it null rather than failing the
+            // foreign key and, with it, a write its claim still covers.
+            decidedByUserId: sql`(select ${tables.user.id} from ${tables.user} where ${tables.user.id} = ${executor.openerUserId})`,
+            redeemCodeHash: null,
+            claim,
+            now,
+          });
+        } catch (error) {
+          await release();
+          throw error;
         }
-      }
-      if (input.record !== undefined) changes.outcome = JSON.stringify(input.record);
-      const statements = input.statements ?? [];
-      const amendment = db
-        .update(operation)
-        .set(changes)
-        .where(
-          and(
-            eq(operation.id, row.id),
-            eq(operation.state, "completed"),
-            ...(input.condition ? [input.condition] : []),
-            ...lastChanged(statements),
-          ),
-        )
-        .returning({ id: operation.id });
-      return lastReturnedOne(await runBatch(db, [...statements, amendment]));
-    },
+        if (!completed) {
+          await release();
+          await explainRefusedWrite(row.id, now);
+        }
+        await afterCommit(result.afterCommit);
+        return {
+          id: row.id,
+          state: "completed",
+          record: result.record === undefined ? null : result.record,
+          outcome: result.outcome,
+          replayed: false,
+        };
+      },
 
-    async retire(input) {
-      requireEnabled();
-      const retired = await db
-        .update(operation)
-        .set({
-          state: "retired",
-          sealedOutcome: null,
-          sealedUntil: null,
-          redeemCodeHash: null,
-          updatedAt: new Date(),
-        })
-        .where(and(eq(operation.id, input.id), ne(operation.state, "retired")))
-        .returning({ id: operation.id });
-      return retired.length === 1;
-    },
-
-    sweepStatements,
-
-    async sweep(now) {
-      requireEnabled();
-      await runBatch(db, sweepStatements(now));
-    },
+      async reveal(input) {
+        requireEnabled();
+        const { userId, sessionId } = requireInteractiveSession(input.actor ?? createEmptyAuthState());
+        const row = await findById(input.id);
+        if (!row || hidden(row, admitInternal) || row.organizationId === null) throw operationNotFound();
+        const organizationId = row.organizationId;
+        // Someone outside the organization learns nothing, not even that it exists.
+        const membership = await repository.findMembership(userId, organizationId);
+        if (!membership) throw operationNotFound();
+        if (!hasRoleAtLeast(membership.role, "admin")) {
+          throw forbidden("Revealing needs the admin role or higher in this organization");
+        }
+        if (isOrganizationExpired(membership.organization)) throw organizationExpired();
+        const kind = kindOf(row.kind);
+        if (kind.browser) {
+          throw validationError(
+            `Operation kind \`${kind.name}\` hands its outcome to its client; it cannot be revealed`,
+          );
+        }
+        const now = Date.now();
+        switch (effectiveState(row, now)) {
+          case "pending":
+            throw operationPending();
+          case "denied":
+            throw operationDenied();
+          case "expired":
+          case "retired":
+            throw operationExpired();
+          case "completed":
+            break;
+        }
+        const sealed = row.sealedOutcome;
+        // Whatever consumes the sealed outcome — a reveal, a `once` poll, an
+        // undeliverable cleanup — drops it but leaves `sealed_until`, so a
+        // reveal after it inside the window is told apart from one that never
+        // had anything to reveal, and `execute` keeps replaying the record
+        // through the window; the sweep clears it with the window.
+        const revealedAlready = (current: OperationRow) =>
+          current.sealedOutcome === null && current.sealedUntil !== null && current.sealedUntil.getTime() > now;
+        if (sealed === null) {
+          if (revealedAlready(row)) throw alreadyRevealed();
+          throw operationExpired("This operation holds no outcome to reveal");
+        }
+        if (!sealLive(row, now)) throw operationExpired("This operation's outcome is no longer available");
+        // Opened before anything is spent, so a seal that cannot be read is
+        // reported rather than consumed.
+        const outcome = await openSealed({ ...row, sealedOutcome: sealed });
+        // The person is the authority here, not the credential that opened
+        // the operation: a key downgraded or revoked since does not stop an
+        // admin from collecting what it created.
+        const revealer = credentialAuthoritySql(tables, {
+          organizationId,
+          userId,
+          credentialId: sessionId,
+          allowedRoles: rolesAtLeast("admin"),
+          nowMs: now,
+        });
+        const deliverable = deliverableSql(row, now);
+        // The organization exists and is not past its deadline, by either
+        // clock: `expires_at` is ISO text, read as epoch milliseconds here.
+        const organizationLive = sql`exists (select 1 from ${tables.organization} as ${sql.identifier("cf_auth_reveal_organization")}
+          where ${revealOrganization.id} = ${organizationId}
+            and (${revealOrganization.expiresAt} is null
+              or cast(unixepoch(${revealOrganization.expiresAt}, 'subsec') * 1000 as integer) > ${sqliteNowMs(now)}))`;
+        // Every condition rides on the write that takes the outcome — the
+        // seal's deadline by the database's clock too — so of two reveals
+        // racing only one hands it over, and nothing that stopped holding
+        // after it was read above slips through.
+        const taken = await db
+          .update(operation)
+          .set({ sealedOutcome: null, updatedAt: new Date(now) })
+          .where(
+            and(
+              eq(operation.id, row.id),
+              eq(operation.state, "completed"),
+              eq(operation.sealedOutcome, sealed),
+              sql`${operation.sealedUntil} > ${sqliteNowMs(now)}`,
+              organizationLive,
+              revealer,
+              ...(deliverable ? [deliverable] : []),
+            ),
+          )
+          .returning({ id: operation.id });
+        if (taken.length !== 1) {
+          const current = await findById(row.id);
+          if (!current) throw operationNotFound();
+          if (current.state !== "completed") throw operationExpired();
+          if (current.sealedOutcome === null) {
+            if (revealedAlready(current)) throw alreadyRevealed();
+            throw operationExpired("This operation's outcome is no longer available");
+          }
+          if (current.sealedOutcome !== sealed) {
+            // `amend` sealed a new outcome meanwhile. It is not this call's to
+            // judge or to drop; the next reveal reads it afresh.
+            throw conflict("This operation's outcome changed while it was being revealed; reveal it again");
+          }
+          if (!(await holds(organizationLive))) throw organizationExpired();
+          if (deliverable && !(await holds(deliverable))) await dropUndeliverable(row.id, sealed, now);
+          if (!(await holds(revealer))) {
+            throw conflict("Your session or role changed before the outcome was revealed; sign in again");
+          }
+          throw operationExpired("This operation's outcome is no longer available");
+        }
+        return { id: row.id, kind: row.kind, organizationId, outcome };
+      },
+    };
   };
+
+  return { operations: door(false), internal: door(true) };
 };
+
+/** The operations service `cfAuth.operations` is: the engine's door that refuses internal kinds. */
+export const createOperationsService = (
+  config: ResolvedCfAuthConfig,
+  repository: CfAuthRepository,
+): CfAuthOperations => createOperationsEngine(config, repository).operations;
