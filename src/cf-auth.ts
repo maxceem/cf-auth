@@ -3,7 +3,8 @@ import { createBetterAuthInstance, type CfBetterAuth } from "./better-auth.js";
 import { resolveConfig, type CfAuthConfig, type ResolvedCfAuthConfig } from "./config.js";
 import { createCurrentOrganizationCookie, type CurrentOrganizationCookie } from "./cookies.js";
 import { createAuthMiddleware, type AuthMiddlewareOptions, type CfAuthEnv } from "./middleware.js";
-import { createOperationsService, type CfAuthOperations } from "./operations.js";
+import { createOAuthServiceForEngine, oauthBuiltInKinds, type CfAuthOAuth } from "./oauth/service.js";
+import { createOperationsEngine, type CfAuthOperations } from "./operations.js";
 import { createCfAuthRepository, type CfAuthRepository } from "./repository.js";
 import { createAuthService, type CfAuthService } from "./service.js";
 import type { MiddlewareHandler } from "hono";
@@ -20,6 +21,13 @@ export interface CfAuth {
    * refuses while `operations.enabled` is off.
    */
   readonly operations: CfAuthOperations;
+  /**
+   * OAuth for public clients: the authorization request, consent, the code
+   * exchange and the discovery documents; connections with `token`,
+   * `revoke`, `resolveAccessTokenAuthState`, the sweep and the issuance
+   * primitive. Every method refuses while `oauth.enabled` is off.
+   */
+  readonly oauth: CfAuthOAuth;
   /** Low-level drizzle queries, exposed for apps that need direct access. */
   readonly repository: CfAuthRepository;
   /** Signed current-organization cookie helpers. */
@@ -70,11 +78,19 @@ export const createCfAuth = (config: CfAuthConfig): CfAuth => {
   const auth = createBetterAuthInstance(resolved, getService);
   service = createAuthService(repository, resolved);
 
-  const operations = createOperationsService(resolved, repository);
+  // One engine behind both: `cfAuth.operations` is its public door, and the
+  // OAuth service drives `cf-auth:oauth.authorize` through the internal one,
+  // so the pending caps count every kind together.
+  const engine = createOperationsEngine(resolved, repository, {
+    builtInKinds: oauthBuiltInKinds(resolved),
+  });
+  const operations = engine.operations;
+  const oauth = createOAuthServiceForEngine(resolved, repository, resolved.oauth ? engine.internal : null);
   const currentOrganizationCookie = createCurrentOrganizationCookie(resolved);
   const middleware = createAuthMiddleware(resolved, {
     auth,
     service,
+    oauth,
     currentOrganizationCookie,
   });
 
@@ -86,6 +102,7 @@ export const createCfAuth = (config: CfAuthConfig): CfAuth => {
     auth,
     service,
     operations,
+    oauth,
     repository,
     currentOrganizationCookie,
     basePath: resolved.basePath,

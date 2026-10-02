@@ -38,6 +38,18 @@ export const sessionRequired = (
 ) => new CfAuthError("session_required", message, 403);
 
 /**
+ * The caller is authenticated and holds the role, but the credential it
+ * presented carries a grant too narrow for this action — a `read` key where
+ * a write needs `manage`.
+ *
+ * 403 rather than 401 for the same reason as {@link sessionRequired}: the
+ * credential is valid, and retrying with it will never help.
+ */
+export const grantInsufficient = (
+  message = "This credential's grant does not allow this action; use a session or a key with the manage grant",
+) => new CfAuthError("grant_insufficient", message, 403);
+
+/**
  * The organization exists, but its provisional deadline has passed, so nothing
  * may act inside it. Distinct from {@link forbidden}: no role or credential
  * change would help.
@@ -72,6 +84,18 @@ export const invalidProof = (message = "The proof does not match this operation"
 
 export const alreadyCompleted = (message = "This operation has already been completed") =>
   new CfAuthError("already_completed", message, 409);
+
+/**
+ * A reservation handle was presented for another kind, or from another
+ * organization, than the one it was reserved for.
+ */
+export const operationMismatch = (
+  message = "This handle belongs to a different kind of operation or another organization",
+) => new CfAuthError("operation_mismatch", message, 409);
+
+/** A sealed outcome was already released to a browser page. */
+export const alreadyRevealed = (message = "This operation's outcome has already been revealed") =>
+  new CfAuthError("already_revealed", message, 409);
 
 export const tooManyPending = (message = "Too many operations are waiting for approval") =>
   new CfAuthError("too_many_pending", message, 429);

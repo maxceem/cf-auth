@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { resolveConfig, type CfAuthDatabase } from "../src/config.js";
 import { createBetterAuthOptions } from "../src/better-auth.js";
+import { createOperationsService } from "../src/operations.js";
+import { createCfAuthRepository } from "../src/repository.js";
 import { cfAuthTables, createCfAuthTables } from "../src/schema.js";
 import { getTableName } from "drizzle-orm";
 
@@ -215,13 +217,29 @@ describe("resolveConfig", () => {
       }),
     ).toThrowError(/maxAge/);
   });
+
+  it("refuses operations on a database that cannot batch, through either factory", () => {
+    const withOperations = { ...base, apiKeys: { enabled: true }, operations: { enabled: true } };
+    expect(() => resolveConfig(withOperations)).toThrowError(
+      /`operations` needs a database that batches atomically \(D1, libsql\)/,
+    );
+    expect(() => resolveConfig({ ...base, operations: { enabled: false } })).not.toThrow();
+
+    // A resolved configuration built by hand, which never went through resolveConfig.
+    const batching = resolveConfig({ ...withOperations, db: { batch: async () => [] } as unknown as CfAuthDatabase });
+    const resolved = { ...batching, db };
+    expect(() => createOperationsService(resolved, createCfAuthRepository(db, cfAuthTables))).toThrowError(
+      /batches atomically/,
+    );
+  });
 });
 
 describe("schema", () => {
-  it("exposes the eight tables an app must migrate", () => {
+  it("exposes the nine tables an app must migrate", () => {
     expect(Object.keys(cfAuthTables).sort()).toEqual([
       "account",
       "apiKey",
+      "oauthToken",
       "operation",
       "organization",
       "organizationUser",
@@ -234,6 +252,7 @@ describe("schema", () => {
   it("uses unprefixed physical table names by default", () => {
     expect(Object.values(cfAuthTables).map(getTableName).sort()).toEqual([
       "api_key",
+      "oauth_token",
       "operation",
       "organization",
       "organization_user",
@@ -249,6 +268,7 @@ describe("schema", () => {
 
     expect(Object.values(prefixed).map(getTableName).sort()).toEqual([
       "auth_api_key",
+      "auth_oauth_token",
       "auth_operation",
       "auth_organization",
       "auth_organization_user",

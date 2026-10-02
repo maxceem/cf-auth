@@ -38,8 +38,39 @@ export const isApiKeyActionSource = (value: ActionSource): value is ApiKeyAction
 export const operationStates = ["pending", "completed", "denied", "expired", "retired"] as const;
 export type OperationState = (typeof operationStates)[number];
 
-/** Which credential proved the caller's identity. */
-export type AuthCredentialType = "session" | "apiKey";
+/**
+ * Which credential proved the caller's identity: a person's own session, an
+ * API key, or an OAuth connection's access token. Every type but `session` is
+ * a delegated credential, bound to one organization and carrying a grant.
+ */
+export type AuthCredentialType = "session" | "apiKey" | "oauth";
+
+/**
+ * What an `api_key` row authenticates as: an API key, whose token is looked
+ * up by digest, or an OAuth connection, whose tokens resolve only through the
+ * OAuth service. Decides authentication; `source` never does.
+ */
+export const apiKeyCredentialTypes = ["apiKey", "oauth"] as const;
+export type ApiKeyCredentialType = (typeof apiKeyCredentialTypes)[number];
+
+/** Where an OAuth access token may be presented: the MCP endpoint, or the management API. */
+export const oauthActionSources = ["mcp", "api"] as const;
+export type OAuthActionSource = (typeof oauthActionSources)[number];
+
+/**
+ * How much of its holder's authority a credential may exercise, least first.
+ *
+ * Distinct from {@link OrganizationRole}: the role says what the person or
+ * service may do in the organization, the grant says how much of that one
+ * credential may use. What a request may do is the role and the grant
+ * together. A `read` credential reads; only a `manage` one writes. A person's
+ * own session is always `manage`.
+ */
+export const credentialGrants = ["read", "manage"] as const;
+export type CredentialGrant = (typeof credentialGrants)[number];
+
+export const isCredentialGrant = (value: unknown): value is CredentialGrant =>
+  (credentialGrants as readonly unknown[]).includes(value);
 
 export type IdentityKind = "human" | "service";
 export type AuthActor = {
@@ -99,7 +130,10 @@ export interface AuthState {
   authenticated: boolean;
   assurance: "interactive" | "credential" | null;
   credentialType: AuthCredentialType | null;
-  /** Where the request came from (`web` for sessions, `api`/`cli`/`mcp` for API keys). */
+  /**
+   * Where the request came from: `web` for sessions, `api`/`cli`/`mcp` for API
+   * keys, and for an OAuth connection the endpoint's own, `mcp` or `api`.
+   */
   source: ActionSource | null;
   actor: AuthActor | null;
   user: AuthUser | null;
@@ -108,6 +142,13 @@ export interface AuthState {
   organization: OrganizationSummary | null;
   /** The caller's role inside {@link AuthState.organization}. */
   role: OrganizationRole | null;
+  /**
+   * How much of that role this credential may exercise: `"manage"` for a
+   * session, the row's own grant for an API key or an OAuth connection, null
+   * when unauthenticated.
+   * See {@link CredentialGrant}.
+   */
+  grant: CredentialGrant | null;
 }
 
 export interface ApiKeySummary {
@@ -127,10 +168,20 @@ export interface ApiKeySummary {
    * this to `false` too, so `enabled && !revokedAt` is the live key.
    */
   enabled: boolean;
-  /** Where the key was issued from, e.g. `console`, `cli` or `bootstrap`. */
+  /**
+   * Where the key was issued from, e.g. `console`, `cli` or `bootstrap`; `oauth`
+   * for an OAuth connection, which no caller may claim for a key of its own.
+   * Display only: what the row authenticates as is `credentialType`.
+   */
   source: string;
+  /** `"oauth"` for an OAuth connection, `"apiKey"` for a key. */
+  credentialType: ApiKeyCredentialType;
   /** A human-readable note about the holder, e.g. `CLI on mac-studio`. */
   label: string | null;
+  /** How much of its holder's authority the key may exercise. Keys issued before grants existed are `manage`. */
+  grant: CredentialGrant;
+  /** The OAuth client a connection was issued to (`credentialType: "oauth"`); null for a key. */
+  clientId: string | null;
   createdAt: string;
   revokedAt: string | null;
 }
@@ -160,6 +211,8 @@ export type CfAuthEvent =
       organizationId: string;
       apiKeyId: string;
       name: string;
+      /** `"oauth"` when the row is an OAuth connection; absent for an API key. */
+      credentialType?: "oauth";
     }
   | {
       type: "api_key.revoked";
@@ -167,6 +220,8 @@ export type CfAuthEvent =
       organizationId: string;
       apiKeyId: string;
       name: string;
+      /** `"oauth"` when the row is an OAuth connection; absent for an API key. */
+      credentialType?: "oauth";
     };
 
 const roleRank: Record<OrganizationRole, number> = {
@@ -201,6 +256,17 @@ export const hasRoleAtLeast = (
   minimum: OrganizationRole,
 ): boolean => (role ? roleRank[role] >= roleRank[minimum] : false);
 
+const grantRank: Record<CredentialGrant, number> = {
+  manage: 2,
+  read: 1,
+};
+
+/** True when `grant` covers `needed`: `manage` covers both, `read` only `read`, null neither. */
+export const hasGrantAtLeast = (
+  grant: CredentialGrant | null | undefined,
+  needed: CredentialGrant,
+): boolean => (grant && isCredentialGrant(grant) ? grantRank[grant] >= grantRank[needed] : false);
+
 /** An unauthenticated {@link AuthState}. Safe default for anonymous requests. */
 export const createEmptyAuthState = (): AuthState => ({
   authenticated: false,
@@ -212,4 +278,5 @@ export const createEmptyAuthState = (): AuthState => ({
   memberships: [],
   organization: null,
   role: null,
+  grant: null,
 });

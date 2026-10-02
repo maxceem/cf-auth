@@ -3,9 +3,16 @@ import { drizzle } from "drizzle-orm/d1";
 import type { BaseSQLiteDatabase } from "drizzle-orm/sqlite-core";
 import type { SQL } from "drizzle-orm";
 import { validationError } from "./errors.js";
+import { isAcceptableRedirectUri } from "./oauth/redirect-uri.js";
 import type { OperationKind } from "./operations.js";
 import { cfAuthTables, type CfAuthTables } from "./schema.js";
-import { organizationRoles, type AuthUser, type CfAuthEvent, type OrganizationRole } from "./types.js";
+import {
+  isCredentialGrant,
+  organizationRoles,
+  type AuthUser,
+  type CfAuthEvent,
+  type OrganizationRole,
+} from "./types.js";
 
 /**
  * Any async drizzle SQLite database — `drizzle-orm/d1` in production,
@@ -106,6 +113,67 @@ export interface OperationsConfig {
   };
   /** How long a sealed outcome waits to be collected. Default: 15 minutes. */
   sealTtlMs?: number;
+  /** How long a reservation (`reserve`) waits to be executed. Default: 15 minutes. */
+  reserveTtlMs?: number;
+}
+
+/** A pre-registered public OAuth client: the fallback where CIMD is off or refused. */
+export interface OAuthClientConfig {
+  clientId: string;
+  /** Shown on the consent page and copied onto the connection. Trusted configuration. */
+  name: string;
+  /**
+   * Absolute, no fragment: `https`, `http` on a loopback host (any port at
+   * presentation), or a private-use scheme in reverse-DNS form.
+   */
+  redirectUris: string[];
+}
+
+/** Client ID Metadata Documents: a `client_id` that is an https URL names its own metadata. */
+export interface OAuthCimdConfig {
+  /** Default: `globalThis.fetch`. */
+  fetch?: typeof fetch;
+  /** Extra host policy, e.g. an allowlist, asked after the built-in refusals. */
+  allowUrl?: (url: URL) => boolean | Promise<boolean>;
+}
+
+/**
+ * OAuth 2.1 for public clients (MCP clients): cf-auth issues connections
+ * whose tokens authenticate like API keys. cf-auth mounts no routes; the
+ * service functions under `cfAuth.oauth` answer what the app's routes send.
+ */
+export interface OAuthConfig {
+  /**
+   * Needs `apiKeys.enabled`, `operations.enabled` and a database that batches
+   * atomically (D1, libsql). Default: `false`.
+   */
+  enabled?: boolean;
+  /**
+   * The issuer and the single protected resource: an origin with no path and
+   * no trailing slash, `https`, or `http` on a loopback host (`127.0.0.1`,
+   * `[::1]`, `localhost` or a name under `.localhost`). Required when enabled.
+   */
+  issuer?: string;
+  /** Paths under the issuer also accepted as `resource`; tokens are bound to the issuer either way. Default: `["/mcp"]`. */
+  resourcePaths?: string[];
+  /** Default: 10 minutes. */
+  accessTokenTtlMs?: number;
+  /** Default: 30 days, restarted by each rotation. */
+  refreshTokenTtlMs?: number;
+  /** Absolute cap from the connection's creation. Default: `null` (none: revocable, like a key). */
+  connectionMaxAgeMs?: number | null;
+  /** A pending authorization's life, and a code's validity from completion. Default: 10 minutes. */
+  authorizationTtlMs?: number;
+  /**
+   * Required when enabled. Distinct from each other and from
+   * `apiKeys.tokenPrefix`, and the access prefix must not be able to begin
+   * an API key, since a bearer token is routed by it.
+   */
+  tokenPrefix?: { access: string; refresh: string };
+  /** Pre-registered clients. */
+  clients?: OAuthClientConfig[];
+  /** Client ID Metadata Documents. On by default; `false` turns them off. */
+  cimd?: false | OAuthCimdConfig;
 }
 
 export interface EmailAndPasswordConfig {
@@ -211,6 +279,7 @@ export interface CfAuthConfig {
   apiKeys?: ApiKeysConfig;
   cookies?: CookieConfig;
   operations?: OperationsConfig;
+  oauth?: OAuthConfig;
 
   /** Tables to read/write. Defaults to {@link cfAuthTables}. */
   tables?: CfAuthTables;
@@ -251,6 +320,7 @@ export interface ResolvedOperationsConfig {
   login: Required<LoginOperationConfig> | null;
   limits: { pendingPerOrganization: number; pendingPerOpener: number };
   sealTtlMs: number;
+  reserveTtlMs: number;
 }
 
 const minute = 60_000;
@@ -260,9 +330,22 @@ export const operationDefaults = {
   pendingTtlMs: 15 * minute,
   recordTtlMs: 90 * day,
   sealTtlMs: 15 * minute,
+  reserveTtlMs: 15 * minute,
 } as const;
 
 const operationKindName = /^[a-z][a-z0-9._-]{0,63}$/;
+
+/**
+ * The namespace of cf-auth's own internal kinds. A stored operation whose kind
+ * starts with it is internal whatever an engine has registered, so a row of an
+ * internal kind stays out of reach of the public entry points even for an
+ * engine built without that kind. An app's kind name cannot contain `:`.
+ */
+export const internalOperationKindPrefix = "cf-auth:";
+
+/** Whether a kind name is in cf-auth's internal namespace. */
+export const isInternalOperationKind = (name: string): boolean =>
+  name.startsWith(internalOperationKindPrefix);
 
 const positiveNumber = (value: number | undefined, fallback: number, label: string) => {
   if (value === undefined) return fallback;
@@ -276,9 +359,22 @@ const positiveInteger = (value: number | undefined, fallback: number, label: str
   return resolved;
 };
 
-/** Checks one kind's own settings; exported so the built-in kinds go through the same rules. */
-export const validateOperationKind = (kind: OperationKind, label?: string): void => {
-  if (!operationKindName.test(kind.name ?? "")) {
+/**
+ * Checks one kind's own settings; exported so the built-in kinds go through the
+ * same rules. A kind is internal by its name alone, `cf-auth:<name>`, and only
+ * a built-in kind may take one: nothing outside cf-auth can drive an internal
+ * kind, so an app declaring one would register a kind it cannot use. There is
+ * no public flag for it, so nothing an app writes can mark a kind internal.
+ */
+export const validateOperationKind = (
+  kind: OperationKind,
+  label?: string,
+  options: { builtIn?: boolean } = {},
+): void => {
+  const rawName = typeof kind.name === "string" ? kind.name : "";
+  const internalName = options.builtIn === true && isInternalOperationKind(rawName);
+  const baseName = internalName ? rawName.slice(internalOperationKindPrefix.length) : rawName;
+  if (!operationKindName.test(baseName)) {
     throw validationError(
       `Operation kind name \`${String(kind.name)}\` must be lowercase letters, digits, \`.\`, \`_\` or \`-\``,
     );
@@ -286,6 +382,16 @@ export const validateOperationKind = (kind: OperationKind, label?: string): void
   label ??= `operations.kinds[${kind.name}]`;
   if (kind.open !== "public" && !organizationRoles.includes(kind.open?.minRole)) {
     throw validationError(`\`${label}.open\` must be "public" or { minRole }`);
+  }
+  if (kind.grant !== undefined) {
+    if (kind.open === "public") {
+      throw validationError(
+        `\`${label}.grant\` applies to a kind a caller opens; a public kind binds no credential`,
+      );
+    }
+    if (!isCredentialGrant(kind.grant)) {
+      throw validationError(`\`${label}.grant\` must be "read" or "manage"`);
+    }
   }
   if (
     kind.approverMinRole !== undefined &&
@@ -300,8 +406,13 @@ export const validateOperationKind = (kind: OperationKind, label?: string): void
   if (kind.countsTowardPending !== undefined && typeof kind.countsTowardPending !== "boolean") {
     throw validationError(`\`${label}.countsTowardPending\` must be a boolean`);
   }
-  if (kind.deliver !== undefined && kind.deliver !== "once" && kind.deliver !== "window") {
-    throw validationError(`\`${label}.deliver\` must be "once" or "window"`);
+  if (kind.deliver !== undefined && kind.deliver !== "once" && kind.deliver !== "window" && kind.deliver !== "reveal") {
+    throw validationError(`\`${label}.deliver\` must be "once", "window" or "reveal"`);
+  }
+  if (kind.deliver === "reveal" && kind.browser) {
+    throw validationError(
+      `\`${label}.deliver\`: "reveal" is for a kind without a browser step; a browser kind's client collects its outcome`,
+    );
   }
   if (!kind.browser && (kind.userCode || kind.approve || kind.refusal || kind.input || kind.approver)) {
     throw validationError(
@@ -315,12 +426,37 @@ export const validateOperationKind = (kind: OperationKind, label?: string): void
   }
 };
 
+/**
+ * Refuses a database without `batch` for a feature whose writes must land
+ * together or not at all: run in order instead, a write refused late would
+ * leave the ones before it committed.
+ */
+const assertBatchingDatabase = (db: CfAuthDatabase, feature: string, why: string): void => {
+  if (typeof (db as unknown as { batch?: unknown }).batch !== "function") {
+    throw validationError(`\`${feature}\` needs a database that batches atomically (D1, libsql): ${why}`);
+  }
+};
+
+/**
+ * Operations' half of {@link assertBatchingDatabase}. Exported for the
+ * engine, which may be handed a configuration that never went through
+ * `resolveConfig`.
+ */
+export const assertOperationsDatabase = (db: CfAuthDatabase): void =>
+  assertBatchingDatabase(
+    db,
+    "operations",
+    "a completion, an execution and a sweep are each one batch, and a refused completion rolls its whole batch back",
+  );
+
 const resolveOperations = (
   config: CfAuthConfig,
+  db: CfAuthDatabase,
   apiKeysEnabled: boolean,
 ): ResolvedOperationsConfig => {
   const input = config.operations ?? {};
   const enabled = input.enabled ?? false;
+  if (enabled) assertOperationsDatabase(db);
   const loginInput = input.login ?? true;
   const login =
     enabled && loginInput !== false
@@ -391,6 +527,211 @@ const resolveOperations = (
       ),
     },
     sealTtlMs: positiveNumber(input.sealTtlMs, operationDefaults.sealTtlMs, "operations.sealTtlMs"),
+    reserveTtlMs: positiveNumber(
+      input.reserveTtlMs,
+      operationDefaults.reserveTtlMs,
+      "operations.reserveTtlMs",
+    ),
+  };
+};
+
+export interface ResolvedOAuthConfig {
+  issuer: string;
+  resourcePaths: readonly string[];
+  /** Every accepted spelling of `resource`: the issuer, then the issuer with each path. */
+  resources: readonly string[];
+  accessTokenTtlMs: number;
+  refreshTokenTtlMs: number;
+  connectionMaxAgeMs: number | null;
+  authorizationTtlMs: number;
+  tokenPrefix: { access: string; refresh: string };
+  clients: readonly OAuthClientConfig[];
+  /** Null when CIMD is off; `fetch` and `allowUrl` null when not configured. */
+  cimd: {
+    fetch: typeof fetch | null;
+    allowUrl: ((url: URL) => boolean | Promise<boolean>) | null;
+  } | null;
+}
+
+/** Defaults of the `oauth` block. The refresh grace and rotation limit are fixed, not configured. */
+export const oauthDefaults = {
+  resourcePaths: ["/mcp"],
+  accessTokenTtlMs: 10 * minute,
+  refreshTokenTtlMs: 30 * day,
+  authorizationTtlMs: 10 * minute,
+} as const;
+
+/** Loopback for `oauth.issuer`: the loopback literals, `localhost`, or a name under `.localhost` (RFC 6761 §6.3). */
+const isLoopbackIssuerHost = (hostname: string): boolean =>
+  // The URL parser has already lowercased the hostname, so no case folding is needed here.
+  hostname === "127.0.0.1" || hostname === "[::1]" || /^(?:localhost|(?:[^.]+\.)+localhost)$/.test(hostname);
+const tokenPrefixPattern = /^[A-Za-z0-9_-]{1,32}$/;
+const resourcePathPattern = /^(?:\/[A-Za-z0-9._~!$&'()*+,;=:@%-]+)+$/;
+const base62Run = /^[A-Za-z0-9]*$/;
+
+const resolveOAuth = (
+  config: CfAuthConfig,
+  db: CfAuthDatabase,
+  apiKeys: { enabled: boolean; tokenPrefix: string },
+  operationsEnabled: boolean,
+): ResolvedOAuthConfig | null => {
+  const input = config.oauth;
+  if (!input || input.enabled !== true) {
+    if (input?.enabled !== undefined && typeof input.enabled !== "boolean") {
+      throw validationError("`oauth.enabled` must be a boolean");
+    }
+    return null;
+  }
+  if (!apiKeys.enabled) {
+    throw validationError("`oauth` issues connections that are API-key rows; set `apiKeys.enabled: true`");
+  }
+  if (!operationsEnabled) {
+    throw validationError("`oauth` runs its authorizations on the operation engine; set `operations.enabled: true`");
+  }
+  assertBatchingDatabase(db, "oauth", "its code exchange, rotation and revocation are each one batch");
+
+  if (typeof input.issuer !== "string" || !input.issuer) {
+    throw validationError("`oauth.issuer` is required");
+  }
+  let issuerUrl: URL;
+  try {
+    issuerUrl = new URL(input.issuer);
+  } catch {
+    throw validationError("`oauth.issuer` must be an absolute URL");
+  }
+  const secure =
+    issuerUrl.protocol === "https:" ||
+    (issuerUrl.protocol === "http:" && isLoopbackIssuerHost(issuerUrl.hostname));
+  if (!secure) {
+    throw validationError(
+      "`oauth.issuer` must be https, or http on a loopback host (`127.0.0.1`, `[::1]`, `localhost` or a name under `.localhost`)",
+    );
+  }
+  if (input.issuer !== issuerUrl.origin) {
+    throw validationError(
+      "`oauth.issuer` must be an origin: no path, no trailing slash, no query, no fragment and no credentials",
+    );
+  }
+  const issuer = issuerUrl.origin;
+
+  const resourcePaths = input.resourcePaths ?? [...oauthDefaults.resourcePaths];
+  if (!Array.isArray(resourcePaths)) throw validationError("`oauth.resourcePaths` must be an array");
+  for (const path of resourcePaths) {
+    if (typeof path !== "string" || !resourcePathPattern.test(path) || path.endsWith("/")) {
+      throw validationError(
+        `\`oauth.resourcePaths\` entry \`${String(path)}\` must be a path such as "/mcp": a leading slash, no trailing slash, no query or fragment`,
+      );
+    }
+  }
+  if (new Set(resourcePaths).size !== resourcePaths.length) {
+    throw validationError("`oauth.resourcePaths` lists a path twice");
+  }
+
+  const connectionMaxAgeMs =
+    input.connectionMaxAgeMs === undefined || input.connectionMaxAgeMs === null
+      ? null
+      : positiveNumber(input.connectionMaxAgeMs, 0, "oauth.connectionMaxAgeMs");
+
+  const prefix = input.tokenPrefix;
+  if (!prefix || typeof prefix !== "object") {
+    throw validationError("`oauth.tokenPrefix` is required: { access, refresh }");
+  }
+  for (const name of ["access", "refresh"] as const) {
+    if (typeof prefix[name] !== "string" || !tokenPrefixPattern.test(prefix[name])) {
+      throw validationError(
+        `\`oauth.tokenPrefix.${name}\` must be 1 to 32 letters, digits, \`_\` or \`-\``,
+      );
+    }
+  }
+  if (prefix.access === prefix.refresh) {
+    throw validationError("`oauth.tokenPrefix.access` and `.refresh` must differ");
+  }
+  for (const name of ["access", "refresh"] as const) {
+    if (prefix[name] === apiKeys.tokenPrefix) {
+      throw validationError(`\`oauth.tokenPrefix.${name}\` must differ from \`apiKeys.tokenPrefix\``);
+    }
+  }
+  // A bearer token is routed to OAuth by the access prefix, so no API key may
+  // be able to begin with it: neither may the key prefix begin with the access
+  // prefix, nor may the access prefix be the key prefix plus characters a
+  // key's random part can hold.
+  const apiKeyPrefix = apiKeys.tokenPrefix;
+  if (
+    apiKeyPrefix.startsWith(prefix.access) ||
+    (prefix.access.startsWith(apiKeyPrefix) && base62Run.test(prefix.access.slice(apiKeyPrefix.length)))
+  ) {
+    throw validationError(
+      "`oauth.tokenPrefix.access` could begin an API key; choose a prefix an API key cannot start with",
+    );
+  }
+
+  const clients = input.clients ?? [];
+  if (!Array.isArray(clients)) throw validationError("`oauth.clients` must be an array");
+  const clientIds = new Set<string>();
+  const resolvedClients = clients.map((client, index): OAuthClientConfig => {
+    const label = `oauth.clients[${index}]`;
+    if (!client || typeof client.clientId !== "string" || !client.clientId.trim()) {
+      throw validationError(`\`${label}.clientId\` is required`);
+    }
+    if (client.clientId !== client.clientId.trim() || client.clientId.length > 2048) {
+      throw validationError(`\`${label}.clientId\` must be at most 2048 characters with no surrounding spaces`);
+    }
+    if (clientIds.has(client.clientId)) {
+      throw validationError(`\`${label}.clientId\` \`${client.clientId}\` is declared twice`);
+    }
+    clientIds.add(client.clientId);
+    if (typeof client.name !== "string" || !client.name.trim() || client.name.trim().length > 200) {
+      throw validationError(`\`${label}.name\` is required, at most 200 characters`);
+    }
+    if (!Array.isArray(client.redirectUris) || client.redirectUris.length === 0) {
+      throw validationError(`\`${label}.redirectUris\` must list at least one redirect URI`);
+    }
+    for (const uri of client.redirectUris) {
+      if (!isAcceptableRedirectUri(uri)) {
+        throw validationError(
+          `\`${label}.redirectUris\` entry \`${String(uri)}\` must be absolute with no fragment: https, http on a loopback host, or a private-use scheme such as com.example.app:/cb`,
+        );
+      }
+    }
+    return { clientId: client.clientId, name: client.name.trim(), redirectUris: [...client.redirectUris] };
+  });
+
+  let cimd: ResolvedOAuthConfig["cimd"];
+  if (input.cimd === false) {
+    cimd = null;
+  } else if (input.cimd === undefined) {
+    cimd = { fetch: null, allowUrl: null };
+  } else if (typeof input.cimd === "object" && input.cimd !== null) {
+    if (input.cimd.fetch !== undefined && typeof input.cimd.fetch !== "function") {
+      throw validationError("`oauth.cimd.fetch` must be a function");
+    }
+    if (input.cimd.allowUrl !== undefined && typeof input.cimd.allowUrl !== "function") {
+      throw validationError("`oauth.cimd.allowUrl` must be a function");
+    }
+    cimd = { fetch: input.cimd.fetch ?? null, allowUrl: input.cimd.allowUrl ?? null };
+  } else {
+    throw validationError("`oauth.cimd` must be false or { fetch?, allowUrl? }");
+  }
+
+  return {
+    issuer,
+    resourcePaths: [...resourcePaths],
+    resources: [issuer, ...resourcePaths.map((path) => `${issuer}${path}`)],
+    accessTokenTtlMs: positiveNumber(input.accessTokenTtlMs, oauthDefaults.accessTokenTtlMs, "oauth.accessTokenTtlMs"),
+    refreshTokenTtlMs: positiveNumber(
+      input.refreshTokenTtlMs,
+      oauthDefaults.refreshTokenTtlMs,
+      "oauth.refreshTokenTtlMs",
+    ),
+    connectionMaxAgeMs,
+    authorizationTtlMs: positiveNumber(
+      input.authorizationTtlMs,
+      oauthDefaults.authorizationTtlMs,
+      "oauth.authorizationTtlMs",
+    ),
+    tokenPrefix: { access: prefix.access, refresh: prefix.refresh },
+    clients: resolvedClients,
+    cimd,
   };
 };
 
@@ -419,6 +760,8 @@ export interface ResolvedCfAuthConfig {
   };
   apiKeys: Required<ApiKeysConfig>;
   operations: ResolvedOperationsConfig;
+  /** Null while `oauth.enabled` is off. */
+  oauth: ResolvedOAuthConfig | null;
   cookies: {
     prefix: string;
     betterAuthPrefix: string;
@@ -489,7 +832,14 @@ export const resolveConfig = (config: CfAuthConfig): ResolvedCfAuthConfig => {
   }
 
   const apiKeysEnabled = config.apiKeys?.enabled ?? false;
-  const operations = resolveOperations(config, apiKeysEnabled);
+  const operations = resolveOperations(config, db, apiKeysEnabled);
+  const apiKeyTokenPrefix = config.apiKeys?.tokenPrefix ?? "key_";
+  const oauth = resolveOAuth(
+    config,
+    db,
+    { enabled: apiKeysEnabled, tokenPrefix: apiKeyTokenPrefix },
+    operations.enabled,
+  );
 
   const trustedOrigins = [
     ...new Set(
@@ -530,9 +880,10 @@ export const resolveConfig = (config: CfAuthConfig): ResolvedCfAuthConfig => {
           : () => defaultOrganizationName ?? "My Organization",
     },
     operations,
+    oauth,
     apiKeys: {
       enabled: apiKeysEnabled,
-      tokenPrefix: config.apiKeys?.tokenPrefix ?? "key_",
+      tokenPrefix: apiKeyTokenPrefix,
       clientHeader: config.apiKeys?.clientHeader ?? "X-Client",
     },
     cookies: {

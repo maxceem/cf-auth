@@ -2,7 +2,7 @@ import { alias } from "drizzle-orm/sqlite-core";
 import { sql, type SQL } from "drizzle-orm";
 import { SQLiteAsyncDialect } from "drizzle-orm/sqlite-core";
 import type { CfAuthTables } from "./schema.js";
-import type { OrganizationRole } from "./types.js";
+import type { CredentialGrant, OrganizationRole } from "./types.js";
 
 export interface CredentialAuthorityInput {
   organizationId: string;
@@ -10,6 +10,12 @@ export interface CredentialAuthorityInput {
   credentialId: string;
   /** An empty list deliberately denies authority. */
   allowedRoles: readonly OrganizationRole[];
+  /**
+   * The least grant the credential must carry. `"manage"` requires an API
+   * key's row to say `manage`; a session always satisfies it. Default:
+   * `"read"`, which every live credential satisfies.
+   */
+  grant?: CredentialGrant;
   /** Caller-observed time. SQLite's current clock is also enforced. */
   nowMs: number;
 }
@@ -50,6 +56,9 @@ export const credentialAuthoritySql = (
   const roles = sql.join(input.allowedRoles.map((role) => sql`${role}`), sql`, `);
   const liveAfter = sqliteNowMs(input.nowMs);
 
+  // The key branch takes an API key or an OAuth connection, each by its exact
+  // `credential_type`: a connection opens operations and claims like a key,
+  // and a type cf-auth never writes is neither.
   return sql`exists (
     select 1
     from ${tables.organizationUser} as ${membershipAlias}
@@ -62,11 +71,13 @@ export const credentialAuthoritySql = (
         exists (
           select 1 from ${tables.apiKey} as ${keyAlias}
           where ${key.id} = ${input.credentialId}
+            and ${key.credentialType} in ('apiKey', 'oauth')
             and ${key.userId} = ${user.id}
             and ${key.organizationId} = ${membership.organizationId}
             and ${key.enabled} = 1
             and ${key.revokedAt} is null
             and (${key.expiresAt} is null or ${key.expiresAt} > ${liveAfter})
+            ${input.grant === "manage" ? sql`and ${key.grant} = 'manage'` : sql``}
         )
         or (
           ${user.kind} = 'human'
@@ -107,8 +118,9 @@ export const liveHumanSessionSql = (
  * Compiles the live credential and membership authority predicate used inside
  * an existing SQLite mutation boundary. Table and column names come from the
  * configured cf-auth schema, including custom prefixes. This covers only a
- * live credential plus active membership and an allowed role; the host must
- * append its account, resource, and deadline policy to the same mutation.
+ * live credential plus active membership, an allowed role and, when asked,
+ * the credential's grant; the host must append its account, resource, and
+ * deadline policy to the same mutation.
  */
 export const credentialAuthorityCondition = (
   tables: CfAuthTables,

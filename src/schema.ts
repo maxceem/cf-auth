@@ -1,13 +1,19 @@
 import { sql } from "drizzle-orm";
 import { check, index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
-import { operationStates, organizationMemberStatuses, organizationRoles } from "./types.js";
+import {
+  apiKeyCredentialTypes,
+  credentialGrants,
+  operationStates,
+  organizationMemberStatuses,
+  organizationRoles,
+} from "./types.js";
 
 export interface CfAuthTablesOptions {
   /**
    * Prefix applied to every physical table and index name, e.g. `"auth_"`
    * produces `auth_user`, `auth_user_session`, ... Defaults to `""` (unprefixed:
    * `user`, `user_session`, `user_account`, `verification`, `organization`,
-   * `organization_user`, `api_key`, `operation`).
+   * `organization_user`, `api_key`, `operation`, `oauth_token`).
    *
    * If you set this, you must regenerate the reference migration — see the
    * README "Migrations" section.
@@ -182,10 +188,53 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
       expiresAt: integer("expires_at", { mode: "timestamp_ms" }),
       createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
       revokedAt: integer("revoked_at", { mode: "timestamp_ms" }),
-      /** Where the key was issued from, e.g. `console`, `cli` or `bootstrap`. Display only. */
+      /**
+       * Where the key was issued from, e.g. `console`, `cli` or `bootstrap`;
+       * `oauth` for a connection. Display only: provenance, never what the
+       * row authenticates as, which is `credential_type`.
+       */
       source: text("source").notNull().default("console"),
       /** A human-readable note about the holder, e.g. `CLI on mac-studio`. Display only. */
       label: text("label"),
+      /**
+       * How much of its holder's authority the key may exercise: `read` or
+       * `manage`. Enforced by cf-auth's services and operation guards; keys
+       * that predate it are `manage`.
+       *
+       * No CHECK constraint: adding one to an existing table makes drizzle-kit
+       * rebuild the table with an INSERT that reads this column before it
+       * exists, in every app's generated migration. cf-auth validates every
+       * value it writes, and reads anything else as `read`, the least grant.
+       */
+      grant: text("grant", { enum: credentialGrants }).notNull().default("manage"),
+      /**
+       * The OAuth client an OAuth connection (`credential_type = 'oauth'`) was
+       * issued to: a registered client id or a Client ID Metadata Document
+       * URL. Null for a key.
+       */
+      clientId: text("client_id"),
+      /**
+       * The protected resource a connection's tokens are bound to, normalised
+       * to the issuer origin. Access-token resolution refuses a connection
+       * whose resource is not the deployment's issuer. Null for a key.
+       */
+      resource: text("resource"),
+      /**
+       * What the row authenticates as: `apiKey`, a key looked up by its
+       * token's digest, or `oauth`, a connection whose tokens resolve only
+       * through the OAuth service. Every authentication and authority rule
+       * reads this column, never `source`; rows that predate it are keys.
+       *
+       * No CHECK constraint, though SQLite would accept one on `ADD COLUMN`:
+       * drizzle-kit cannot express a column-level CHECK, and a table-level
+       * one makes it rebuild `api_key` with a copy that reads this column
+       * before it exists, in every app's generated migration. Instead every
+       * rule matches one of the two values exactly, so a value put there by
+       * hand authenticates as neither.
+       */
+      credentialType: text("credential_type", { enum: apiKeyCredentialTypes })
+        .notNull()
+        .default("apiKey"),
     },
     (table) => [
       uniqueIndex(ix("api_key_token_hash_unique")).on(table.tokenHash),
@@ -234,6 +283,7 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
       outcome: text("outcome"),
       sealedOutcome: text("sealed_outcome"),
       sealedUntil: integer("sealed_until", { mode: "timestamp_ms" }),
+      /** Who approved, denied or executed it: attribution only, never a lock. */
       decidedByUserId: text("decided_by_user_id").references(() => user.id, {
         onDelete: "set null",
       }),
@@ -244,6 +294,12 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
       expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
       /** When the sweep may delete the record, whatever its state. */
       retainUntil: integer("retain_until", { mode: "timestamp_ms" }).notNull(),
+      /**
+       * The random value an `execute` in progress holds the reservation with.
+       * Its completion and its release both require it, so nothing that
+       * happens to a user row can unlock an execution that is running.
+       */
+      executionClaim: text("execution_claim"),
     },
     (table) => [
       uniqueIndex(ix("operation_poll_token_hash_unique")).on(table.pollTokenHash),
@@ -266,6 +322,47 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
     ],
   );
 
+  // --- OAuth connection tokens -----------------------------------------------
+  // An OAuth connection is an `api_key` row (`credential_type = 'oauth'`); its tokens
+  // live here, at most two generations per connection: the current one and
+  // the one it replaced. Only SHA-256 digests of the tokens are stored. The
+  // connection's lifetime is `api_key.expires_at`; a generation holds only
+  // its access token's own expiry.
+
+  const oauthToken = sqliteTable(
+    t("oauth_token"),
+    {
+      id: text("id").primaryKey(),
+      apiKeyId: text("api_key_id")
+        .notNull()
+        .references(() => apiKey.id, { onDelete: "cascade" }),
+      /** 1 for the generation the code exchange issued, then one more per rotation. */
+      generation: integer("generation").notNull(),
+      accessTokenHash: text("access_token_hash").notNull(),
+      accessExpiresAt: integer("access_expires_at", { mode: "timestamp_ms" }).notNull(),
+      refreshTokenHash: text("refresh_token_hash").notNull(),
+      /** When this generation's refresh token was exchanged for the next; null while current. */
+      rotatedAt: integer("rotated_at", { mode: "timestamp_ms" }),
+      /**
+       * The response of the rotation that replaced this generation, sealed
+       * under a key derived from this generation's refresh token, so only its
+       * holder can open the replay inside the grace window.
+       */
+      sealedResponse: text("sealed_response"),
+      createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+    },
+    // The (api_key_id, generation) index also serves every lookup and
+    // cascade by connection, as its leftmost column.
+    (table) => [
+      uniqueIndex(ix("oauth_token_access_token_hash_unique")).on(table.accessTokenHash),
+      uniqueIndex(ix("oauth_token_refresh_token_hash_unique")).on(table.refreshTokenHash),
+      uniqueIndex(ix("oauth_token_api_key_id_generation_unique")).on(
+        table.apiKeyId,
+        table.generation,
+      ),
+    ],
+  );
+
   return {
     user,
     session,
@@ -275,6 +372,7 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
     organizationUser,
     apiKey,
     operation,
+    oauthToken,
   };
 };
 
@@ -285,8 +383,9 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
  *
  * ```ts
  * import { cfAuthTables } from "@maxceem/cf-auth/schema";
- * export const { user, session, account, verification, organization, organizationUser, apiKey, operation } =
- *   cfAuthTables;
+ * export const {
+ *   user, session, account, verification, organization, organizationUser, apiKey, operation, oauthToken,
+ * } = cfAuthTables;
  * export const myAppTable = sqliteTable("my_app", { ... });
  * ```
  */
@@ -315,4 +414,5 @@ export const {
   organizationUser: organizationUserTable,
   apiKey: apiKeyTable,
   operation: operationTable,
+  oauthToken: oauthTokenTable,
 } = cfAuthTables;

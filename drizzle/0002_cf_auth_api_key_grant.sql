@@ -1,0 +1,1 @@
+ALTER TABLE `api_key` ADD `grant` text DEFAULT 'manage' NOT NULL;

@@ -15,6 +15,27 @@
       "when": 1790663745664,
       "tag": "0001_cf_auth_operations",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1790767113060,
+      "tag": "0002_cf_auth_api_key_grant",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1790817812878,
+      "tag": "0003_cf_auth_operation_execution_claim",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1790905695278,
+      "tag": "0004_cf_auth_oauth_token",
+      "breakpoints": true
     }
   ]
 }

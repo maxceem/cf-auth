@@ -62,7 +62,8 @@ describe("login operation", () => {
     expect(details).toMatchObject({
       kind: "login",
       state: "pending",
-      payload: null,
+      // No grant asked for is the default one, spelled out for the page.
+      payload: { grant: "manage" },
       client: { label: "CLI on mac-studio", meta: { os: "darwin", userAgent: "agw/1.0" } },
       organization: null,
       hasLoopbackRedirect: false,
@@ -101,14 +102,18 @@ describe("login operation", () => {
     };
     expect(outcome.organizationId).toBe(human.organizationId);
     expect(outcome.credential.token).toMatch(/^key_/);
-    expect(completed.record).toEqual({ organizationId: human.organizationId, apiKeyId: outcome.apiKeyId });
+    expect(completed.record).toEqual({
+      organizationId: human.organizationId,
+      apiKeyId: outcome.apiKeyId,
+      grant: "manage",
+    });
 
     // The key works, belongs to the approver, and says where it came from.
     const state = await harness.me({
       useJar: false,
       headers: { Authorization: `Bearer ${outcome.credential.token}`, "X-Client": "cli" },
     });
-    expect(state).toMatchObject({ credentialType: "apiKey", source: "cli" });
+    expect(state).toMatchObject({ credentialType: "apiKey", source: "cli", grant: "manage" });
     expect(state.user?.id).toBe(human.userId);
     expect(state.organization?.id).toBe(human.organizationId);
     const keys = await harness.cfAuth.service.listApiKeys({
@@ -122,6 +127,7 @@ describe("login operation", () => {
         name: "CLI on mac-studio",
         source: "cli",
         label: "CLI on mac-studio",
+        grant: "manage",
         enabled: true,
       }),
     ]);
@@ -1448,5 +1454,298 @@ describe("api key provenance", () => {
       harness.cfAuth.service.revokeOwnApiKey({ actor: await harness.cfAuth.service.resolveApiKeyAuthState("nope") }),
       "unauthorized",
     );
+  });
+});
+
+describe("operation grants", () => {
+  /** A write a caller opens and an admin approves; the default grant, `manage`. */
+  const change = defineOperationKind({
+    name: "change",
+    open: { minRole: "member" },
+    browser: true,
+    approve: () => ({ outcome: { changed: true }, seal: true }),
+  });
+  /** A read a caller opens and the app completes; declares `read`. */
+  const report = defineOperationKind({
+    name: "report",
+    open: { minRole: "member" },
+    browser: false,
+    grant: "read",
+  });
+  /** A write the app completes itself; the default grant. */
+  const apply = defineOperationKind({
+    name: "apply",
+    open: { minRole: "member" },
+    browser: false,
+  });
+  const kinds: OperationKind[] = [change, report, apply];
+
+  const keyState = async (harness: TestAuth, grant: "read" | "manage") => {
+    const owner = await harness.sessions.human();
+    const actor = await harness.actorFor(owner.userId);
+    const key = await harness.cfAuth.service.createApiKey({
+      organizationId: owner.organizationId,
+      actor,
+      name: `${grant} key`,
+      grant,
+    });
+    return {
+      owner,
+      actor,
+      key,
+      opener: await harness.cfAuth.service.resolveApiKeyAuthState(key.plaintext, "cli"),
+    };
+  };
+
+  it("issues the grant a login asks for, and keeps it in the record", async () => {
+    const harness = await createTestAuth(enabled());
+    const { operations } = harness.cfAuth;
+    const human = await harness.sessions.human();
+    const actor = await harness.actorFor(human.userId);
+    const token = createOperationToken();
+
+    const view = await operations.open({
+      kind: "login",
+      token,
+      payload: { grant: "read" },
+      client: { label: "Read-only agent" },
+    });
+    const details = await operations.details({ id: view.id, proof: view.browserProof!, viewer: actor });
+    expect(details.payload).toEqual({ grant: "read" });
+
+    await operations.approve({
+      id: view.id,
+      proof: view.browserProof!,
+      actor,
+      organizationId: human.organizationId,
+    });
+    const completed = await operations.poll({ id: view.id, token });
+    const outcome = completed.outcome as { credential: { token: string }; apiKeyId: string };
+    expect(completed.record).toEqual({
+      organizationId: human.organizationId,
+      apiKeyId: outcome.apiKeyId,
+      grant: "read",
+    });
+    const state = await harness.cfAuth.service.resolveApiKeyAuthState(outcome.credential.token, "cli");
+    expect(state).toMatchObject({ authenticated: true, grant: "read" });
+
+    // An explicit grant is its own request: a resend may not change it, nor
+    // drop it for the legacy spelling.
+    const explicit = createOperationToken();
+    const first = await operations.open({
+      kind: "login",
+      token: explicit,
+      payload: { grant: "manage" },
+      client: { label: "Agent" },
+    });
+    expect(
+      (await operations.open({ kind: "login", token: explicit, payload: { grant: "manage" }, client: { label: "Agent" } })).id,
+    ).toBe(first.id);
+    await expectCode(
+      operations.open({ kind: "login", token: explicit, payload: { grant: "read" }, client: { label: "Agent" } }),
+      "conflict",
+    );
+    await expectCode(
+      operations.open({ kind: "login", token: explicit, client: { label: "Agent" } }),
+      "conflict",
+    );
+  });
+
+  it("keeps a login opened without a payload as it was stored before grants, meaning manage", async () => {
+    const harness = await createTestAuth(enabled());
+    const { operations } = harness.cfAuth;
+    const human = await harness.sessions.human();
+    const actor = await harness.actorFor(human.userId);
+    const token = createOperationToken();
+
+    const first = await operations.open({ kind: "login", token, client: { label: "Old CLI" } });
+    // Stored and hashed exactly as before grants existed: no payload.
+    const row = (
+      await harness.client.execute({
+        sql: "SELECT payload, request_hash FROM operation WHERE id = ?",
+        args: [first.id],
+      })
+    ).rows[0]!;
+    expect(row.payload).toBeNull();
+    expect(row.request_hash).toBe(await sha256Hex(JSON.stringify(["login", null, null, null])));
+
+    // The CLI repeating the identical open is answered, not refused.
+    const repeated = await operations.open({ kind: "login", token, client: { label: "Old CLI" } });
+    expect(repeated.id).toBe(first.id);
+    const withNull = await operations.open({ kind: "login", token, payload: null, client: { label: "Old CLI" } });
+    expect(withNull.id).toBe(first.id);
+
+    // Everywhere it is read, no payload means manage.
+    const details = await operations.details({ id: first.id, proof: first.browserProof!, viewer: actor });
+    expect(details.payload).toEqual({ grant: "manage" });
+    await operations.approve({
+      id: first.id,
+      proof: first.browserProof!,
+      actor,
+      organizationId: human.organizationId,
+    });
+    const completed = await operations.poll({ id: first.id, token });
+    expect(completed.record).toMatchObject({ grant: "manage" });
+    const outcome = completed.outcome as { credential: { token: string } };
+    expect((await harness.cfAuth.service.resolveApiKeyAuthState(outcome.credential.token)).grant).toBe("manage");
+  });
+
+  it("refuses a login payload that is not a grant", async () => {
+    const harness = await createTestAuth(enabled());
+    const { operations } = harness.cfAuth;
+    for (const payload of [{ grant: "admin" }, { grant: "read", scope: "all" }, "read", ["read"]]) {
+      await expectCode(
+        operations.open({
+          kind: "login",
+          token: createOperationToken(),
+          payload,
+          client: { label: "Agent" },
+        }),
+        "validation_error",
+      );
+    }
+  });
+
+  it("refuses to open a kind from a key whose grant is below the kind's", async () => {
+    const harness = await createTestAuth(enabled({ kinds }));
+    const { operations } = harness.cfAuth;
+    const { opener: reader } = await keyState(harness, "read");
+    const { opener: manager, actor } = await keyState(harness, "manage");
+
+    await expectCode(
+      operations.open({ kind: "change", token: createOperationToken(), opener: reader }),
+      "grant_insufficient",
+    );
+    await expectCode(
+      operations.open({ kind: "apply", token: createOperationToken(), opener: reader }),
+      "grant_insufficient",
+    );
+
+    // A kind that only reads accepts a read key, and completes under it.
+    const read = await operations.open({ kind: "report", token: createOperationToken(), opener: reader });
+    expect(await operations.complete({ id: read.id, outcome: { rows: 3 } })).toMatchObject({
+      state: "completed",
+    });
+
+    // A session and a manage key open a manage kind.
+    await operations.open({ kind: "change", token: createOperationToken(), opener: manager });
+    await operations.open({ kind: "change", token: createOperationToken(), opener: actor });
+  });
+
+  it("rechecks the opener's grant when the write lands", async () => {
+    const harness = await createTestAuth(enabled({ kinds }));
+    const { operations } = harness.cfAuth;
+    const { opener, actor, key } = await keyState(harness, "manage");
+
+    const approved = await operations.open({ kind: "change", token: createOperationToken(), opener });
+    const completed = await operations.open({ kind: "apply", token: createOperationToken(), opener });
+
+    // The key no longer carries `manage` by the time either write lands.
+    await harness.client.execute({
+      sql: `UPDATE api_key SET "grant" = 'read' WHERE id = ?`,
+      args: [key.id],
+    });
+
+    await expectCode(
+      operations.approve({ id: approved.id, proof: approved.browserProof!, actor }),
+      "conflict",
+    );
+    await expectCode(operations.complete({ id: completed.id, outcome: {} }), "conflict");
+    expect(await harness.cfAuth.service.resolveApiKeyAuthState(key.plaintext)).toMatchObject({
+      grant: "read",
+    });
+  });
+
+  it("refuses the completion once the opener's row is no longer exactly a key", async () => {
+    const harness = await createTestAuth(enabled({ kinds }));
+    const { operations } = harness.cfAuth;
+    const { opener, key } = await keyState(harness, "manage");
+    const typeIs = (value: string) =>
+      harness.client.execute({ sql: "UPDATE api_key SET credential_type = ? WHERE id = ?", args: [value, key.id] });
+
+    const opened = await operations.open({ kind: "apply", token: createOperationToken(), opener });
+    await typeIs("other");
+
+    // Neither fresh authentication nor the write's recheck accepts it.
+    expect((await harness.cfAuth.service.resolveApiKeyAuthState(key.plaintext)).authenticated).toBe(false);
+    await expectCode(operations.complete({ id: opened.id, outcome: {} }), "conflict");
+    const state = async () =>
+      (await harness.client.execute({ sql: "SELECT state FROM operation WHERE id = ?", args: [opened.id] })).rows[0]
+        ?.state;
+    expect(await state()).toBe("pending");
+
+    // Restored, the same operation completes: nothing but the type refused it.
+    await typeIs("apiKey");
+    await operations.complete({ id: opened.id, outcome: {} });
+    expect(await state()).toBe("completed");
+  });
+
+  it("withholds a sealed manage outcome from a downgraded key, even once its kind is gone", async () => {
+    const harness = await createTestAuth(enabled({ kinds }));
+    const { opener, actor, key } = await keyState(harness, "manage");
+    const withoutKinds = createCfAuth({
+      appName: "Test App",
+      secret: testSecret,
+      db: harness.db,
+      apiKeys: { enabled: true },
+      operations: { enabled: true, realm: "test-deployment" },
+      onError: () => {},
+    }).operations;
+
+    // Collected by poll: a kind the app completes.
+    const pollToken = createOperationToken();
+    const polled = await harness.cfAuth.operations.open({ kind: "apply", token: pollToken, opener });
+    await harness.cfAuth.operations.complete({
+      id: polled.id,
+      outcome: { secret: "only-for-manage" },
+      seal: true,
+    });
+
+    // Collected by redeem: a browser kind with a loopback redirect.
+    const redeemToken = createOperationToken();
+    const redeemed = await harness.cfAuth.operations.open({
+      kind: "change",
+      token: redeemToken,
+      opener,
+      client: { loopbackRedirect: "http://127.0.0.1:5000/cb" },
+    });
+    const approval = await harness.cfAuth.operations.approve({
+      id: redeemed.id,
+      proof: redeemed.browserProof!,
+      actor,
+    });
+
+    await harness.client.execute({
+      sql: `UPDATE api_key SET "grant" = 'read' WHERE id = ?`,
+      args: [key.id],
+    });
+
+    for (const operations of [harness.cfAuth.operations, withoutKinds]) {
+      const answer = await operations.poll({ id: polled.id, token: pollToken });
+      expect(answer).not.toHaveProperty("outcome");
+      await expectCode(
+        operations.redeem({ id: redeemed.id, token: redeemToken, redeemCode: approval.redeemCode! }),
+        "operation_expired",
+      );
+    }
+    // Withheld, not spent: it is still sealed, waiting for a key that may have it.
+    const sealed = (
+      await harness.client.execute({
+        sql: "SELECT id FROM operation WHERE sealed_outcome IS NOT NULL ORDER BY id",
+        args: [],
+      })
+    ).rows.map((row) => row.id);
+    expect(sealed.sort()).toEqual([polled.id, redeemed.id].sort());
+  });
+
+  it("rejects a grant on a public kind, and one that is not a grant", async () => {
+    await expect(
+      createTestAuth(
+        enabled({ kinds: [defineOperationKind({ name: "open", open: "public", browser: false, grant: "read" })] }),
+      ),
+    ).rejects.toMatchObject({ code: "validation_error" });
+    await expect(
+      createTestAuth(enabled({ kinds: [{ ...apply, grant: "all" as "read" }] })),
+    ).rejects.toMatchObject({ code: "validation_error" });
   });
 });
