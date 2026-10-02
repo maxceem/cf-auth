@@ -78,7 +78,6 @@ const internalTask = defineOperationKind({
   name: "cf-auth:internal.task",
   open: { minRole: "member" },
   browser: false,
-  internal: true,
 });
 const internalPage = defineOperationKind({
   name: "cf-auth:internal.page",
@@ -86,7 +85,6 @@ const internalPage = defineOperationKind({
   browser: true,
   approver: "proof",
   userCode: true,
-  internal: true,
   approve: () => ({ outcome: { approved: true } }),
 });
 
@@ -1043,27 +1041,15 @@ describe("internal kinds", () => {
     expect((await row(harness, reserved.id)).sealed_outcome).not.toBeNull();
   });
 
-  it("are named in cf-auth's namespace, and only they are", () => {
-    const named = (name: string, internalFlag?: true) =>
-      ({ name, open: { minRole: "member" }, browser: false, ...(internalFlag ? { internal: internalFlag } : {}) }) as OperationKind;
-    expect(() => validateOperationKind(named("cf-auth:x.y", true), "k", { builtIn: true })).not.toThrow();
-    expect(() => validateOperationKind(named("x.y", true), "k", { builtIn: true })).toThrow(/cf-auth:/);
-    expect(() => validateOperationKind(named("cf-auth:x.y"), "k", { builtIn: true })).toThrow(/cf-auth:/);
+  it("are internal by their name alone, which only a built-in kind may take", () => {
+    const named = (name: string) => ({ name, open: { minRole: "member" }, browser: false }) as OperationKind;
+    expect(() => validateOperationKind(named("cf-auth:x.y"), "k", { builtIn: true })).not.toThrow();
+    expect(() => validateOperationKind(named("x.y"), "k", { builtIn: true })).not.toThrow();
     expect(() => validateOperationKind(named("cf-auth:x.y"), "k")).toThrow(/lowercase/);
     expect(() => validateOperationKind(named("cf-auth:"), "k", { builtIn: true })).toThrow(/lowercase/);
   });
 
   it("may not be declared by an app", async () => {
-    await expect(
-      createTestAuth({
-        operations: { enabled: true, kinds: [{ ...createApp, internal: true }] },
-      }),
-    ).rejects.toMatchObject({ code: "validation_error" });
-    await expect(
-      createTestAuth({
-        operations: { enabled: true, kinds: [{ ...createApp, internal: false as unknown as true }] },
-      }),
-    ).rejects.toMatchObject({ code: "validation_error" });
     await expect(
       createTestAuth({
         operations: { enabled: true, kinds: [{ ...createApp, name: "cf-auth:app.create" }] },

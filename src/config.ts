@@ -361,9 +361,10 @@ const positiveInteger = (value: number | undefined, fallback: number, label: str
 
 /**
  * Checks one kind's own settings; exported so the built-in kinds go through the
- * same rules. Only a built-in kind may be `internal`: nothing outside cf-auth
- * can drive one, so an app declaring it would register a kind it cannot use.
- * An internal kind is named `cf-auth:<name>`, and only an internal kind is.
+ * same rules. A kind is internal by its name alone, `cf-auth:<name>`, and only
+ * a built-in kind may take one: nothing outside cf-auth can drive an internal
+ * kind, so an app declaring one would register a kind it cannot use. There is
+ * no public flag for it, so nothing an app writes can mark a kind internal.
  */
 export const validateOperationKind = (
   kind: OperationKind,
@@ -379,14 +380,6 @@ export const validateOperationKind = (
     );
   }
   label ??= `operations.kinds[${kind.name}]`;
-  if (kind.internal !== undefined && (kind.internal !== true || !options.builtIn)) {
-    throw validationError(`\`${label}.internal\` is reserved for cf-auth's own built-in kinds`);
-  }
-  if ((kind.internal === true) !== internalName) {
-    throw validationError(
-      `\`${label}\`: a kind is internal exactly when its name starts with \`${internalOperationKindPrefix}\``,
-    );
-  }
   if (kind.open !== "public" && !organizationRoles.includes(kind.open?.minRole)) {
     throw validationError(`\`${label}.open\` must be "public" or { minRole }`);
   }
@@ -433,12 +426,37 @@ export const validateOperationKind = (
   }
 };
 
+/**
+ * Refuses a database without `batch` for a feature whose writes must land
+ * together or not at all: run in order instead, a write refused late would
+ * leave the ones before it committed.
+ */
+const assertBatchingDatabase = (db: CfAuthDatabase, feature: string, why: string): void => {
+  if (typeof (db as unknown as { batch?: unknown }).batch !== "function") {
+    throw validationError(`\`${feature}\` needs a database that batches atomically (D1, libsql): ${why}`);
+  }
+};
+
+/**
+ * Operations' half of {@link assertBatchingDatabase}. Exported for the
+ * engine, which may be handed a configuration that never went through
+ * `resolveConfig`.
+ */
+export const assertOperationsDatabase = (db: CfAuthDatabase): void =>
+  assertBatchingDatabase(
+    db,
+    "operations",
+    "a completion, an execution and a sweep are each one batch, and a refused completion rolls its whole batch back",
+  );
+
 const resolveOperations = (
   config: CfAuthConfig,
+  db: CfAuthDatabase,
   apiKeysEnabled: boolean,
 ): ResolvedOperationsConfig => {
   const input = config.operations ?? {};
   const enabled = input.enabled ?? false;
+  if (enabled) assertOperationsDatabase(db);
   const loginInput = input.login ?? true;
   const login =
     enabled && loginInput !== false
@@ -570,11 +588,7 @@ const resolveOAuth = (
   if (!operationsEnabled) {
     throw validationError("`oauth` runs its authorizations on the operation engine; set `operations.enabled: true`");
   }
-  if (typeof (db as unknown as { batch?: unknown }).batch !== "function") {
-    throw validationError(
-      "`oauth` needs a database that batches atomically (D1, libsql): its code exchange, rotation and revocation are each one batch",
-    );
-  }
+  assertBatchingDatabase(db, "oauth", "its code exchange, rotation and revocation are each one batch");
 
   if (typeof input.issuer !== "string" || !input.issuer) {
     throw validationError("`oauth.issuer` is required");
@@ -818,7 +832,7 @@ export const resolveConfig = (config: CfAuthConfig): ResolvedCfAuthConfig => {
   }
 
   const apiKeysEnabled = config.apiKeys?.enabled ?? false;
-  const operations = resolveOperations(config, apiKeysEnabled);
+  const operations = resolveOperations(config, db, apiKeysEnabled);
   const apiKeyTokenPrefix = config.apiKeys?.tokenPrefix ?? "key_";
   const oauth = resolveOAuth(
     config,

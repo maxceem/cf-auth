@@ -1656,6 +1656,30 @@ describe("operation grants", () => {
     });
   });
 
+  it("refuses the completion once the opener's row is no longer exactly a key", async () => {
+    const harness = await createTestAuth(enabled({ kinds }));
+    const { operations } = harness.cfAuth;
+    const { opener, key } = await keyState(harness, "manage");
+    const typeIs = (value: string) =>
+      harness.client.execute({ sql: "UPDATE api_key SET credential_type = ? WHERE id = ?", args: [value, key.id] });
+
+    const opened = await operations.open({ kind: "apply", token: createOperationToken(), opener });
+    await typeIs("other");
+
+    // Neither fresh authentication nor the write's recheck accepts it.
+    expect((await harness.cfAuth.service.resolveApiKeyAuthState(key.plaintext)).authenticated).toBe(false);
+    await expectCode(operations.complete({ id: opened.id, outcome: {} }), "conflict");
+    const state = async () =>
+      (await harness.client.execute({ sql: "SELECT state FROM operation WHERE id = ?", args: [opened.id] })).rows[0]
+        ?.state;
+    expect(await state()).toBe("pending");
+
+    // Restored, the same operation completes: nothing but the type refused it.
+    await typeIs("apiKey");
+    await operations.complete({ id: opened.id, outcome: {} });
+    expect(await state()).toBe("completed");
+  });
+
   it("withholds a sealed manage outcome from a downgraded key, even once its kind is gone", async () => {
     const harness = await createTestAuth(enabled({ kinds }));
     const { opener, actor, key } = await keyState(harness, "manage");

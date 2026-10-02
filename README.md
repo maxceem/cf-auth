@@ -169,9 +169,9 @@ errors, the guard and the seal window.
 OAuth 2.1 for public clients such as MCP clients: the authorization-code
 flow with PKCE, a consent page where a person picks the account and the
 grant, refresh with rotation, and revocation. What a client ends up holding
-is a **connection**: an `api_key` row with `source: "oauth"`, bound to one
+is a **connection**: an `api_key` row with `credential_type = 'oauth'`, bound to one
 person in one organization with a grant, like a key. It shows up in
-`listApiKeys` beside the keys, with its client's `clientId`, and
+`listApiKeys` beside the keys, with `credentialType: "oauth"` and its client's `clientId`, and
 `revokeApiKey` ends it. Its tokens are prefixed and name the connection,
 `<prefix><connectionId>.<secret>`: the access token lives 10 minutes, the
 refresh token 30 days, restarted by each rotation, and `expires_at` on the
@@ -202,8 +202,9 @@ app.get("/oauth/authorize", async (c) => {
   return c.html(errorPage(result.error.description), result.error.status); // never back to the client
 });
 app.post("/oauth/token", async (c) => {
-  const { status, body } = await cfAuth.oauth.token({ body: new URLSearchParams(await c.req.text()) });
-  return c.json(body, status, { "Cache-Control": "no-store" });
+  const result = await cfAuth.oauth.token({ body: new URLSearchParams(await c.req.text()) });
+  const retry = result.status === 429 ? { "Retry-After": String(result.retryAfterSeconds) } : {};
+  return c.json(result.body, result.status, { "Cache-Control": "no-store", ...retry });
 });
 // Your bearer gate; the middleware also routes the access prefix here by itself.
 const state = await cfAuth.oauth.resolveAccessTokenAuthState(token, { source: "mcp" });
@@ -240,7 +241,8 @@ is a security rule:
 
 Both approvals are idempotent: approving again, by either door, answers the
 same redirect byte for byte, because the code is kept sealed under the
-browser proof. A refresh rotates the tokens; the previous refresh token
+browser proof. A refresh rotates the tokens, at most once per 5 s: sooner is `429
+slow_down` with a `Retry-After`, and the token stays good. The previous refresh token
 replays the same response for 30 s, and after that its return revokes the
 whole connection. See [OAuth connections](docs/index.md#oauth-connections)
 and [Authorization](docs/index.md#authorization).
@@ -254,16 +256,21 @@ Every deployment, whether or not it turns OAuth on:
 - **Apply three migrations, in order**: `0002_cf_auth_api_key_grant.sql`
   (`api_key.grant`, every existing key at `manage`),
   `0003_cf_auth_operation_execution_claim.sql` (`operation.execution_claim`)
-  and `0004_cf_auth_oauth_token.sql` (the `oauth_token` table and
-  `api_key.client_id` and `api_key.resource`). If you generate with
+  and `0004_cf_auth_oauth_token.sql` (the `oauth_token` table,
+  `api_key.client_id`, `api_key.resource` and `api_key.credential_type`,
+  every existing key at `apiKey`; an OAuth connection is `oauth`). If you generate with
   drizzle-kit instead, export `oauthToken` from `cfAuthTables` beside the
   other tables and generate. cf-auth's queries name these columns with OAuth
   off too.
 - **A custom `CfAuthRepository`** (one you wrote rather than
-  `createCfAuthRepository`) must add `findOAuthAccess` — see
-  [Storage](docs/index.md#storage) for its contract — store the `grant`
-  `createApiKey` is given, and return `grant` and `clientId` on every
-  `ApiKeySummary`.
+  `createCfAuthRepository`) must store the `grant` `createApiKey` is given,
+  write `credential_type` `apiKey` (the column's default), and return
+  `grant`, `clientId` and `credentialType` on every `ApiKeySummary`; it
+  must also look a key up only among `credential_type = 'apiKey'` rows in
+  `findActiveApiKeyByHash`, never by `source`.
+- **Operations need a database that batches atomically** (D1, libsql):
+  `createCfAuth` refuses one without `batch` while `operations.enabled` is
+  on, where it used to run the statements one by one.
 - **A refused completion rolls back its whole batch.** When `approve`,
   `complete`, `execute` or `amend` finds its guard refused, the engine now
   makes the batch fail on purpose (`NOT NULL constraint failed:
@@ -273,10 +280,9 @@ Every deployment, whether or not it turns OAuth on:
   that relied on its statements landing when the completion did not, and
   expect that error if you alert on database errors.
 - **The `cf-auth:` kind namespace is reserved.** `open` and `reserve` refuse
-  such a kind with `422 validation_error`, a lookup of one of its rows answers
-  `404 operation_not_found` (or `null`), and `internal` is refused in
-  `operations.kinds`. Kind names could never contain `:`, so your own kinds
-  are unaffected.
+  such a kind with `422 validation_error`, and a lookup of one of its rows
+  answers `404 operation_not_found` (or `null`). Kind names could never contain
+  `:`, so your own kinds are unaffected.
 - `AuthState` gained `grant`, and `credentialType` may be `"oauth"`: an
   exhaustive switch, or an `AuthState` you build by hand in a test, needs the
   new case or field.
@@ -286,7 +292,9 @@ block to `createCfAuth` with `enabled: true`, an `issuer` origin and a
 `tokenPrefix` for access and refresh tokens, plus `clients` you register
 yourself if you want any; it needs `apiKeys` and `operations` on and a D1 or
 libsql database, then mount the routes listed under
-[OAuth connections](#oauth-connections).
+[OAuth connections](#oauth-connections). Its token endpoint answers a
+refresh within 5 s of the last one with `429 slow_down` and
+`retryAfterSeconds`, which your route sends as `Retry-After`.
 
 ## Documentation
 

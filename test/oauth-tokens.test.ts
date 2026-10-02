@@ -256,6 +256,7 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
           name: clientName,
           label: clientName,
           source: "oauth",
+          credential_type: "oauth",
           client_id: clientId,
           resource: issuer,
           grant: "manage",
@@ -406,19 +407,32 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         expect(String(stored[0]!.sealed_response)).not.toContain(next.access_token.split(".")[1]!);
       });
 
-      it("refuses a second rotation within 5 s, keeps the current token valid, and keeps two generations", async () => {
+      it("throttles a second rotation within 5 s with 429 slow_down, keeps the current token valid, and keeps two generations", async () => {
         const { tokens, connectionId } = await connect();
         const second = ok(await refresh(tokens.refresh_token));
         const before = await snapshot(connectionId);
 
-        expect(await refresh(second.refresh_token)).toEqual({
-          status: 400,
-          body: { error: "invalid_grant", error_description: "slow down: refreshed too recently" },
+        const throttled = await refresh(second.refresh_token);
+        expect(throttled).toEqual({
+          status: 429,
+          body: { error: "slow_down", error_description: "Refreshed too recently; retry after the interval" },
+          retryAfterSeconds: expect.any(Number),
         });
-        expect(await snapshot(connectionId)).toEqual(before);
+        // Rounded up to whole seconds, never past the interval.
+        expect(throttled.status === 429 && throttled.retryAfterSeconds).toBeGreaterThanOrEqual(1);
+        expect(throttled.status === 429 && throttled.retryAfterSeconds).toBeLessThanOrEqual(5);
+        // Two seconds of the interval left, less however long this test has run since.
+        await ageRotation(connectionId, 3_000);
+        expect(await refresh(second.refresh_token)).toMatchObject({ status: 429, retryAfterSeconds: 2 });
+        expect(await snapshot(connectionId)).toEqual({
+          ...before,
+          generations: before.generations.map((row, index) =>
+            index === 0 ? { ...row, rotated_at: Number(row.rotated_at) - 3_000 } : row,
+          ),
+        });
         expect((await resolve(second.access_token)).authenticated).toBe(true);
 
-        await ageRotation(connectionId, 6_000);
+        await ageRotation(connectionId, 3_000);
         const third = ok(await refresh(second.refresh_token));
         expect((await generations(connectionId)).map((row) => row.generation)).toEqual([2, 3]);
         // The generation before the previous one is gone, so its token is unknown: no revocation.
@@ -1092,6 +1106,7 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         const connection = listed.find((key) => key.id === connectionId);
         expect(connection).toMatchObject({
           source: "oauth",
+          credentialType: "oauth",
           clientId,
           grant: "read",
           name: clientName,
@@ -1244,9 +1259,41 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
       it("may revoke itself, whatever its grant", async () => {
         const { tokens, connectionId } = await connect({ grant: "read" });
         const revoked = await h.cfAuth.service.revokeOwnApiKey({ actor: await resolve(tokens.access_token) });
-        expect(revoked).toMatchObject({ id: connectionId, source: "oauth" });
+        expect(revoked).toMatchObject({ id: connectionId, source: "oauth", credentialType: "oauth" });
         expect(await generations(connectionId)).toHaveLength(0);
         expect((await resolve(tokens.access_token)).authenticated).toBe(false);
+      });
+
+      it("authenticates by credential_type, never by source", async () => {
+        const { human, tokens, connectionId } = await connect();
+        const key = await h.cfAuth.service.createApiKey({
+          organizationId: human.organizationId,
+          actor: await h.actorFor(human.userId),
+          name: "Plain key",
+        });
+        expect(key.credentialType).toBe("apiKey");
+        const keyAuthenticates = async () =>
+          (await h.cfAuth.service.resolveApiKeyAuthState(key.plaintext)).authenticated;
+
+        // Provenance swapped both ways: nothing changes.
+        await h.exec("UPDATE api_key SET source = 'console' WHERE id = ?", connectionId);
+        await h.exec("UPDATE api_key SET source = 'oauth' WHERE id = ?", key.id);
+        expect(await keyAuthenticates()).toBe(true);
+        const rotated = ok(await refresh(tokens.refresh_token));
+        const connectionAuthenticates = async () => (await resolve(rotated.access_token)).authenticated;
+        expect(await connectionAuthenticates()).toBe(true);
+
+        // Each type swapped: the key's token never resolves as a connection's, nor the reverse.
+        await h.exec("UPDATE api_key SET credential_type = 'oauth' WHERE id = ?", key.id);
+        await h.exec("UPDATE api_key SET credential_type = 'apiKey' WHERE id = ?", connectionId);
+        expect(await keyAuthenticates()).toBe(false);
+        expect(await connectionAuthenticates()).toBe(false);
+        expect((await h.cfAuth.service.resolveApiKeyAuthState(rotated.access_token)).authenticated).toBe(false);
+
+        // A value cf-auth never writes authenticates as neither.
+        await h.exec("UPDATE api_key SET credential_type = 'other' WHERE id IN (?, ?)", connectionId, key.id);
+        expect(await keyAuthenticates()).toBe(false);
+        expect(await connectionAuthenticates()).toBe(false);
       });
 
       it("cannot be minted as a key: source oauth is reserved", async () => {

@@ -227,9 +227,10 @@ oauth?: {
 Validation follows `resolveConfig`: the issuer must be https, or http on
 loopback; `oauth` requires `apiKeys` and `operations`; the prefixes must be
 distinct from `apiKeys.tokenPrefix` and from each other. `oauth` also refuses
-a database without `batch`: the engine's sequential fallback keeps every
-guard but not atomicity, and the code exchange, the rotation and the guest
-provisioning each depend on one atomic batch.
+a database without `batch`: the code exchange, the rotation and the guest
+provisioning each depend on one atomic batch. (Operations now refuse one
+too, and the engine has no sequential fallback, since a refused completion
+must roll back its whole batch.)
 
 The refresh grace (30 s) and the rotation rate limit (one rotation per 5 s per
 connection) are fixed, not configurable.
@@ -254,8 +255,10 @@ connection) are fixed, not configurable.
 - `ApiKeySummary` gains:
   - `grant: "read" | "manage"`;
   - `clientId: string | null`, null for a key;
-  - `source: "oauth"` for a connection. `normalizeApiKeySource` must refuse a
-    caller-supplied `"oauth"`.
+  - `credentialType: "apiKey" | "oauth"`, from `api_key.credential_type`,
+    which decides what the row authenticates as;
+  - `source: "oauth"` for a connection, as provenance only.
+    `normalizeApiKeySource` must refuse a caller-supplied `"oauth"`.
 - Issuance inputs gain `grant?: "read" | "manage"`, defaulting to `"manage"`:
   `createApiKey`, `issueServiceApiKey`, and the `login` kind, which the CLI
   opens at `manage`.
@@ -550,9 +553,10 @@ on a live connection, rotates in one guarded batch:
   advances `api_key.expires_at` (see "Connection lifetime").
 
 **Rate limit.** At most one rotation per 5 s per connection. Presenting the
-current refresh token within 5 s of the last rotation fails with
-`invalid_grant` and the description "slow down: refreshed too recently"; it
-revokes nothing, and the current token stays valid.
+current refresh token within 5 s of the last rotation answers `429` with
+`slow_down` (RFC 8628's name) and `retryAfterSeconds` for `Retry-After`; it
+revokes nothing, and the current token stays valid. Not `invalid_grant`,
+which tells a client to discard its token.
 
 **Grace.** Presenting the previous generation's refresh token within 30 s of
 its rotation replays the sealed response: the same access and refresh tokens,
@@ -776,8 +780,15 @@ gateway's tables become `mgmt_oauth_token`, and so on.
     cf-auth validates every value it writes, and an unknown stored value
     reads as `read`. Step 3. Existing rows migrate to `manage`.
   - `client_id text` and `resource text`, null for keys. Step 9.
-  - A connection row has `source = 'oauth'`, `name`/`label` set to the
-    client's name, and `expires_at` set as in "Connection lifetime".
+  - `credential_type text not null default 'apiKey'`, `oauth` for a
+    connection, and no CHECK: SQLite accepts one on `ADD COLUMN`, but
+    drizzle-kit can only emit a table-level CHECK, which it applies by the
+    same broken rebuild as for `grant`. Key lookup
+    matches `apiKey` and every OAuth rule matches `oauth`, exactly, so an
+    unknown value authenticates as neither. `source` is display only.
+  - A connection row has `credential_type = 'oauth'`, `source = 'oauth'`,
+    `name`/`label` set to the client's name, and `expires_at` set as in
+    "Connection lifetime".
   - Its `token_hash` holds the digest of a random value that is never
     revealed. That keeps the unique index honest; no token authenticates
     through that column.

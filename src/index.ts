@@ -42,6 +42,7 @@ export {
 export {
   actionSources,
   apiKeyActionSources,
+  apiKeyCredentialTypes,
   canManageOrganization,
   createEmptyAuthState,
   credentialGrants,
@@ -56,6 +57,7 @@ export {
   organizationRoles,
   type ActionSource,
   type ApiKeyActionSource,
+  type ApiKeyCredentialType,
   type ApiKeySummary,
   type AuthActor,
   type AuthSession,
@@ -200,16 +202,12 @@ export {
   type OAuthTokenResult,
 } from "./oauth/service.js";
 export {
-  oauthAuthorizationRecordTtlMs,
-  oauthAuthorizeKindName,
   oauthEndpointPaths,
   oauthScopes,
   type ApproveAuthorizationInput,
   type ApproveGuestAuthorizationInput,
   type AuthorizationServerMetadata,
   type OAuthAuthorizationDetails,
-  type OAuthAuthorizationPayload,
-  type OAuthAuthorizationRecord,
   type OAuthAuthorizeErrorPage,
   type OAuthAuthorizeResult,
   type OAuthClientIdentity,

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { resolveConfig, type CfAuthDatabase } from "../src/config.js";
 import { createBetterAuthOptions } from "../src/better-auth.js";
+import { createOperationsService } from "../src/operations.js";
+import { createCfAuthRepository } from "../src/repository.js";
 import { cfAuthTables, createCfAuthTables } from "../src/schema.js";
 import { getTableName } from "drizzle-orm";
 
@@ -214,6 +216,21 @@ describe("resolveConfig", () => {
         },
       }),
     ).toThrowError(/maxAge/);
+  });
+
+  it("refuses operations on a database that cannot batch, through either factory", () => {
+    const withOperations = { ...base, apiKeys: { enabled: true }, operations: { enabled: true } };
+    expect(() => resolveConfig(withOperations)).toThrowError(
+      /`operations` needs a database that batches atomically \(D1, libsql\)/,
+    );
+    expect(() => resolveConfig({ ...base, operations: { enabled: false } })).not.toThrow();
+
+    // A resolved configuration built by hand, which never went through resolveConfig.
+    const batching = resolveConfig({ ...withOperations, db: { batch: async () => [] } as unknown as CfAuthDatabase });
+    const resolved = { ...batching, db };
+    expect(() => createOperationsService(resolved, createCfAuthRepository(db, cfAuthTables))).toThrowError(
+      /batches atomically/,
+    );
   });
 });
 

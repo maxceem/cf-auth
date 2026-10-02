@@ -152,11 +152,11 @@ describe("credentialAuthorityCondition", () => {
       for (const statement of [
         "create table private_user (id text primary key, kind text not null)",
         "create table private_organization_user (organization_id text, user_id text, role text, status text)",
-        "create table private_api_key (id text, user_id text, organization_id text, enabled integer, revoked_at integer, expires_at integer)",
+        "create table private_api_key (id text, user_id text, organization_id text, credential_type text, enabled integer, revoked_at integer, expires_at integer)",
         "create table private_user_session (id text, user_id text, expires_at integer)",
         "insert into private_user values ('user', 'human')",
         "insert into private_organization_user values ('org', 'user', 'owner', 'active')",
-        "insert into private_api_key values ('credential', 'user', 'org', 1, null, null)",
+        "insert into private_api_key values ('credential', 'user', 'org', 'apiKey', 1, null, null)",
       ]) {
         await client.execute(statement);
       }

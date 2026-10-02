@@ -1,10 +1,11 @@
-import { and, asc, count, eq, gt, isNull, ne, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, count, eq, gt, inArray, isNull, ne, or, sql, type SQL } from "drizzle-orm";
 import { alias } from "drizzle-orm/sqlite-core";
 import type { CfAuthDatabase } from "./config.js";
 import { deterministicUuid } from "./crypto.js";
 import { CfAuthError, conflict, validationError } from "./errors.js";
 import type { CfAuthTables } from "./schema.js";
 import {
+  apiKeyCredentialTypes,
   isCredentialGrant,
   type ApiKeySummary,
   type AuthSession,
@@ -254,21 +255,82 @@ export interface CfAuthRepository {
   revokeApiKey(apiKeyId: string, organizationId: string): Promise<ApiKeySummary | null>;
   findApiKeyById(apiKeyId: string, organizationId: string): Promise<ApiKeySummary | null>;
   findActiveApiKeyByHash(tokenHash: string, now: Date): Promise<ApiKeyAuthRecord | null>;
-  /**
-   * An OAuth connection's current generation with everything an access
-   * token's state is built from — the connection's grant, its user, and the
-   * membership with its organization — read in one statement, where
-   * `condition` holds. Used by the OAuth service, which passes the liveness
-   * rule as `condition` and then verifies the token's digest against
-   * `accessTokenHash`.
-   */
-  findOAuthAccess(input: { connectionId: string; condition: SQL }): Promise<{
-    accessTokenHash: string;
-    grant: string;
-    user: AuthUser;
-    membership: OrganizationMembership;
-  } | null>;
 }
+
+/**
+ * The columns a user and a membership with its organization are read with,
+ * and how a row of them becomes an {@link AuthUser} and an
+ * {@link OrganizationMembership}. Shared with cf-auth's OAuth store, which
+ * reads them in the same statement as an access token; not exported from the
+ * package index.
+ */
+export const authRowColumns = ({ user, organization, organizationUser }: CfAuthTables) => ({
+  userColumns: {
+    id: user.id,
+    kind: user.kind,
+    name: user.name,
+    email: user.email,
+    emailVerified: user.emailVerified,
+    image: user.image,
+    createdAt: user.createdAt,
+  },
+  membershipColumns: {
+    role: organizationUser.role,
+    status: organizationUser.status,
+    joinedAt: organizationUser.joinedAt,
+    organizationId: organization.id,
+    organizationName: organization.name,
+    organizationCreatedAt: organization.createdAt,
+    claimed: sql<boolean>`EXISTS (
+      SELECT 1 FROM ${organizationUser} claimed_membership
+      JOIN ${user} claimed_user ON claimed_user.id = claimed_membership.user_id
+      WHERE claimed_membership.organization_id = ${organization}.${sql.identifier(organization.id.name)}
+        AND claimed_membership.role = 'owner'
+        AND claimed_user.kind = 'human'
+    )`,
+    expiresAt: organization.expiresAt,
+  },
+});
+
+export const toAuthUser = (row: {
+  id: string;
+  name: string | null;
+  email: string | null;
+  kind: "human" | "service";
+  emailVerified: boolean;
+  image: string | null;
+  createdAt: Date | string | number;
+}): AuthUser => ({
+  id: row.id,
+  kind: row.kind,
+  name: row.name,
+  email: row.email,
+  emailVerified: Boolean(row.emailVerified),
+  image: row.image,
+  createdAt: toIso(row.createdAt),
+});
+
+export const toMembership = (row: {
+  role: OrganizationRole;
+  status: "active";
+  joinedAt: string;
+  organizationId: string;
+  organizationName: string;
+  organizationCreatedAt: string;
+  claimed: boolean | number;
+  expiresAt: string | null;
+}): OrganizationMembership => ({
+  role: row.role,
+  status: row.status,
+  joinedAt: row.joinedAt,
+  organization: {
+    claimed: Boolean(row.claimed),
+    expiresAt: row.expiresAt,
+    id: row.organizationId,
+    name: row.organizationName,
+    createdAt: row.organizationCreatedAt,
+  },
+});
 
 export const createCfAuthRepository = (
   db: CfAuthDatabase,
@@ -276,6 +338,7 @@ export const createCfAuthRepository = (
   options: CfAuthRepositoryOptions = {},
 ): CfAuthRepository => {
   const { user, session, organization, organizationUser, apiKey, oauthToken } = tables;
+  const { userColumns, membershipColumns } = authRowColumns(tables);
 
   const onError =
     options.onError ??
@@ -352,73 +415,6 @@ export const createCfAuthRepository = (
     );
   };
 
-  const userColumns = {
-    id: user.id,
-    kind: user.kind,
-    name: user.name,
-    email: user.email,
-    emailVerified: user.emailVerified,
-    image: user.image,
-    createdAt: user.createdAt,
-  };
-
-  const toAuthUser = (row: {
-    id: string;
-    name: string | null;
-    email: string | null;
-    kind: "human" | "service";
-    emailVerified: boolean;
-    image: string | null;
-    createdAt: Date | string | number;
-  }): AuthUser => ({
-    id: row.id,
-    kind: row.kind,
-    name: row.name,
-    email: row.email,
-    emailVerified: Boolean(row.emailVerified),
-    image: row.image,
-    createdAt: toIso(row.createdAt),
-  });
-
-  const membershipColumns = {
-    role: organizationUser.role,
-    status: organizationUser.status,
-    joinedAt: organizationUser.joinedAt,
-    organizationId: organization.id,
-    organizationName: organization.name,
-    organizationCreatedAt: organization.createdAt,
-    claimed: sql<boolean>`EXISTS (
-      SELECT 1 FROM ${organizationUser} claimed_membership
-      JOIN ${user} claimed_user ON claimed_user.id = claimed_membership.user_id
-      WHERE claimed_membership.organization_id = ${organization}.${sql.identifier(organization.id.name)}
-        AND claimed_membership.role = 'owner'
-        AND claimed_user.kind = 'human'
-    )`,
-    expiresAt: organization.expiresAt,
-  };
-
-  const toMembership = (row: {
-    role: OrganizationRole;
-    status: "active";
-    joinedAt: string;
-    organizationId: string;
-    organizationName: string;
-    organizationCreatedAt: string;
-    claimed: boolean | number;
-    expiresAt: string | null;
-  }): OrganizationMembership => ({
-    role: row.role,
-    status: row.status,
-    joinedAt: row.joinedAt,
-    organization: {
-      claimed: Boolean(row.claimed),
-      expiresAt: row.expiresAt,
-      id: row.organizationId,
-      name: row.organizationName,
-      createdAt: row.organizationCreatedAt,
-    },
-  });
-
   const apiKeyColumns = {
     id: apiKey.id,
     organizationId: apiKey.organizationId,
@@ -427,6 +423,7 @@ export const createCfAuthRepository = (
     tokenHint: apiKey.tokenHint,
     enabled: apiKey.enabled,
     source: apiKey.source,
+    credentialType: apiKey.credentialType,
     label: apiKey.label,
     grant: apiKey.grant,
     clientId: apiKey.clientId,
@@ -442,6 +439,7 @@ export const createCfAuthRepository = (
     tokenHint: string;
     enabled: boolean | number;
     source: string;
+    credentialType: string;
     label: string | null;
     grant: string;
     clientId: string | null;
@@ -457,6 +455,8 @@ export const createCfAuthRepository = (
       tokenHint: row.tokenHint,
       enabled: Boolean(row.enabled),
       source: row.source,
+      // A value put there by hand authenticates as neither; it is listed as a key.
+      credentialType: row.credentialType === "oauth" ? "oauth" : "apiKey",
       label: row.label,
       // Only cf-auth writes this column and it writes only the two values; a
       // value put there by hand fails closed, as the least grant.
@@ -593,6 +593,8 @@ export const createCfAuthRepository = (
                 .where(
                   and(
                     eq(credentialGuard.id, input.provisioning.credentialId),
+                    // A key or a connection, each by its exact type, as the shared authority predicate reads it.
+                    inArray(credentialGuard.credentialType, apiKeyCredentialTypes),
                     eq(credentialGuard.userId, input.provisioning.userId),
                     eq(credentialGuard.organizationId, input.organizationId),
                     eq(credentialGuard.enabled, true),
@@ -1006,7 +1008,9 @@ export const createCfAuthRepository = (
       // One validated value for the row and the answer, so neither can say
       // something the other does not.
       const grant = normalizeCredentialGrant(input.grant);
-      await db.insert(apiKey).values({ id, ...input, grant, createdAt, revokedAt: null });
+      await db
+        .insert(apiKey)
+        .values({ id, ...input, grant, credentialType: "apiKey", createdAt, revokedAt: null });
       return {
         id,
         userId: input.userId,
@@ -1015,6 +1019,7 @@ export const createCfAuthRepository = (
         tokenHint: input.tokenHint,
         enabled: input.enabled,
         source: input.source,
+        credentialType: "apiKey",
         label: input.label,
         grant,
         clientId: null,
@@ -1048,6 +1053,7 @@ export const createCfAuthRepository = (
           and(
             eq(apiKey.id, apiKeyId),
             eq(apiKey.organizationId, organizationId),
+            eq(apiKey.credentialType, "apiKey"),
             isNull(apiKey.revokedAt),
             or(isNull(apiKey.expiresAt), gt(apiKey.expiresAt, now)),
             organizationUsable(organizationId, now),
@@ -1102,46 +1108,6 @@ export const createCfAuthRepository = (
       return row ? toApiKeySummary(row) : null;
     },
 
-    async findOAuthAccess({ connectionId, condition }) {
-      const newest = alias(oauthToken, "cf_auth_oauth_newest");
-      const row = await db
-        .select({
-          accessTokenHash: oauthToken.accessTokenHash,
-          grant: apiKey.grant,
-          user: userColumns,
-          ...membershipColumns,
-        })
-        .from(oauthToken)
-        .innerJoin(apiKey, eq(apiKey.id, oauthToken.apiKeyId))
-        .innerJoin(user, eq(user.id, apiKey.userId))
-        .innerJoin(
-          organizationUser,
-          and(
-            eq(organizationUser.userId, apiKey.userId),
-            eq(organizationUser.organizationId, apiKey.organizationId),
-          ),
-        )
-        .innerJoin(organization, eq(organization.id, apiKey.organizationId))
-        .where(
-          and(
-            eq(oauthToken.apiKeyId, connectionId),
-            isNull(oauthToken.rotatedAt),
-            // The current generation is the newest one.
-            sql`${oauthToken.generation} = (select max(${newest.generation}) from ${oauthToken} as ${sql.identifier("cf_auth_oauth_newest")}
-              where ${newest.apiKeyId} = ${connectionId})`,
-            condition,
-          ),
-        )
-        .get();
-      if (!row) return null;
-      return {
-        accessTokenHash: row.accessTokenHash,
-        grant: row.grant,
-        user: toAuthUser(row.user),
-        membership: toMembership(row),
-      };
-    },
-
     async findActiveApiKeyByHash(tokenHash, now) {
       const row = await db
         .select(apiKeyColumns)
@@ -1151,7 +1117,7 @@ export const createCfAuthRepository = (
             eq(apiKey.tokenHash, tokenHash),
             // A connection's token_hash digests nothing ever revealed; its
             // tokens resolve through the OAuth service only.
-            ne(apiKey.source, "oauth"),
+            eq(apiKey.credentialType, "apiKey"),
             eq(apiKey.enabled, true),
             isNull(apiKey.revokedAt),
             or(isNull(apiKey.expiresAt), gt(apiKey.expiresAt, now)),

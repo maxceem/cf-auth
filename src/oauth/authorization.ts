@@ -228,7 +228,6 @@ const parseProvision = (value: unknown): OAuthGuestProvision => {
  */
 export const createOAuthAuthorizeKind = (oauth: ResolvedOAuthConfig): OperationKind => ({
   name: oauthAuthorizeKindName,
-  internal: true,
   open: "public",
   browser: true,
   approver: "proof",

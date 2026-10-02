@@ -953,7 +953,7 @@ export const createAuthService = (
         organizationId: input.organizationId,
         apiKeyId: apiKey.id,
         name: apiKey.name,
-        ...(apiKey.source === "oauth" ? { credentialType: "oauth" as const } : {}),
+        ...(apiKey.credentialType === "oauth" ? { credentialType: "oauth" as const } : {}),
       });
 
       return apiKey;
@@ -987,7 +987,7 @@ export const createAuthService = (
         organizationId,
         apiKeyId: apiKey.id,
         name: apiKey.name,
-        ...(apiKey.source === "oauth" ? { credentialType: "oauth" as const } : {}),
+        ...(apiKey.credentialType === "oauth" ? { credentialType: "oauth" as const } : {}),
       });
 
       return apiKey;

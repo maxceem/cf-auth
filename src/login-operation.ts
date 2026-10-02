@@ -110,6 +110,7 @@ export const createLoginOperationKind = (
     return sql`exists (
       select 1 from ${tables.apiKey} as ${sql.identifier("cf_auth_delivered_key")}
       where ${key.id} = ${apiKeyId}
+        and ${key.credentialType} = 'apiKey'
         and ${key.enabled} = 1
         and ${key.revokedAt} is null
         and (${key.expiresAt} is null or ${key.expiresAt} > ${sqliteNowMs(now)})

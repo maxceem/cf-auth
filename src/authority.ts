@@ -56,6 +56,9 @@ export const credentialAuthoritySql = (
   const roles = sql.join(input.allowedRoles.map((role) => sql`${role}`), sql`, `);
   const liveAfter = sqliteNowMs(input.nowMs);
 
+  // The key branch takes an API key or an OAuth connection, each by its exact
+  // `credential_type`: a connection opens operations and claims like a key,
+  // and a type cf-auth never writes is neither.
   return sql`exists (
     select 1
     from ${tables.organizationUser} as ${membershipAlias}
@@ -68,6 +71,7 @@ export const credentialAuthoritySql = (
         exists (
           select 1 from ${tables.apiKey} as ${keyAlias}
           where ${key.id} = ${input.credentialId}
+            and ${key.credentialType} in ('apiKey', 'oauth')
             and ${key.userId} = ${user.id}
             and ${key.organizationId} = ${membership.organizationId}
             and ${key.enabled} = 1

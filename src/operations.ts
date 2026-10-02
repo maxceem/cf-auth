@@ -27,6 +27,7 @@ import {
   sqliteNowMs,
 } from "./authority.js";
 import {
+  assertOperationsDatabase,
   internalOperationKindPrefix,
   isInternalOperationKind,
   operationDefaults,
@@ -206,7 +207,11 @@ export interface OperationRefusalContext<Payload = unknown> {
  * resolves to, and `Input` what the approval page may submit with it.
  */
 export interface OperationKindDefinition<Payload = unknown, Outcome = unknown, Input = unknown> {
-  /** Lowercase letters, digits, `.`, `_` and `-`. */
+  /**
+   * Lowercase letters, digits, `.`, `_` and `-`. The `cf-auth:` namespace
+   * belongs to cf-auth's own internal kinds, which no entry point of
+   * `cfAuth.operations` admits.
+   */
   name: string;
   /**
    * How the payload is read. Leave it out for a kind that takes none. A
@@ -245,17 +250,6 @@ export interface OperationKindDefinition<Payload = unknown, Outcome = unknown, I
   grant?: CredentialGrant;
   /** Whether it is approved in a browser. Without one, the app calls `complete`, or `reserve` and `execute`. */
   browser: boolean;
-  /**
-   * Reserved for cf-auth's own built-in kinds, and refused in
-   * `operations.kinds`. An internal kind is named `cf-auth:<name>`, and a
-   * stored operation in that namespace is internal whatever is registered —
-   * an engine built without the kind still hides its rows. It lives in the
-   * same table and the same sweep, but every entry point of
-   * `cfAuth.operations` refuses it: `open` and `reserve` with `422
-   * validation_error`, everything that looks one up as `404
-   * operation_not_found`. Only the flow that owns it drives it.
-   */
-  internal?: true;
   /**
    * What approving needs. `"session"` (default): a signed-in person, as
    * `approverMinRole` says. `"proof"`: the browser proof alone — whoever holds
@@ -750,18 +744,14 @@ const assertBatchable = (statement: unknown) => {
 };
 
 /**
- * Runs statements as one transaction and answers each one's result. Both D1
- * and libsql batch; a driver that cannot runs them in order, which keeps every
- * guard but not the atomicity.
+ * Runs statements as one transaction and answers each one's result. There is
+ * no sequential fallback: a refused completion must roll back what ran before
+ * it, so a database without `batch` is refused before the engine is built.
  */
 const runBatch = async (db: CfAuthDatabase, statements: readonly unknown[]): Promise<unknown[]> => {
   if (statements.length === 0) return [];
   statements.forEach(assertBatchable);
-  const batch = (db as unknown as BatchCapableDatabase).batch;
-  if (typeof batch === "function") return batch.call(db, statements);
-  const results: unknown[] = [];
-  for (const statement of statements) results.push(await (statement as Promise<unknown>));
-  return results;
+  return (db as unknown as Required<BatchCapableDatabase>).batch(statements);
 };
 
 const clientText = (value: unknown, label: string): string | undefined => {
@@ -869,6 +859,7 @@ export const createOperationsEngine = (
   const { db, tables } = config;
   const { operation } = tables;
   const settings = config.operations;
+  if (settings.enabled) assertOperationsDatabase(db);
 
   const kinds = new Map<string, OperationKind>();
   if (settings.login) {

@@ -56,6 +56,7 @@ describe("initial schema", () => {
       "grant",
       "client_id",
       "resource",
+      "credential_type",
     ]);
   });
 });

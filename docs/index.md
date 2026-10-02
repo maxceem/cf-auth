@@ -156,15 +156,16 @@ adds the `operation` table and the `source` and `label` columns of `api_key`,
 `0002_cf_auth_api_key_grant.sql` adds its `grant` column, with every
 existing key at `manage`, `0003_cf_auth_operation_execution_claim.sql` adds
 `operation.execution_claim`, and `0004_cf_auth_oauth_token.sql` adds the
-`oauth_token` table and the `client_id` and `resource` columns of `api_key`
-(see [OAuth connections](#oauth-connections)). Each is plain `CREATE` and
+`oauth_token` table and the `client_id`, `resource` and `credential_type`
+columns of `api_key` (see [OAuth connections](#oauth-connections)). Each is plain `CREATE` and
 `ALTER TABLE ... ADD`; none rebuilds a table. Copy them in, in order. The package's own tests apply these exact files, so
 they cannot drift from the schema.
 
 **Upgrading from 0.7.0.** Apply `0002`, `0003` and `0004`, even with OAuth
-off. The other changes — `findOAuthAccess` on a custom repository, a refused
-completion rolling back its batch, the reserved `cf-auth:` kind namespace —
-are listed in [Upgrading to 0.8.0](../README.md#upgrading-to-080).
+off. The other changes — `credentialType` on a custom repository's
+`ApiKeySummary`, a refused completion rolling back its batch, operations
+needing a batching database, the reserved `cf-auth:` kind namespace — are
+listed in [Upgrading to 0.8.0](../README.md#upgrading-to-080).
 
 ### Renaming the tables
 
@@ -202,7 +203,7 @@ ones worth knowing about.
 | `google`                                | —                   | `{ clientId, clientSecret }`. Leave it out to turn Google off.                            |
 | `accountLinking.implicit`               | `false`             | Whether a Google sign-in may join an existing password account. See below.                |
 | `apiKeys`                               | off                 | `{ enabled: true, tokenPrefix: "sk_live_" }`.                                             |
-| `operations`                            | off                 | `{ enabled: true, realm }`. See [Operations](#operations-approved-in-a-browser).          |
+| `operations`                            | off                 | `{ enabled: true, realm }`. Needs D1 or libsql. See [Operations](#operations-approved-in-a-browser). |
 | `oauth`                                 | off                 | `{ enabled: true, issuer, tokenPrefix }`. See [OAuth connections](#oauth-connections).    |
 | `organizations.defaultOrganizationName` | `"My Organization"` | A string, or a function of the user.                                                      |
 | `cookies.prefix`                        | from `appName`      | See below.                                                                                |
@@ -282,7 +283,9 @@ insert's atomic admission decision, not a transaction around the whole signup.
 
 `credentialAuthorityCondition(tables, input)` returns `{ sql, params }` for a
 SQLite condition that requires an active membership, one of the explicit
-allowed roles, and either a live scoped API key or a live human session. It
+allowed roles, and either a live scoped API key or OAuth connection (an
+`api_key` row whose `credential_type` is exactly `apiKey` or `oauth`) or a
+live human session. It
 uses the later of `input.nowMs` and SQLite's current clock and respects custom
 table prefixes.
 
@@ -474,8 +477,11 @@ gets `403 api_key_required`.
 Every key records where it came from. `source` is a short word — `console`
 unless you pass another, `cli` for the keys the built-in `login` operation
 issues — and `label` is optional free text such as `CLI on mac-studio`. Both are
-for display only; nothing authorizes on them. `oauth` is reserved: it marks
-an [OAuth connection](#oauth-connections), and no caller may issue a key with it.
+for display only; nothing authorizes on them. `oauth` is reserved: it is the
+provenance of an [OAuth connection](#oauth-connections), and no caller may
+issue a key with it. What a row authenticates as is its `credentialType`,
+`"apiKey"` for a key and `"oauth"` for a connection, on every
+`ApiKeySummary` and stored as `api_key.credential_type`.
 Session and API-key callers use the same membership role. Keys never acquire
 browser assurance, including keys belonging to a human. Applications expose
 their own authorized management routes around these server methods when needed.
@@ -604,6 +610,12 @@ createCfAuth({
   operations: { enabled: true, realm: env.DEPLOYMENT_ID },
 });
 ```
+
+Operations need a database that batches atomically: D1, or a libsql drizzle
+instance. A completion, an execution and a sweep are each one batch, and a
+refused completion rolls its whole batch back, which a driver running
+statements one by one cannot do; `createCfAuth` refuses one without `batch`
+with `422 validation_error` while `operations.enabled` is on.
 
 Then `cfAuth.operations` has everything below. It declares no routes: you mount
 your own and call these from them.
@@ -1046,7 +1058,7 @@ client afterwards. Anyone else, and any operation without an organization, is
 ### Internal kinds
 
 cf-auth's own flows register kinds of their own, named in the reserved
-`cf-auth:` namespace and marked `internal: true` — today one,
+`cf-auth:` namespace, which is what makes them internal — today one,
 `cf-auth:oauth.authorize`, registered while `oauth.enabled` (see
 [Authorization](#authorization)). They share the table, the limits and the sweep, but `cfAuth.operations`
 does not admit them: `open` and `reserve` refuse one with `422
@@ -1055,8 +1067,8 @@ code answers `404 operation_not_found` (or null, for `findByToken` and
 `lookupByUserCode`), `retire` answers `false`, and `operations.kinds` leaves
 them out. What makes a stored operation internal is its kind's name, not what
 is registered, so an engine built without the kind still hides its rows. Only
-the flow that owns one drives it. Your own kind names cannot contain `:`, and
-`internal` is refused in `operations.kinds`.
+the flow that owns one drives it. Your own kind names cannot contain `:`, so
+none of them can be internal.
 
 ### Limits
 
@@ -1120,7 +1132,8 @@ to 400 in your error handler if that is what your API answers with.
 ## OAuth connections
 
 OAuth 2.1 for public clients, such as MCP clients. A client the person
-approves gets a **connection**: an `api_key` row with `source: "oauth"`, so
+approves gets a **connection**: an `api_key` row with `credential_type =
+'oauth'` (and `source: "oauth"`, for display), so
 everything that binds a key binds it too. It belongs to one person in one
 organization, carries a grant, is listed by `listApiKeys` and ended by
 `revokeApiKey`. Its tokens are issued, rotated, revoked and resolved here.
@@ -1197,8 +1210,11 @@ connection expires.
 ### The functions
 
 ```ts
-cfAuth.oauth.token({ body: URLSearchParams }):
-  Promise<{ status: 200; body: OAuthTokenResponse } | { status: 400 | 401; body: OAuthErrorBody }>;
+cfAuth.oauth.token({ body: URLSearchParams }): Promise<
+  | { status: 200; body: OAuthTokenResponse }
+  | { status: 400 | 401; body: OAuthErrorBody }
+  | { status: 429; body: OAuthErrorBody & { error: "slow_down" }; retryAfterSeconds: number }
+>;
 cfAuth.oauth.revoke({ body: URLSearchParams }):
   Promise<{ status: 200; body: null } | { status: 400 | 401; body: OAuthErrorBody }>;
 cfAuth.oauth.resolveAccessTokenAuthState(token: string, { source: "mcp" | "api" }): Promise<AuthState>;
@@ -1222,9 +1238,10 @@ decides the rest:
   generation being unrotated, the connection, membership and organization
   live, by the later of the request's clock and the database's: the generation is marked rotated and keeps the new response, sealed;
   the next generation is inserted; the one before is deleted; `expires_at`
-  advances. Within 5 s of the last rotation it is refused instead,
-  `invalid_grant` "slow down: refreshed too recently", and the token stays
-  valid.
+  advances. Within 5 s of the last rotation it is refused instead with
+  `429` and `slow_down`, changing nothing: the token stays valid, and
+  `retryAfterSeconds`, whole seconds rounded up, is when it may be presented
+  again. Send it as `Retry-After`.
 - **The previous generation's**, within 30 s of its rotation, replays that
   rotation's response byte for byte. It is sealed with AES-256-GCM under a
   key derived by HKDF-SHA256 from the presented refresh token, which the
@@ -1576,8 +1593,7 @@ completing batch themselves), has no user code, counts toward
 `authorizationTtlMs` is over 12 hours, to twice it, so the record always
 outlives the code. Its payload is the client, the redirect URI, the
 challenge, the requested grant, the `state`, the normalised resource and the
-sealed code. Its completion record, kept in the clear, is
-`OAuthAuthorizationRecord`:
+sealed code. Its completion record, kept in the clear, is:
 
 ```ts
 { door: "person" | "guest"; userId; organizationId; grant; requestedGrant;
@@ -1593,7 +1609,8 @@ opened, after which its code is unknown.
 ### Storage
 
 Migration `0004_cf_auth_oauth_token.sql` adds `api_key.client_id` and
-`api_key.resource` (null for keys) and the `oauth_token` table: `id`,
+`api_key.resource` (null for keys), `api_key.credential_type` (`'apiKey'`
+by default, `'oauth'` for a connection) and the `oauth_token` table: `id`,
 `api_key_id` (cascading), `generation`, `access_token_hash` (unique),
 `access_expires_at`, `refresh_token_hash` (unique), `rotated_at`,
 `sealed_response` and `created_at`, unique on `(api_key_id, generation)`. A
@@ -1601,21 +1618,18 @@ connection keeps at most two rows: the current generation and the previous
 one. `ApiKeySummary.clientId` is the client's id for a connection and `null`
 for a key.
 
-**Upgrading a custom repository.** If you implement `CfAuthRepository`
-yourself rather than using `createCfAuthRepository`, it now needs
-`findOAuthAccess({ connectionId, condition })` — also with OAuth off, since
-the interface requires it. Its contract:
-
-- one coherent `SELECT`: the generation, the connection's grant, its user,
-  and the membership with its organization, read together, never assembled
-  from separate reads;
-- only the connection's current generation: the row whose `generation` is
-  the maximum across all of that connection's `oauth_token` rows, and only if
-  it is unrotated (`rotated_at` null);
-- the supplied `condition` enforced inside that same query (it is the
-  liveness rule and the access token's expiry);
-- answer `{ accessTokenHash, grant, user, membership }` or `null`, and leave
-  the token's digest verification to the OAuth service.
+`credential_type` decides what a row authenticates as: an API key's token is
+looked up only among `'apiKey'` rows, and every OAuth read and write matches
+`'oauth'`. `source` stays provenance and display, `oauth` for a connection.
+The column has no CHECK constraint. SQLite would accept one on `ADD
+COLUMN`, but drizzle-kit, which apps generate their migrations with, can only
+express a table-level CHECK, and adding that makes it rebuild `api_key` with
+a copy that reads the new column before it exists. Every rule matches one of
+the two values exactly instead, the shared credential predicate included
+(it takes a key or a connection, each by its type), so a value cf-auth never
+writes authenticates as neither. The OAuth service reads
+and writes these tables itself, so a custom `CfAuthRepository` implements
+nothing for it.
 
 ### OAuth errors
 
@@ -1626,10 +1640,11 @@ Send every token and revocation response with `Cache-Control: no-store`.
 | ------------------------ | ------ | -------------------------------------------------------------------- |
 | `invalid_request`        | 400    | A parameter given twice, a required one missing, a body that is not form parameters, a malformed `code_verifier` |
 | `invalid_client`         | 401    | `client_id` is not the client the connection was issued to; nothing changes |
-| `invalid_grant`          | 400    | An unknown refresh token; a dead connection; refreshed within 5 s ("slow down: refreshed too recently"); reuse, which revokes the connection. An unknown, unapproved, expired or swept code; a `client_id`, `redirect_uri` or verifier that is not the authorization's; a code already exchanged, which revokes the connection it issued |
+| `invalid_grant`          | 400    | An unknown refresh token; a dead connection; reuse, which revokes the connection. An unknown, unapproved, expired or swept code; a `client_id`, `redirect_uri` or verifier that is not the authorization's; a code already exchanged, which revokes the connection it issued |
 | `invalid_scope`          | 400    | `scope` is not exactly the connection's grant                        |
 | `invalid_target`         | 400    | `resource` is not the issuer or one of its paths, or not the connection's |
 | `unsupported_grant_type` | 400    | A `grant_type` other than `authorization_code` and `refresh_token`  |
+| `slow_down`              | 429    | A valid refresh token presented within 5 s of the last rotation; nothing changes and the token stays good. The result carries `retryAfterSeconds` for `Retry-After`. Named after RFC 8628 §3.5 |
 
 The authorization endpoint answers its own errors, never thrown:
 

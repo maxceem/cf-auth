@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import { check, index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 import {
+  apiKeyCredentialTypes,
   credentialGrants,
   operationStates,
   organizationMemberStatuses,
@@ -187,7 +188,11 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
       expiresAt: integer("expires_at", { mode: "timestamp_ms" }),
       createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
       revokedAt: integer("revoked_at", { mode: "timestamp_ms" }),
-      /** Where the key was issued from, e.g. `console`, `cli` or `bootstrap`. Display only. */
+      /**
+       * Where the key was issued from, e.g. `console`, `cli` or `bootstrap`;
+       * `oauth` for a connection. Display only: provenance, never what the
+       * row authenticates as, which is `credential_type`.
+       */
       source: text("source").notNull().default("console"),
       /** A human-readable note about the holder, e.g. `CLI on mac-studio`. Display only. */
       label: text("label"),
@@ -203,9 +208,9 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
        */
       grant: text("grant", { enum: credentialGrants }).notNull().default("manage"),
       /**
-       * The OAuth client an OAuth connection (`source = 'oauth'`) was issued
-       * to: a registered client id or a Client ID Metadata Document URL. Null
-       * for a key.
+       * The OAuth client an OAuth connection (`credential_type = 'oauth'`) was
+       * issued to: a registered client id or a Client ID Metadata Document
+       * URL. Null for a key.
        */
       clientId: text("client_id"),
       /**
@@ -214,6 +219,22 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
        * whose resource is not the deployment's issuer. Null for a key.
        */
       resource: text("resource"),
+      /**
+       * What the row authenticates as: `apiKey`, a key looked up by its
+       * token's digest, or `oauth`, a connection whose tokens resolve only
+       * through the OAuth service. Every authentication and authority rule
+       * reads this column, never `source`; rows that predate it are keys.
+       *
+       * No CHECK constraint, though SQLite would accept one on `ADD COLUMN`:
+       * drizzle-kit cannot express a column-level CHECK, and a table-level
+       * one makes it rebuild `api_key` with a copy that reads this column
+       * before it exists, in every app's generated migration. Instead every
+       * rule matches one of the two values exactly, so a value put there by
+       * hand authenticates as neither.
+       */
+      credentialType: text("credential_type", { enum: apiKeyCredentialTypes })
+        .notNull()
+        .default("apiKey"),
     },
     (table) => [
       uniqueIndex(ix("api_key_token_hash_unique")).on(table.tokenHash),
@@ -302,7 +323,7 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
   );
 
   // --- OAuth connection tokens -----------------------------------------------
-  // An OAuth connection is an `api_key` row (`source = 'oauth'`); its tokens
+  // An OAuth connection is an `api_key` row (`credential_type = 'oauth'`); its tokens
   // live here, at most two generations per connection: the current one and
   // the one it replaced. Only SHA-256 digests of the tokens are stored. The
   // connection's lifetime is `api_key.expires_at`; a generation holds only

@@ -45,6 +45,14 @@ export type OperationState = (typeof operationStates)[number];
  */
 export type AuthCredentialType = "session" | "apiKey" | "oauth";
 
+/**
+ * What an `api_key` row authenticates as: an API key, whose token is looked
+ * up by digest, or an OAuth connection, whose tokens resolve only through the
+ * OAuth service. Decides authentication; `source` never does.
+ */
+export const apiKeyCredentialTypes = ["apiKey", "oauth"] as const;
+export type ApiKeyCredentialType = (typeof apiKeyCredentialTypes)[number];
+
 /** Where an OAuth access token may be presented: the MCP endpoint, or the management API. */
 export const oauthActionSources = ["mcp", "api"] as const;
 export type OAuthActionSource = (typeof oauthActionSources)[number];
@@ -163,13 +171,16 @@ export interface ApiKeySummary {
   /**
    * Where the key was issued from, e.g. `console`, `cli` or `bootstrap`; `oauth`
    * for an OAuth connection, which no caller may claim for a key of its own.
+   * Display only: what the row authenticates as is `credentialType`.
    */
   source: string;
+  /** `"oauth"` for an OAuth connection, `"apiKey"` for a key. */
+  credentialType: ApiKeyCredentialType;
   /** A human-readable note about the holder, e.g. `CLI on mac-studio`. */
   label: string | null;
   /** How much of its holder's authority the key may exercise. Keys issued before grants existed are `manage`. */
   grant: CredentialGrant;
-  /** The OAuth client a connection was issued to (`source: "oauth"`); null for a key. */
+  /** The OAuth client a connection was issued to (`credentialType: "oauth"`); null for a key. */
   clientId: string | null;
   createdAt: string;
   revokedAt: string | null;

@@ -5,7 +5,7 @@ import type { CfAuthTables } from "../schema.js";
 
 /**
  * Whether an OAuth connection may act, as one SQL condition: its row is an
- * OAuth connection (`source = 'oauth'`), enabled, unrevoked, bound to
+ * OAuth connection (`credential_type = 'oauth'`), enabled, unrevoked, bound to
  * `issuer`, with an `expires_at` strictly in the future; its user's
  * membership in its organization is active; and the organization is inside
  * its deadline. Times are judged by the later of `nowMs` and the database's
@@ -33,7 +33,7 @@ export const oauthConnectionLiveSql = (
     join ${tables.organization} as ${sql.identifier("cf_auth_oauth_live_organization")}
       on ${organization.id} = ${key.organizationId}
     where ${key.id} = ${input.connectionId}
-      and ${key.source} = 'oauth'
+      and ${key.credentialType} = 'oauth'
       and ${key.enabled} = 1
       and ${key.revokedAt} is null
       and ${key.resource} = ${input.issuer}

@@ -2,10 +2,10 @@
  * OAuth connections: issuance, refresh with rotation and replay detection,
  * revocation, and access-token resolution.
  *
- * A connection is an `api_key` row with `source = 'oauth'`: it belongs to one
- * user in one organization, carries a grant, and ends when that row is
- * revoked or passes `expires_at` — so every rule that binds an API key binds
- * a connection too. Its tokens live in `oauth_token`, at most two generations
+ * A connection is an `api_key` row with `credential_type = 'oauth'`: it
+ * belongs to one user in one organization, carries a grant, and ends when
+ * that row is revoked or passes `expires_at` — so every rule that binds an
+ * API key binds a connection too. Its tokens live in `oauth_token`, at most two generations
  * per connection. Every write here is one batch.
  *
  * The authorization request, consent and the code exchange live in
@@ -46,6 +46,7 @@ import {
   type ProtectedResourceMetadata,
 } from "./authorization.js";
 import { oauthConnectionLiveSql, oauthMembershipLiveSql, oauthOrganizationLiveSql } from "./authority.js";
+import { findOAuthAccess } from "./store.js";
 import { duplicateDescription, duplicatedParameter, formParams, type FormParams } from "./params.js";
 import { connectionIdPattern, issueGeneration, parseOAuthToken, resolveToken, type IssuedGeneration, type OAuthTokenRow } from "./tokens.js";
 
@@ -65,13 +66,20 @@ export interface OAuthTokenResponse {
   scope: CredentialGrant;
 }
 
+/**
+ * The RFC 6749 §5.2 codes, RFC 8707's `invalid_target`, and `slow_down`,
+ * named after RFC 8628 §3.5's: a valid refresh token presented within
+ * {@link oauthRotationIntervalMs} of the last rotation. It is not
+ * `invalid_grant`, which tells a client to drop its token and start over.
+ */
 export type OAuthErrorCode =
   | "invalid_request"
   | "invalid_client"
   | "invalid_grant"
   | "unsupported_grant_type"
   | "invalid_scope"
-  | "invalid_target";
+  | "invalid_target"
+  | "slow_down";
 
 /** An RFC 6749 §5.2 error body. */
 export interface OAuthErrorBody {
@@ -79,10 +87,15 @@ export interface OAuthErrorBody {
   error_description: string;
 }
 
-/** What `token` answers: 200 and the tokens, or 400 (401 for `invalid_client`) and the error. */
+/**
+ * What `token` answers: 200 and the tokens; 400 (401 for `invalid_client`)
+ * and the error; or 429 `slow_down`, a refresh refused only for its timing,
+ * whose token stays good — send `retryAfterSeconds` as `Retry-After`.
+ */
 export type OAuthTokenResult =
   | { status: 200; body: OAuthTokenResponse }
-  | { status: 400 | 401; body: OAuthErrorBody };
+  | { status: 400 | 401; body: OAuthErrorBody }
+  | { status: 429; body: OAuthErrorBody & { error: "slow_down" }; retryAfterSeconds: number };
 
 /** What `revoke` answers: 200 with no body (RFC 7009 §2.2), or the error. */
 export type OAuthRevokeResult =
@@ -196,7 +209,7 @@ const rotationSealInfo = "cf-auth:oauth-rotation-response";
 const rotationSealContext = (connectionId: string, generation: number) =>
   `cf-auth:oauth-rotation:${connectionId}:${generation}`;
 
-const fail = (error: OAuthErrorCode, description: string): { status: 400 | 401; body: OAuthErrorBody } => ({
+const fail = (error: Exclude<OAuthErrorCode, "slow_down">, description: string): { status: 400 | 401; body: OAuthErrorBody } => ({
   status: error === "invalid_client" ? 401 : 400,
   body: { error, error_description: description },
 });
@@ -304,7 +317,7 @@ export const createOAuthServiceForEngine = (
     (await db
       .select(connectionColumns)
       .from(apiKey)
-      .where(and(eq(apiKey.id, connectionId), eq(apiKey.source, "oauth")))
+      .where(and(eq(apiKey.id, connectionId), eq(apiKey.credentialType, "oauth")))
       .get()) ?? null;
 
   /** An unknown stored grant fails closed, as the least one. */
@@ -354,7 +367,7 @@ export const createOAuthServiceForEngine = (
       })
       .from(apiKey)
       .leftJoin(oauthToken, and(eq(oauthToken.id, generationId), eq(oauthToken.apiKeyId, apiKey.id)))
-      .where(and(eq(apiKey.id, connection.id), eq(apiKey.source, "oauth")))
+      .where(and(eq(apiKey.id, connection.id), eq(apiKey.credentialType, "oauth")))
       .get();
     if (!row) return null;
     return {
@@ -418,7 +431,7 @@ export const createOAuthServiceForEngine = (
         .where(
           and(
             eq(apiKey.id, connection.id),
-            eq(apiKey.source, "oauth"),
+            eq(apiKey.credentialType, "oauth"),
             // The row itself is live when the write lands, by the database's
             // clock too: an expired or revoked connection is left as it is.
             eq(apiKey.enabled, true),
@@ -583,7 +596,12 @@ export const createOAuthServiceForEngine = (
 
     const lastRotation = resolved.generations[1]?.rotatedAt?.getTime();
     if (lastRotation !== undefined && now - lastRotation < oauthRotationIntervalMs) {
-      return fail("invalid_grant", "slow down: refreshed too recently");
+      return {
+        status: 429,
+        body: { error: "slow_down", error_description: "Refreshed too recently; retry after the interval" },
+        // Whole seconds, rounded up, so a client that waits exactly this long is not refused again.
+        retryAfterSeconds: Math.max(1, Math.ceil((lastRotation + oauthRotationIntervalMs - now) / 1000)),
+      };
     }
     return rotate(oauth, connection, resolved.generation, presented, now);
   };
@@ -647,6 +665,7 @@ export const createOAuthServiceForEngine = (
           createdAt: new Date(now),
           revokedAt: null,
           source: "oauth",
+          credentialType: "oauth",
           label: clientName,
           grant: input.grant,
           clientId,
@@ -781,7 +800,7 @@ export const createOAuthServiceForEngine = (
       // One statement: the current generation, unexpired, on a live
       // connection bound to this issuer, with its user, membership and
       // organization — nothing read apart can disagree with the rest.
-      const access = await repository.findOAuthAccess({
+      const access = await findOAuthAccess(db, tables, {
         connectionId,
         condition: and(
           sql`${oauthToken.accessExpiresAt} > ${sqliteNowMs(now)}`,
