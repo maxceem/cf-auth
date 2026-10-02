@@ -150,8 +150,8 @@ export interface OAuthConfig {
   enabled?: boolean;
   /**
    * The issuer and the single protected resource: an origin with no path and
-   * no trailing slash, `https`, or `http` on a loopback host. Required when
-   * enabled.
+   * no trailing slash, `https`, or `http` on a loopback host (`127.0.0.1`,
+   * `[::1]`, `localhost` or a name under `.localhost`). Required when enabled.
    */
   issuer?: string;
   /** Paths under the issuer also accepted as `resource`; tokens are bound to the issuer either way. Default: `["/mcp"]`. */
@@ -543,7 +543,10 @@ export const oauthDefaults = {
   authorizationTtlMs: 10 * minute,
 } as const;
 
-const loopbackIssuerHosts = new Set(["127.0.0.1", "[::1]", "localhost"]);
+/** Loopback for `oauth.issuer`: the loopback literals, `localhost`, or a name under `.localhost` (RFC 6761 §6.3). */
+const isLoopbackIssuerHost = (hostname: string): boolean =>
+  // The URL parser has already lowercased the hostname, so no case folding is needed here.
+  hostname === "127.0.0.1" || hostname === "[::1]" || /^(?:localhost|(?:[^.]+\.)+localhost)$/.test(hostname);
 const tokenPrefixPattern = /^[A-Za-z0-9_-]{1,32}$/;
 const resourcePathPattern = /^(?:\/[A-Za-z0-9._~!$&'()*+,;=:@%-]+)+$/;
 const base62Run = /^[A-Za-z0-9]*$/;
@@ -584,9 +587,11 @@ const resolveOAuth = (
   }
   const secure =
     issuerUrl.protocol === "https:" ||
-    (issuerUrl.protocol === "http:" && loopbackIssuerHosts.has(issuerUrl.hostname));
+    (issuerUrl.protocol === "http:" && isLoopbackIssuerHost(issuerUrl.hostname));
   if (!secure) {
-    throw validationError("`oauth.issuer` must be https, or http on a loopback host");
+    throw validationError(
+      "`oauth.issuer` must be https, or http on a loopback host (`127.0.0.1`, `[::1]`, `localhost` or a name under `.localhost`)",
+    );
   }
   if (input.issuer !== issuerUrl.origin) {
     throw validationError(

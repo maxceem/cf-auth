@@ -1154,8 +1154,10 @@ oauth?: {
   the rotation, the revocation and the code exchange are each one atomic
   batch;
 - an `issuer` that is not exactly an origin — `https`, or `http` on
-  `127.0.0.1`, `[::1]` or `localhost` — with no path, trailing slash, query,
-  fragment or credentials;
+  `127.0.0.1`, `[::1]`, `localhost` or a name under `.localhost` (reserved
+  for loopback use by RFC 6761 §6.3, though resolver support varies: Chrome,
+  Firefox and systemd-resolved treat it as loopback, Safari on macOS before 26
+  does not) — with no path, trailing slash, query, fragment or credentials;
 - a missing `tokenPrefix`; prefixes other than 1 to 32 letters, digits, `_`
   or `-`; equal access and refresh prefixes; either equal to
   `apiKeys.tokenPrefix`; or an access prefix an API key could begin with,

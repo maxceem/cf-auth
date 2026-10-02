@@ -1413,8 +1413,32 @@ describe("OAuth configuration", () => {
       "https://user@console.example.com",
       "https://Console.example.com",
       "ftp://console.example.com",
+      // Only `localhost` itself or a name under `.localhost` qualifies.
+      "http://localhost.example.com",
+      "http://notlocalhost",
+      "http://evil-localhost",
+      "http://.localhost",
+      "http://a..localhost",
+      "http://app.localhost.",
+      "http://a.localhost.example.com",
+      "http://[::ffff:7f00:1]",
+      // The parser normalises these to `app.localhost`, so the exact-origin check refuses them.
+      "http://App.localhost",
+      "http://app%2elocalhost",
+      "http://app\u3002localhost",
+      "http://app\uff0elocalhost",
+      "http://app\uff61localhost",
     ]) {
       expect(() => resolve({ issuer: bad }), bad).toThrow(/oauth\.issuer/);
+    }
+    // Names under `.localhost` are reserved for loopback use (RFC 6761 §6.3); resolver support varies.
+    for (const good of [
+      "http://localhost:8787",
+      "http://app.localhost:8080",
+      "http://a.b.localhost",
+      "http://xn--bcher-kva.localhost",
+    ]) {
+      expect(resolve({ issuer: good }).oauth?.issuer, good).toBe(good);
     }
     expect(() => resolveConfig({ ...base, oauth: { enabled: true, tokenPrefix } })).toThrow(/oauth\.issuer/);
   });
