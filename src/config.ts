@@ -2,6 +2,7 @@ import type { D1Database } from "@cloudflare/workers-types";
 import { drizzle } from "drizzle-orm/d1";
 import type { BaseSQLiteDatabase } from "drizzle-orm/sqlite-core";
 import type { SQL } from "drizzle-orm";
+import type { BetterAuthOptions } from "better-auth/types";
 import { validationError } from "./errors.js";
 import { isAcceptableRedirectUri } from "./oauth/redirect-uri.js";
 import type { OperationKind } from "./operations.js";
@@ -296,6 +297,13 @@ export interface CfAuthConfig {
 
   /** Called when a non-fatal internal error occurs (e.g. a failing `onEvent`). */
   onError?: (error: unknown, context: { scope: string }) => void;
+
+  /**
+   * better-auth's own logger options, passed through unchanged. Leave it out
+   * for better-auth's default, which writes to the console; supply `log` to
+   * decide what reaches your logs, or `disabled: true` to drop them.
+   */
+  logger?: BetterAuthOptions["logger"];
 }
 
 const slugify = (value: string) =>
@@ -775,6 +783,7 @@ export interface ResolvedCfAuthConfig {
   openAPI: boolean;
   onEvent: ((event: CfAuthEvent) => void | Promise<void>) | undefined;
   onError: (error: unknown, context: { scope: string }) => void;
+  logger: BetterAuthOptions["logger"];
 }
 
 /**
@@ -905,5 +914,6 @@ export const resolveConfig = (config: CfAuthConfig): ResolvedCfAuthConfig => {
       ((error, context) => {
         console.error(`[cf-auth] ${context.scope}`, error);
       }),
+    logger: config.logger,
   };
 };

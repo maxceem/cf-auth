@@ -85,6 +85,17 @@ describe("resolveConfig", () => {
     });
   });
 
+  it("passes a logger through to Better Auth, and leaves its default alone otherwise", () => {
+    const log = () => undefined;
+    const optionsFor = (config: Parameters<typeof resolveConfig>[0]) =>
+      createBetterAuthOptions(resolveConfig(config), () => {
+        throw new Error("service is not used while building options");
+      });
+
+    expect(optionsFor({ ...base, logger: { level: "error", log } }).logger).toEqual({ level: "error", log });
+    expect(optionsFor(base)).not.toHaveProperty("logger");
+  });
+
   it("forwards the account linking policy to Better Auth", () => {
     const optionsFor = (config: Parameters<typeof resolveConfig>[0]) =>
       createBetterAuthOptions(resolveConfig(config), () => {

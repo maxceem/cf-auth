@@ -208,6 +208,8 @@ ones worth knowing about.
 | `organizations.defaultOrganizationName` | `"My Organization"` | A string, or a function of the user.                                                      |
 | `cookies.prefix`                        | from `appName`      | See below.                                                                                |
 | `onEvent`                               | —                   | Called for sign-ups and key changes. See [Audit events](#audit-events).                   |
+| `onError`                               | `console.error`     | Called with a failure cf-auth recovered from, and the scope it happened in.               |
+| `logger`                                | better-auth's       | better-auth's own `logger` options, passed through. Use `log` to choose what is logged.   |
 
 ### Cookie names
 
