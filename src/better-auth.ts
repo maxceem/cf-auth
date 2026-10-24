@@ -64,6 +64,7 @@ export const createBetterAuthOptions = (
     basePath: config.basePath,
     secret: config.secret,
     trustedOrigins: config.trustedOrigins,
+    ...(config.logger ? { logger: config.logger } : {}),
     database: (() => {
       const factory = drizzleAdapter(config.db, {
         provider: "sqlite",
