@@ -11,6 +11,10 @@ multi-tenant part that every one of these apps ends up writing again:
   made for each human signup; email-less service identities share memberships.
 - Hono middleware that works out who is calling, from a session cookie **or** an
   API key.
+- **Invitations** by email address: a one-time link, accepted only by that
+  address, joining in one atomic write. You send the email; cf-auth keeps the
+  invitation.
+- Email verification through better-auth, with the sending left to you.
 - A signed cookie that remembers which organization the user picked.
 - **Operations approved in a browser**: a CLI asks, a signed-in person approves
   on your page, and the CLI collects the result. The built-in `login` gives a
@@ -248,6 +252,28 @@ whole connection. See [OAuth connections](docs/index.md#oauth-connections)
 and [Authorization](docs/index.md#authorization).
 
 Upgrading from 0.7.0: see [Upgrading to 0.8.0](#upgrading-to-080).
+
+## Upgrading to 0.9.0
+
+- **Apply `0005_cf_auth_organization_invitation.sql`** (the
+  `organization_invitation` table), or export `organizationInvitation` from
+  `cfAuthTables` beside the other tables and generate with drizzle-kit.
+  `ensureDefaultOrganization` reads it on every request from someone with no
+  organization, so the table must exist even if you never invite anyone.
+- **A custom `CfAuthRepository`** must implement the invitation methods and
+  `updateOrganizationName`.
+- **A signup with a pending invitation gets no default organization.** Its
+  `authState.organization` is `null` until the person accepts or declines; a
+  page for that state should offer `listMyInvitations` or ask them to open
+  the link.
+- `CfAuthEvent` has new members (`member.*`, `invitation.*`,
+  `organization.renamed`, `user.email_verified`); an exhaustive switch needs
+  the new cases.
+
+Everything else is additive: invitations, `leaveOrganization`,
+`renameOrganization` and the `emailVerification` option. See
+[Invitations](docs/index.md#invitations) and
+[Email verification](docs/index.md#email-verification).
 
 ## Upgrading to 0.8.0
 

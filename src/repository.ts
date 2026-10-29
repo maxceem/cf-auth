@@ -1,4 +1,4 @@
-import { and, asc, count, eq, gt, inArray, isNull, ne, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, inArray, isNull, ne, or, sql, type SQL } from "drizzle-orm";
 import { alias } from "drizzle-orm/sqlite-core";
 import type { CfAuthDatabase } from "./config.js";
 import { deterministicUuid } from "./crypto.js";
@@ -11,6 +11,10 @@ import {
   type AuthSession,
   type AuthUser,
   type CredentialGrant,
+  type InvitationPreview,
+  type InvitationResponse,
+  type InvitationState,
+  type OrganizationInvitation,
   type OrganizationMember,
   type OrganizationMembership,
   type OrganizationRole,
@@ -228,6 +232,72 @@ export interface CfAuthRepository {
     requireAnotherOwner?: boolean;
   }): Promise<MembershipMutationResult>;
 
+  updateOrganizationName(input: {
+    organizationId: string;
+    name: string;
+  }): Promise<OrganizationSummary | null>;
+
+  /**
+   * Opens an invitation, or reissues an expired one for the same address in
+   * place. Null when a live invitation to that address is already open — the
+   * partial unique index decides, inside the statement.
+   */
+  createInvitation(input: {
+    organizationId: string;
+    email: string;
+    role: OrganizationRole;
+    tokenHash: string;
+    invitedByUserId: string;
+    expiresAt: Date;
+    now: Date;
+  }): Promise<OrganizationInvitation | null>;
+  /** Open invitations — pending and expired — newest first. */
+  listOpenInvitations(organizationId: string, now: Date): Promise<OrganizationInvitation[]>;
+  findInvitation(
+    invitationId: string,
+    organizationId: string,
+    now: Date,
+  ): Promise<OrganizationInvitation | null>;
+  findInvitationPreviewByTokenHash(tokenHash: string, now: Date): Promise<InvitationPreview | null>;
+  findInvitationPreview(invitationId: string, now: Date): Promise<InvitationPreview | null>;
+  /** Pending, unexpired invitations addressed to `email`, newest first. */
+  listPendingInvitationsForEmail(email: string, now: Date): Promise<InvitationPreview[]>;
+  /** A new token and deadline for an invitation that is still open. Null once it is closed. */
+  reissueInvitation(input: {
+    invitationId: string;
+    organizationId: string;
+    tokenHash: string;
+    expiresAt: Date;
+    invitedByUserId: string;
+    now: Date;
+  }): Promise<OrganizationInvitation | null>;
+  /**
+   * Closes an open invitation with `revoked` or `declined`. `email` restricts a
+   * decline to the invitee. False when it was no longer open.
+   */
+  closeInvitation(input: {
+    invitationId: string;
+    response: Exclude<InvitationResponse, "accepted">;
+    userId: string;
+    email?: string;
+    now: Date;
+  }): Promise<boolean>;
+  /**
+   * Accepts a pending invitation and adds the membership in one batch, both
+   * guarded on the invitation being pending, unexpired, addressed to `email`
+   * and its organization usable. With `verifyEmail`, the same batch marks the
+   * address verified: the token arrived in that inbox. True when this call or
+   * an earlier one by the same user accepted it.
+   */
+  acceptInvitation(input: {
+    invitationId: string;
+    organizationId: string;
+    userId: string;
+    email: string;
+    verifyEmail: boolean;
+    now: Date;
+  }): Promise<boolean>;
+
   createApiKey(input: {
     userId: string;
     organizationId: string;
@@ -337,7 +407,8 @@ export const createCfAuthRepository = (
   tables: CfAuthTables,
   options: CfAuthRepositoryOptions = {},
 ): CfAuthRepository => {
-  const { user, session, organization, organizationUser, apiKey, oauthToken } = tables;
+  const { user, session, organization, organizationUser, organizationInvitation, apiKey, oauthToken } =
+    tables;
   const { userColumns, membershipColumns } = authRowColumns(tables);
 
   const onError =
@@ -350,6 +421,8 @@ export const createCfAuthRepository = (
   const ownerGuard = alias(organizationUser, "cf_auth_owner_guard");
   const organizationGuard = alias(organization, "cf_auth_organization_guard");
   const credentialGuard = alias(apiKey, "cf_auth_credential_guard");
+  const inviter = alias(user, "cf_auth_inviter");
+  const invitationGuard = alias(organizationInvitation, "cf_auth_invitation_guard");
 
   /** Renders a guard subquery as `(select count(*) ...) = n`, ready to AND into a WHERE. */
   const countIs = (query: { getSQL(): SQL }, expected: number) =>
@@ -466,6 +539,83 @@ export const createCfAuthRepository = (
       expiresAt: row.expiresAt ? toIso(row.expiresAt) : null,
       revokedAt: row.revokedAt ? toIso(row.revokedAt) : null,
     };
+  };
+
+  const invitationColumns = {
+    id: organizationInvitation.id,
+    organizationId: organizationInvitation.organizationId,
+    email: organizationInvitation.email,
+    role: organizationInvitation.role,
+    createdAt: organizationInvitation.createdAt,
+    expiresAt: organizationInvitation.expiresAt,
+    response: organizationInvitation.response,
+    respondedAt: organizationInvitation.respondedAt,
+    inviterId: inviter.id,
+    inviterName: inviter.name,
+    inviterEmail: inviter.email,
+  };
+  type InvitationRow = {
+    id: string;
+    organizationId: string;
+    email: string;
+    role: OrganizationRole;
+    createdAt: string;
+    expiresAt: string;
+    response: InvitationResponse | null;
+    respondedAt: string | null;
+    inviterId: string | null;
+    inviterName: string | null;
+    inviterEmail: string | null;
+  };
+  /** `expired` is never stored: an open invitation past its deadline reads as expired. */
+  const invitationState = (row: InvitationRow, now: Date): InvitationState =>
+    row.response ?? (row.expiresAt <= now.toISOString() ? "expired" : "pending");
+  const toInvitation = (row: InvitationRow, now: Date): OrganizationInvitation => ({
+    id: row.id,
+    organizationId: row.organizationId,
+    email: row.email,
+    role: row.role,
+    state: invitationState(row, now),
+    invitedBy: row.inviterId
+      ? { id: row.inviterId, name: row.inviterName, email: row.inviterEmail }
+      : null,
+    createdAt: row.createdAt,
+    expiresAt: row.expiresAt,
+    respondedAt: row.respondedAt,
+  });
+  const selectInvitations = () =>
+    db
+      .select(invitationColumns)
+      .from(organizationInvitation)
+      .leftJoin(inviter, eq(inviter.id, organizationInvitation.invitedByUserId));
+  const selectInvitationPreviews = () =>
+    db
+      .select({ ...invitationColumns, organizationName: organization.name })
+      .from(organizationInvitation)
+      .innerJoin(organization, eq(organization.id, organizationInvitation.organizationId))
+      .leftJoin(inviter, eq(inviter.id, organizationInvitation.invitedByUserId));
+  const toInvitationPreview = (
+    row: InvitationRow & { organizationName: string },
+    now: Date,
+  ): InvitationPreview => ({
+    id: row.id,
+    organization: { id: row.organizationId, name: row.organizationName },
+    email: row.email,
+    role: row.role,
+    state: invitationState(row, now),
+    invitedBy: row.inviterId ? { name: row.inviterName, email: row.inviterEmail } : null,
+    expiresAt: row.expiresAt,
+  });
+  const findInvitationById = async (invitationId: string, organizationId: string, now: Date) => {
+    const row = await selectInvitations()
+      .where(
+        and(
+          eq(organizationInvitation.id, invitationId),
+          eq(organizationInvitation.organizationId, organizationId),
+        ),
+      )
+      .get();
+    return row ? toInvitation(row, now) : null;
   };
 
   const findMembership = async (userId: string, organizationId: string) => {
@@ -1000,6 +1150,240 @@ export const createCfAuthRepository = (
       }
 
       return { ok: true, membership: existing };
+    },
+
+    async updateOrganizationName(input) {
+      const now = new Date().toISOString();
+      const updated = await db
+        .update(organization)
+        .set({ name: input.name, updatedAt: now })
+        .where(eq(organization.id, input.organizationId))
+        .returning({ id: organization.id });
+      if (updated.length === 0) return null;
+      const { organizationId: id, organizationName, organizationCreatedAt, claimed, expiresAt } =
+        membershipColumns;
+      const row = await db
+        .select({ id, organizationName, organizationCreatedAt, claimed, expiresAt })
+        .from(organization)
+        .where(eq(organization.id, input.organizationId))
+        .get();
+      return row
+        ? {
+            id: row.id,
+            name: row.organizationName,
+            createdAt: row.organizationCreatedAt,
+            claimed: Boolean(row.claimed),
+            expiresAt: row.expiresAt,
+          }
+        : null;
+    },
+
+    async createInvitation(input) {
+      const nowIso = input.now.toISOString();
+      const expiresAt = input.expiresAt.toISOString();
+      // An expired invitation to the same address is still open as far as the
+      // unique index goes; reissue it in place. A live one makes the update's
+      // own WHERE false, so nothing is returned and the caller is told.
+      const rows = await db
+        .insert(organizationInvitation)
+        .values({
+          id: crypto.randomUUID(),
+          organizationId: input.organizationId,
+          email: input.email,
+          role: input.role,
+          tokenHash: input.tokenHash,
+          invitedByUserId: input.invitedByUserId,
+          createdAt: nowIso,
+          expiresAt,
+        })
+        .onConflictDoUpdate({
+          target: [organizationInvitation.organizationId, organizationInvitation.email],
+          targetWhere: isNull(organizationInvitation.response),
+          set: {
+            role: input.role,
+            tokenHash: input.tokenHash,
+            invitedByUserId: input.invitedByUserId,
+            createdAt: nowIso,
+            expiresAt,
+          },
+          setWhere: sql`${organizationInvitation.expiresAt} <= ${nowIso}`,
+        })
+        .returning({ id: organizationInvitation.id });
+
+      const id = rows[0]?.id;
+      return id ? findInvitationById(id, input.organizationId, input.now) : null;
+    },
+
+    async listOpenInvitations(organizationId, now) {
+      const rows = await selectInvitations()
+        .where(
+          and(
+            eq(organizationInvitation.organizationId, organizationId),
+            isNull(organizationInvitation.response),
+          ),
+        )
+        .orderBy(desc(organizationInvitation.createdAt), asc(organizationInvitation.id));
+      return rows.map((row) => toInvitation(row, now));
+    },
+
+    findInvitation: findInvitationById,
+
+    async findInvitationPreviewByTokenHash(tokenHash, now) {
+      const row = await selectInvitationPreviews()
+        .where(eq(organizationInvitation.tokenHash, tokenHash))
+        .get();
+      return row ? toInvitationPreview(row, now) : null;
+    },
+
+    async findInvitationPreview(invitationId, now) {
+      const row = await selectInvitationPreviews()
+        .where(eq(organizationInvitation.id, invitationId))
+        .get();
+      return row ? toInvitationPreview(row, now) : null;
+    },
+
+    async listPendingInvitationsForEmail(email, now) {
+      const rows = await selectInvitationPreviews()
+        .where(
+          and(
+            eq(organizationInvitation.email, email.trim().toLowerCase()),
+            isNull(organizationInvitation.response),
+            gt(organizationInvitation.expiresAt, now.toISOString()),
+          ),
+        )
+        .orderBy(desc(organizationInvitation.createdAt), asc(organizationInvitation.id));
+      return rows.map((row) => toInvitationPreview(row, now));
+    },
+
+    async reissueInvitation(input) {
+      const updated = await db
+        .update(organizationInvitation)
+        .set({
+          tokenHash: input.tokenHash,
+          expiresAt: input.expiresAt.toISOString(),
+          invitedByUserId: input.invitedByUserId,
+        })
+        .where(
+          and(
+            eq(organizationInvitation.id, input.invitationId),
+            eq(organizationInvitation.organizationId, input.organizationId),
+            isNull(organizationInvitation.response),
+          ),
+        )
+        .returning({ id: organizationInvitation.id });
+      return updated.length > 0
+        ? findInvitationById(input.invitationId, input.organizationId, input.now)
+        : null;
+    },
+
+    async closeInvitation(input) {
+      const updated = await db
+        .update(organizationInvitation)
+        .set({
+          response: input.response,
+          respondedAt: input.now.toISOString(),
+          respondedByUserId: input.userId,
+        })
+        .where(
+          and(
+            eq(organizationInvitation.id, input.invitationId),
+            isNull(organizationInvitation.response),
+            ...(input.email === undefined
+              ? []
+              : [eq(organizationInvitation.email, input.email.trim().toLowerCase())]),
+          ),
+        )
+        .returning({ id: organizationInvitation.id });
+      return updated.length > 0;
+    },
+
+    async acceptInvitation(input) {
+      const nowIso = input.now.toISOString();
+      const email = input.email.trim().toLowerCase();
+      // Every later statement keys off this exact acceptance — this user, this
+      // instant — so a repeat, or a concurrent accept by someone else, cannot
+      // ride on a row it did not close.
+      const acceptedNow = countIs(
+        db
+          .select({ value: count() })
+          .from(invitationGuard)
+          .where(
+            and(
+              eq(invitationGuard.id, input.invitationId),
+              eq(invitationGuard.response, "accepted"),
+              eq(invitationGuard.respondedByUserId, input.userId),
+              eq(invitationGuard.respondedAt, nowIso),
+            ),
+          ),
+        1,
+      );
+      const statements: unknown[] = [
+        db
+          .update(organizationInvitation)
+          .set({ response: "accepted", respondedAt: nowIso, respondedByUserId: input.userId })
+          .where(
+            and(
+              eq(organizationInvitation.id, input.invitationId),
+              eq(organizationInvitation.organizationId, input.organizationId),
+              eq(organizationInvitation.email, email),
+              isNull(organizationInvitation.response),
+              gt(organizationInvitation.expiresAt, nowIso),
+              organizationUsable(input.organizationId, input.now),
+            ),
+          ),
+        // Someone already in the organization keeps the role they have.
+        db
+          .insert(organizationUser)
+          .select(
+            sql`select ${crypto.randomUUID()}, ${input.organizationId}, ${input.userId}, ${organizationInvitation.role}, 'active', ${nowIso} from ${organizationInvitation} where ${organizationInvitation.id} = ${input.invitationId} and ${acceptedNow}`,
+          )
+          .onConflictDoNothing({
+            target: [organizationUser.organizationId, organizationUser.userId],
+          }),
+      ];
+      if (input.verifyEmail) {
+        statements.push(
+          db
+            .update(user)
+            .set({ emailVerified: true, updatedAt: input.now })
+            .where(
+              and(
+                eq(user.id, input.userId),
+                sql`lower(${user.email}) = ${email}`,
+                eq(user.emailVerified, false),
+                acceptedNow,
+              ),
+            ),
+        );
+      }
+
+      await runAtomically(
+        db,
+        statements,
+        // Without a batch, reopen an acceptance that never became a membership.
+        () =>
+          db
+            .update(organizationInvitation)
+            .set({ response: null, respondedAt: null, respondedByUserId: null })
+            .where(
+              and(
+                eq(organizationInvitation.id, input.invitationId),
+                eq(organizationInvitation.respondedAt, nowIso),
+                eq(organizationInvitation.respondedByUserId, input.userId),
+              ),
+            ),
+        onError,
+      );
+
+      const row = await db
+        .select({
+          response: organizationInvitation.response,
+          respondedByUserId: organizationInvitation.respondedByUserId,
+        })
+        .from(organizationInvitation)
+        .where(eq(organizationInvitation.id, input.invitationId))
+        .get();
+      return row?.response === "accepted" && row.respondedByUserId === input.userId;
     },
 
     async createApiKey(input) {

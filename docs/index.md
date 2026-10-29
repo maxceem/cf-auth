@@ -9,6 +9,8 @@ database.
 - [Options](#options)
 - [Who is calling](#who-is-calling)
 - [Organizations](#organizations)
+- [Invitations](#invitations)
+- [Email verification](#email-verification)
 - [API keys](#api-keys)
 - [Operations approved in a browser](#operations-approved-in-a-browser)
 - [OAuth connections](#oauth-connections)
@@ -124,6 +126,7 @@ export const {
   verification,
   organization,
   organizationUser,
+  organizationInvitation,
   apiKey,
   operation,
   oauthToken,
@@ -157,7 +160,9 @@ adds the `operation` table and the `source` and `label` columns of `api_key`,
 existing key at `manage`, `0003_cf_auth_operation_execution_claim.sql` adds
 `operation.execution_claim`, and `0004_cf_auth_oauth_token.sql` adds the
 `oauth_token` table and the `client_id`, `resource` and `credential_type`
-columns of `api_key` (see [OAuth connections](#oauth-connections)). Each is plain `CREATE` and
+columns of `api_key` (see [OAuth connections](#oauth-connections)), and
+`0005_cf_auth_organization_invitation.sql` adds the `organization_invitation`
+table (see [Invitations](#invitations)). Each is plain `CREATE` and
 `ALTER TABLE ... ADD`; none rebuilds a table. Copy them in, in order. The package's own tests apply these exact files, so
 they cannot drift from the schema.
 
@@ -427,7 +432,12 @@ await service.removeOrganizationMember({
   organizationId,
   userId,
 });
+await service.leaveOrganization({ actor: state, organizationId }); // session only
+await service.renameOrganization({ actor: state, organizationId, name: "Acme" }); // owner or admin
 ```
+
+Someone who leaves, or is removed from, their last organization gets a fresh
+default one on their next request, as a new signup would.
 
 ### What each role may do
 
@@ -440,6 +450,10 @@ members, but **an admin can never reach owner level**:
 | Add someone as an `owner`                    | `owner`            |
 | Demote or remove an `owner`                  | `owner`            |
 | List members                                 | `owner` or `admin` |
+| Invite a `member` or `admin`                 | `owner` or `admin` |
+| Invite an `owner`                            | `owner`            |
+| Rename the organization                      | `owner` or `admin` |
+| Leave                                        | anyone but the last owner |
 
 An organization must always keep at least one owner. Removing or demoting the
 last one fails with `409 last_owner`, and the check happens inside the write
@@ -448,6 +462,123 @@ itself, so two owners removing each other at the same moment cannot both win.
 Apps usually pass `organization.id` to a billing service as the paying
 customer's id. That is just a habit — this package has no billing code and no
 billing dependency.
+
+---
+
+## Invitations
+
+`addOrganizationMember` needs a user who already exists. To bring in someone
+who may not have an account yet, invite their email address. cf-auth keeps the
+invitation and gives you a one-time token; you put the token in a link and
+send it. This package sends no email.
+
+```ts
+const { invitation, token } = await cfAuth.service.createInvitation({
+  actor: state,
+  organizationId,
+  email: "ada@example.com",
+  role: "member",
+});
+// Keep the token out of logs and Referer headers: a fragment is never sent to a server.
+await sendEmail(invitation.email, `${appUrl}/invitations/accept#${token}`);
+```
+
+The page the link opens reads the token from the fragment and asks your API
+what it stands for. That needs nobody signed in, because holding the token is
+the authority:
+
+```ts
+const preview = await cfAuth.service.previewInvitation(token);
+// { organization: { id, name }, email, role, state, invitedBy, expiresAt }
+```
+
+Once the person is signed in — signing up or signing in with the invited
+address — they answer it:
+
+```ts
+await cfAuth.service.acceptInvitation({ actor: state, token }); // joins as invitation.role
+await cfAuth.service.declineInvitation({ actor: state, token });
+```
+
+- **Only the invited address can accept.** Anyone else gets
+  `403 invitation_email_mismatch`, so a forwarded link is no way in.
+- **Accepting by token verifies the address.** The token was delivered to that
+  inbox, so the same batch that adds the membership sets `emailVerified`.
+- **No stray organization.** While someone has a pending invitation, their
+  signup does not get a default organization of its own: `authState` has
+  `organization: null` until they accept. If they decline, or it expires, the
+  next request makes the default organization as usual.
+- **One open invitation per address.** A second one is
+  `409 invitation_pending`; an expired one is reissued in place with a new
+  token. Inviting an existing member is `409 already_a_member`.
+- **Accepting is one atomic batch.** The invitation closes and the membership
+  is added together, both guarded on the invitation still being pending and
+  unexpired and the organization usable. Someone who is already a member keeps
+  their role. A repeat by the person who accepted answers the same membership.
+
+Managing invitations takes the same authority as managing members:
+
+```ts
+await cfAuth.service.listInvitations({ actor, organizationId }); // pending and expired
+await cfAuth.service.resendInvitation({ actor, organizationId, invitationId }); // new token, new deadline
+await cfAuth.service.revokeInvitation({ actor, organizationId, invitationId });
+```
+
+A person whose address is **verified** can also see and answer their pending
+invitations without the link, for example on a page shown to a signed-in user
+with no organization:
+
+```ts
+const invitations = await cfAuth.service.listMyInvitations(state); // [] while unverified
+await cfAuth.service.acceptInvitation({ actor: state, invitationId: invitations[0].id });
+```
+
+By id, an unverified address gets `403 email_unverified`: anyone can register an
+address, so only a verified one may read or answer what was sent to it.
+
+Invitations last 7 days; set `invitations: { ttlMs }` to change that. They live
+in the `organization_invitation` table.
+
+| Error                       | Status | Meaning                                              |
+| --------------------------- | ------ | ---------------------------------------------------- |
+| `invitation_not_found`      | 404    | No invitation for that token, or not yours by id     |
+| `invitation_expired`        | 410    | Past its deadline; ask for a new one                 |
+| `invitation_closed`         | 409    | Already accepted, declined or revoked                |
+| `invitation_email_mismatch` | 403    | Sent to a different address than the signed-in one   |
+| `invitation_pending`        | 409    | A live invitation to that address is already open    |
+| `already_a_member`          | 409    | That address already belongs to a member             |
+| `email_unverified`          | 403    | Answering by id needs a verified address             |
+
+---
+
+## Email verification
+
+Off by default. Give cf-auth a way to send, and an email-and-password signup
+is sent a link that marks the address verified when opened. It is
+better-auth's own verification: a signed token, nothing stored.
+
+```ts
+const cfAuth = createCfAuth({
+  // ...the usual settings
+  emailVerification: {
+    send: async ({ user, url }) => {
+      await sendEmail(user.email!, `Confirm your address: ${url}`);
+    },
+    // sendOnSignUp: true, sendOnSignIn: false,
+    // autoSignInAfterVerification: true, expiresInSeconds: 86400,
+  },
+});
+```
+
+`url` is better-auth's `GET <basePath>/verify-email` endpoint with the token
+and the `callbackURL` to land on; send it as it is. To send a new link, call
+`cfAuth.auth.api.sendVerificationEmail({ body: { email, callbackURL } })`.
+Google sign-ins arrive verified. A verified address emits
+`user.email_verified`.
+
+Verification only records the fact; what an unverified person may do is your
+app's decision. `emailAndPassword.requireEmailVerification` is the strict
+option: no session at all until the address is verified.
 
 ---
 
@@ -1719,6 +1850,15 @@ createCfAuth({
     switch (event.type) {
       case "user.signup": // { userId, email }
       case "organization.created": // { userId, organizationId, role, name }
+      case "organization.renamed": // { actorUserId, organizationId, name }
+      case "user.email_verified": // { userId, email }
+      case "member.added": // { actorUserId, organizationId, userId, role, invitationId? }
+      case "member.role_changed": // { actorUserId, organizationId, userId, previousRole, role }
+      case "member.removed": // { actorUserId, organizationId, userId, role }
+      case "invitation.created": // { actorUserId, organizationId, invitationId, email, role }
+      case "invitation.resent": // { actorUserId, organizationId, invitationId, email }
+      case "invitation.revoked": // { actorUserId, organizationId, invitationId, email }
+      case "invitation.declined": // { userId, organizationId, invitationId, email }
       case "api_key.created": // { actorUserId, organizationId, apiKeyId, name, credentialType? }
       case "api_key.revoked": // { actorUserId, organizationId, apiKeyId, name, credentialType? }
         await writeAuditLog(event);

@@ -59,6 +59,37 @@ export interface OrganizationsConfig {
   defaultOrganizationName?: string | ((user: AuthUser) => string);
 }
 
+export interface InvitationsConfig {
+  /**
+   * How long an invitation can be accepted, counted from when it was sent or
+   * last resent. Default: 7 days.
+   */
+  ttlMs?: number;
+}
+
+/**
+ * better-auth's email verification, with the sending left to the app.
+ *
+ * Present means on: an email-and-password signup is sent a link, and opening
+ * it marks the address verified. Google sign-ins arrive verified already.
+ */
+export interface EmailVerificationConfig {
+  /**
+   * Delivers the link. `url` is better-auth's verification endpoint under
+   * `basePath`, carrying the token and the `callbackURL` the person lands on
+   * afterwards; send it as it is.
+   */
+  send: (input: { user: AuthUser; url: string; token: string }) => Promise<void>;
+  /** Send a link right after an email-and-password signup. Default: `true`. */
+  sendOnSignUp?: boolean;
+  /** Send a new link when an unverified person signs in. Default: `false`. */
+  sendOnSignIn?: boolean;
+  /** Sign the person in when they open the link. Default: `true`. */
+  autoSignInAfterVerification?: boolean;
+  /** How long a link works, in seconds. Default: 24 hours. */
+  expiresInSeconds?: number;
+}
+
 export interface ApiKeysConfig {
   /** Enable bearer API-key authentication and the key management service. Default: `false`. */
   enabled?: boolean;
@@ -277,6 +308,8 @@ export interface CfAuthConfig {
   accountLinking?: AccountLinkingConfig;
 
   organizations?: OrganizationsConfig;
+  invitations?: InvitationsConfig;
+  emailVerification?: EmailVerificationConfig;
   apiKeys?: ApiKeysConfig;
   cookies?: CookieConfig;
   operations?: OperationsConfig;
@@ -766,6 +799,9 @@ export interface ResolvedCfAuthConfig {
     autoProvisionDefaultOrganization: boolean;
     resolveDefaultOrganizationName: (user: AuthUser) => string;
   };
+  invitations: Required<InvitationsConfig>;
+  /** Null while email verification is off. */
+  emailVerification: Required<EmailVerificationConfig> | null;
   apiKeys: Required<ApiKeysConfig>;
   operations: ResolvedOperationsConfig;
   /** Null while `oauth.enabled` is off. */
@@ -806,6 +842,10 @@ export const resolveConfig = (config: CfAuthConfig): ResolvedCfAuthConfig => {
 
   if (config.d1 && config.db) {
     throw validationError("Provide only one of `d1` or `db`");
+  }
+
+  if (config.emailVerification && typeof config.emailVerification.send !== "function") {
+    throw validationError("`emailVerification.send` must be a function");
   }
 
   const tables = config.tables ?? cfAuthTables;
@@ -888,6 +928,23 @@ export const resolveConfig = (config: CfAuthConfig): ResolvedCfAuthConfig => {
           ? defaultOrganizationName
           : () => defaultOrganizationName ?? "My Organization",
     },
+    invitations: {
+      ttlMs: positiveInteger(config.invitations?.ttlMs, 7 * day, "invitations.ttlMs"),
+    },
+    emailVerification: config.emailVerification
+      ? {
+          send: config.emailVerification.send,
+          sendOnSignUp: config.emailVerification.sendOnSignUp ?? true,
+          sendOnSignIn: config.emailVerification.sendOnSignIn ?? false,
+          autoSignInAfterVerification:
+            config.emailVerification.autoSignInAfterVerification ?? true,
+          expiresInSeconds: positiveInteger(
+            config.emailVerification.expiresInSeconds,
+            24 * 60 * 60,
+            "emailVerification.expiresInSeconds",
+          ),
+        }
+      : null,
     operations,
     oauth,
     apiKeys: {

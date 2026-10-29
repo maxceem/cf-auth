@@ -1,6 +1,6 @@
 import type { SQL } from "drizzle-orm";
 import type { ResolvedCfAuthConfig } from "./config.js";
-import { generateApiKeyToken, hashApiKeyToken } from "./crypto.js";
+import { generateApiKeyToken, hashApiKeyToken, randomToken, sha256Hex } from "./crypto.js";
 import {
   CfAuthError,
   conflict,
@@ -29,9 +29,13 @@ import {
   type OAuthActionSource,
   type CreatedApiKey,
   type CredentialGrant,
+  type InvitationPreview,
+  type IssuedInvitation,
+  type OrganizationInvitation,
   type OrganizationMember,
   type OrganizationMembership,
   type OrganizationRole,
+  type OrganizationSummary,
 } from "./types.js";
 
 const ensureNonEmpty = (value: string | null | undefined, label: string) => {
@@ -349,6 +353,83 @@ export interface CfAuthService {
     userId: string;
   }): Promise<OrganizationMembership>;
 
+  /**
+   * Leaves an organization. Session-only. The last owner cannot leave
+   * (`409 last_owner`); with no organization left, the next request gets a
+   * fresh default one, like any member who was removed.
+   */
+  leaveOrganization(input: { actor: AuthState; organizationId: string }): Promise<OrganizationMembership>;
+  /** Renames an organization. Requires an owner or admin and the `manage` grant. */
+  renameOrganization(input: {
+    actor: AuthState;
+    organizationId: string;
+    name: string;
+  }): Promise<OrganizationSummary>;
+
+  /**
+   * Invites an email address into an organization, as `role`.
+   *
+   * Same rules as {@link CfAuthService.addOrganizationMember}: an owner or
+   * admin with the `manage` grant, and only an owner (in a session) may invite
+   * an owner. Answers with the one-time token for the link — deliver it
+   * yourself; cf-auth sends no email. `409 already_a_member` when that address
+   * already belongs to a member, `409 invitation_pending` when a live
+   * invitation to it is open. An expired one is reissued in place.
+   */
+  createInvitation(input: {
+    actor: AuthState;
+    organizationId: string;
+    email: string;
+    role: OrganizationRole;
+  }): Promise<IssuedInvitation>;
+  /** Open invitations, pending and expired. Owner or admin, `read` grant. */
+  listInvitations(input: { actor: AuthState; organizationId: string }): Promise<OrganizationInvitation[]>;
+  /**
+   * A new token and a fresh deadline for an open invitation; the old link
+   * stops working. Same authority as creating it.
+   */
+  resendInvitation(input: {
+    actor: AuthState;
+    organizationId: string;
+    invitationId: string;
+  }): Promise<IssuedInvitation>;
+  /** Withdraws an open invitation. Owner or admin, `manage` grant. */
+  revokeInvitation(input: {
+    actor: AuthState;
+    organizationId: string;
+    invitationId: string;
+  }): Promise<OrganizationInvitation>;
+  /**
+   * What an invitation token stands for, for a page shown before anyone signs
+   * in. Needs no actor: holding the token is the authority. Every state is
+   * answered, so the page can say why a link no longer works; an unknown token
+   * is `404 invitation_not_found`.
+   */
+  previewInvitation(token: string): Promise<InvitationPreview>;
+  /**
+   * Pending invitations addressed to the signed-in person. Empty until their
+   * email address is verified: an unverified address proves nothing, so it
+   * must not reveal which organizations invited it. Session-only.
+   */
+  listMyInvitations(actor: AuthState): Promise<InvitationPreview[]>;
+  /**
+   * Joins the organization an invitation is for, as its role. Session-only,
+   * and only for the address it was sent to (`403 invitation_email_mismatch`).
+   *
+   * By `token`, the link: it was delivered to that address, so accepting also
+   * marks the address verified. By `invitationId`, from
+   * {@link CfAuthService.listMyInvitations}: only once the address is
+   * verified (`403 email_unverified`). Idempotent for the person who accepted.
+   * Someone already in the organization keeps their role.
+   */
+  acceptInvitation(
+    input: { actor: AuthState } & ({ token: string } | { invitationId: string }),
+  ): Promise<OrganizationMembership>;
+  /** Turns an invitation down, by token or (verified address) by id. Session-only. */
+  declineInvitation(
+    input: { actor: AuthState } & ({ token: string } | { invitationId: string }),
+  ): Promise<InvitationPreview>;
+
   resolveApiKeyAuthState(plaintext: string, source?: ActionSource): Promise<AuthState>;
   /** Requires current organization membership. */
   listApiKeys(input: { organizationId: string; actor: AuthState }): Promise<ApiKeySummary[]>;
@@ -522,6 +603,79 @@ export const createAuthService = (
     throw memberNotFound();
   };
 
+  const invitationNotFound = () =>
+    new CfAuthError("invitation_not_found", "Invitation was not found", 404);
+
+  /** The refusal an invitation owes once it is no longer pending. */
+  const invitationClosed = (state: OrganizationInvitation["state"]) =>
+    state === "expired"
+      ? new CfAuthError("invitation_expired", "This invitation has expired", 410)
+      : new CfAuthError("invitation_closed", `This invitation was already ${state}`, 409);
+
+  const normalizeInvitationEmail = (value: string) => {
+    const email = ensureNonEmpty(value, "Email").toLowerCase();
+    if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw validationError("Email address is not valid");
+    }
+    return email;
+  };
+
+  const newInvitationToken = async () => {
+    const token = randomToken(32);
+    return { token, tokenHash: await sha256Hex(token) };
+  };
+
+  /**
+   * Organizations a person's pending invitations will give them. While any is
+   * open, they get no default organization of their own: the invitation is
+   * where they are going, and a stray empty organization would be the first
+   * thing they see.
+   */
+  const hasPendingInvitation = async (email: string | null) =>
+    email !== null &&
+    (await repository.listPendingInvitationsForEmail(email, new Date())).length > 0;
+
+  /**
+   * The invitation a token or id names, for its invitee. By id, only a verified
+   * address may reach it — otherwise anyone could register the address and
+   * answer invitations sent to it.
+   */
+  const resolveInviteeInvitation = async (
+    input: { actor: AuthState } & ({ token: string } | { invitationId: string }),
+  ) => {
+    const userId = requireInteractive(input.actor);
+    const user = await repository.findUserById(userId);
+    if (!user?.email) throw unauthorized();
+    const now = new Date();
+    let preview: InvitationPreview | null;
+    if ("token" in input) {
+      const token = input.token?.trim();
+      preview = token
+        ? await repository.findInvitationPreviewByTokenHash(await sha256Hex(token), now)
+        : null;
+    } else {
+      if (!user.emailVerified) {
+        throw new CfAuthError(
+          "email_unverified",
+          "Verify your email address to answer invitations sent to it",
+          403,
+        );
+      }
+      preview = await repository.findInvitationPreview(input.invitationId, now);
+      // Indistinguishable from a missing one: an id is not a secret.
+      if (preview && preview.email !== user.email.toLowerCase()) preview = null;
+    }
+    if (!preview) throw invitationNotFound();
+    if (preview.email !== user.email.toLowerCase()) {
+      throw new CfAuthError(
+        "invitation_email_mismatch",
+        "This invitation was sent to a different email address",
+        403,
+      );
+    }
+    return { user, preview, now, viaToken: "token" in input };
+  };
+
   const provisionDefaultOrganization = async (user: AuthUser) => {
     const name = config.organizations.resolveDefaultOrganizationName(user);
     const { membership, created } = await repository.ensureDefaultOrganizationWithOwner({
@@ -609,7 +763,8 @@ export const createAuthService = (
         !config.organizations.autoProvisionDefaultOrganization ||
         !state.authenticated ||
         !state.user ||
-        state.memberships.length > 0
+        state.memberships.length > 0 ||
+        (await hasPendingInvitation(state.user.email))
       ) {
         return state;
       }
@@ -643,6 +798,10 @@ export const createAuthService = (
 
       if (existing.length > 0) {
         return toSessionAuthState(storedUser, existing, existing[0]?.organization.id ?? null);
+      }
+
+      if (await hasPendingInvitation(storedUser.email)) {
+        return toSessionAuthState(storedUser, [], null);
       }
 
       const membership = await provisionDefaultOrganization(storedUser);
@@ -778,11 +937,19 @@ export const createAuthService = (
         requireOwnerToActOnOwner(actorMembership.role, "add a member as owner");
       }
 
-      return repository.addOrganizationUser({
+      const membership = await repository.addOrganizationUser({
         organizationId: input.organizationId,
         userId: input.userId,
         role: input.role,
       });
+      await emit({
+        type: "member.added",
+        actorUserId: input.actor.user!.id,
+        organizationId: input.organizationId,
+        userId: input.userId,
+        role: membership.role,
+      });
+      return membership;
     },
 
     async updateOrganizationMemberRole(input) {
@@ -819,7 +986,7 @@ export const createAuthService = (
         return target;
       }
 
-      return unwrapMembershipMutation(
+      const membership = unwrapMembershipMutation(
         await repository.updateOrganizationUserRole({
           organizationId: input.organizationId,
           userId: input.userId,
@@ -828,6 +995,15 @@ export const createAuthService = (
         }),
         "demote",
       );
+      await emit({
+        type: "member.role_changed",
+        actorUserId: input.actor.user!.id,
+        organizationId: input.organizationId,
+        userId: input.userId,
+        previousRole: target.role,
+        role: membership.role,
+      });
+      return membership;
     },
 
     async removeOrganizationMember(input) {
@@ -852,7 +1028,7 @@ export const createAuthService = (
         requireOwnerToActOnOwner(actorMembership.role, "remove another owner");
       }
 
-      return unwrapMembershipMutation(
+      const removed = unwrapMembershipMutation(
         await repository.removeOrganizationUser({
           organizationId: input.organizationId,
           userId: input.userId,
@@ -860,6 +1036,248 @@ export const createAuthService = (
         }),
         "remove",
       );
+      await emit({
+        type: "member.removed",
+        actorUserId: input.actor.user!.id,
+        organizationId: input.organizationId,
+        userId: input.userId,
+        role: removed.role,
+      });
+      return removed;
+    },
+
+    async leaveOrganization(input) {
+      const userId = requireInteractive(input.actor);
+      const membership = await requireMember(userId, input.organizationId);
+      const removed = unwrapMembershipMutation(
+        await repository.removeOrganizationUser({
+          organizationId: input.organizationId,
+          userId,
+          requireAnotherOwner: membership.role === "owner",
+        }),
+        "remove",
+      );
+      await emit({
+        type: "member.removed",
+        actorUserId: userId,
+        organizationId: input.organizationId,
+        userId,
+        role: removed.role,
+      });
+      return removed;
+    },
+
+    async renameOrganization(input) {
+      const actorUserId = requireActor(input.actor, input.organizationId, "manage");
+      await requireManager(actorUserId, input.organizationId);
+      const name = ensureNonEmpty(input.name, "Organization name");
+      if (name.length > 100) throw validationError("Organization name is too long");
+      const organization = await repository.updateOrganizationName({
+        organizationId: input.organizationId,
+        name,
+      });
+      if (!organization) throw forbidden("You are not a member of this organization");
+      await emit({
+        type: "organization.renamed",
+        actorUserId,
+        organizationId: input.organizationId,
+        name,
+      });
+      return organization;
+    },
+
+    async createInvitation(input) {
+      const actorUserId = requireActor(input.actor, input.organizationId, "manage");
+      const actorMembership = await requireManager(actorUserId, input.organizationId);
+      if (isOrganizationExpired(actorMembership.organization)) throw organizationExpired();
+      if (input.role === "owner") {
+        requireInteractive(input.actor);
+        requireOwnerToActOnOwner(actorMembership.role, "invite an owner");
+      }
+      const email = normalizeInvitationEmail(input.email);
+      const existingUser = await repository.findUserByEmail(email);
+      if (existingUser && (await repository.findMembership(existingUser.id, input.organizationId))) {
+        throw conflict("That person is already a member of this organization", "already_a_member");
+      }
+
+      const now = new Date();
+      const { token, tokenHash } = await newInvitationToken();
+      const invitation = await repository.createInvitation({
+        organizationId: input.organizationId,
+        email,
+        role: input.role,
+        tokenHash,
+        invitedByUserId: actorUserId,
+        expiresAt: new Date(now.getTime() + config.invitations.ttlMs),
+        now,
+      });
+      if (!invitation) {
+        throw conflict("An invitation to this address is already pending", "invitation_pending");
+      }
+      await emit({
+        type: "invitation.created",
+        actorUserId,
+        organizationId: input.organizationId,
+        invitationId: invitation.id,
+        email,
+        role: invitation.role,
+      });
+      return { invitation, token };
+    },
+
+    async listInvitations(input) {
+      await requireManager(
+        requireActor(input.actor, input.organizationId, "read"),
+        input.organizationId,
+      );
+      return repository.listOpenInvitations(input.organizationId, new Date());
+    },
+
+    async resendInvitation(input) {
+      const actorUserId = requireActor(input.actor, input.organizationId, "manage");
+      const actorMembership = await requireManager(actorUserId, input.organizationId);
+      if (isOrganizationExpired(actorMembership.organization)) throw organizationExpired();
+      const now = new Date();
+      const existing = await repository.findInvitation(input.invitationId, input.organizationId, now);
+      if (!existing) throw invitationNotFound();
+      if (existing.state !== "pending" && existing.state !== "expired") {
+        throw invitationClosed(existing.state);
+      }
+      if (existing.role === "owner") {
+        requireInteractive(input.actor);
+        requireOwnerToActOnOwner(actorMembership.role, "invite an owner");
+      }
+      const { token, tokenHash } = await newInvitationToken();
+      const invitation = await repository.reissueInvitation({
+        invitationId: input.invitationId,
+        organizationId: input.organizationId,
+        tokenHash,
+        expiresAt: new Date(now.getTime() + config.invitations.ttlMs),
+        invitedByUserId: actorUserId,
+        now,
+      });
+      if (!invitation) {
+        const current = await repository.findInvitation(input.invitationId, input.organizationId, now);
+        throw current ? invitationClosed(current.state) : invitationNotFound();
+      }
+      await emit({
+        type: "invitation.resent",
+        actorUserId,
+        organizationId: input.organizationId,
+        invitationId: invitation.id,
+        email: invitation.email,
+      });
+      return { invitation, token };
+    },
+
+    async revokeInvitation(input) {
+      const actorUserId = requireActor(input.actor, input.organizationId, "manage");
+      await requireManager(actorUserId, input.organizationId);
+      const now = new Date();
+      const existing = await repository.findInvitation(input.invitationId, input.organizationId, now);
+      if (!existing) throw invitationNotFound();
+      if (existing.state !== "pending" && existing.state !== "expired") {
+        throw invitationClosed(existing.state);
+      }
+      const closed = await repository.closeInvitation({
+        invitationId: input.invitationId,
+        response: "revoked",
+        userId: actorUserId,
+        now,
+      });
+      const current = await repository.findInvitation(input.invitationId, input.organizationId, now);
+      if (!closed || !current) throw current ? invitationClosed(current.state) : invitationNotFound();
+      await emit({
+        type: "invitation.revoked",
+        actorUserId,
+        organizationId: input.organizationId,
+        invitationId: current.id,
+        email: current.email,
+      });
+      return current;
+    },
+
+    async previewInvitation(token) {
+      const trimmed = token?.trim();
+      const preview = trimmed
+        ? await repository.findInvitationPreviewByTokenHash(await sha256Hex(trimmed), new Date())
+        : null;
+      if (!preview) throw invitationNotFound();
+      return preview;
+    },
+
+    async listMyInvitations(actor) {
+      const user = await repository.findUserById(requireInteractive(actor));
+      if (!user?.email || !user.emailVerified) return [];
+      return repository.listPendingInvitationsForEmail(user.email, new Date());
+    },
+
+    async acceptInvitation(input) {
+      const { user, preview, now, viaToken } = await resolveInviteeInvitation(input);
+      const membershipBefore = await repository.findMembership(user.id, preview.organization.id);
+      if (preview.state !== "pending") {
+        // A repeat by the person who accepted settles on the same membership.
+        if (preview.state === "accepted" && membershipBefore) return membershipBefore;
+        throw invitationClosed(preview.state);
+      }
+      const organization = await repository.findOrganization(preview.organization.id);
+      if (!organization) throw invitationNotFound();
+      if (isOrganizationExpired(organization)) throw organizationExpired();
+
+      const accepted = await repository.acceptInvitation({
+        invitationId: preview.id,
+        organizationId: preview.organization.id,
+        userId: user.id,
+        email: user.email!,
+        verifyEmail: viaToken,
+        now,
+      });
+      if (!accepted) {
+        const current = await repository.findInvitationPreview(preview.id, new Date());
+        throw invitationClosed(current?.state ?? "revoked");
+      }
+      const membership = await repository.findMembership(user.id, preview.organization.id);
+      if (!membership) throw new Error("Accepted invitation left no membership");
+
+      if (!membershipBefore) {
+        await emit({
+          type: "member.added",
+          actorUserId: user.id,
+          organizationId: preview.organization.id,
+          userId: user.id,
+          role: membership.role,
+          invitationId: preview.id,
+        });
+      }
+      if (viaToken && !user.emailVerified) {
+        await emit({ type: "user.email_verified", userId: user.id, email: user.email! });
+      }
+      return membership;
+    },
+
+    async declineInvitation(input) {
+      const { user, preview, now } = await resolveInviteeInvitation(input);
+      if (preview.state !== "pending" && preview.state !== "expired") {
+        if (preview.state === "declined") return preview;
+        throw invitationClosed(preview.state);
+      }
+      const closed = await repository.closeInvitation({
+        invitationId: preview.id,
+        response: "declined",
+        userId: user.id,
+        email: user.email!,
+        now,
+      });
+      const current = await repository.findInvitationPreview(preview.id, new Date());
+      if (!closed || !current) throw invitationClosed(current?.state ?? "revoked");
+      await emit({
+        type: "invitation.declined",
+        userId: user.id,
+        organizationId: preview.organization.id,
+        invitationId: preview.id,
+        email: preview.email,
+      });
+      return current;
     },
 
     async resolveApiKeyAuthState(plaintext, source = "api") {
