@@ -10,7 +10,7 @@ import { APIError, createAuthMiddleware } from "better-auth/api";
 import { guardUserCreates } from "./atomic-user-create.js";
 import type { ResolvedCfAuthConfig } from "./config.js";
 import { toBetterAuthSchema } from "./schema.js";
-import type { CfAuthService } from "./service.js";
+import { emitCfAuthEvent, type CfAuthService } from "./service.js";
 import type { AuthUser } from "./types.js";
 
 const toIso = (value: Date | string | number | null | undefined) => {
@@ -80,6 +80,26 @@ export const createBetterAuthOptions = (
       maxPasswordLength: config.emailAndPassword.maxPasswordLength,
       requireEmailVerification: config.emailAndPassword.requireEmailVerification,
     },
+    ...(config.emailVerification
+      ? {
+          emailVerification: {
+            sendVerificationEmail: async ({ user, url, token }) => {
+              await config.emailVerification!.send({ user: toAuthUser(user), url, token });
+            },
+            sendOnSignUp: config.emailVerification.sendOnSignUp,
+            sendOnSignIn: config.emailVerification.sendOnSignIn,
+            autoSignInAfterVerification: config.emailVerification.autoSignInAfterVerification,
+            expiresIn: config.emailVerification.expiresInSeconds,
+            afterEmailVerification: async (user) => {
+              await emitCfAuthEvent(config, {
+                type: "user.email_verified",
+                userId: user.id,
+                email: user.email,
+              });
+            },
+          },
+        }
+      : {}),
     account: {
       accountLinking: {
         // Off unless the host opts in: nothing here verifies an email address,

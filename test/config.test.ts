@@ -246,13 +246,14 @@ describe("resolveConfig", () => {
 });
 
 describe("schema", () => {
-  it("exposes the nine tables an app must migrate", () => {
+  it("exposes the ten tables an app must migrate", () => {
     expect(Object.keys(cfAuthTables).sort()).toEqual([
       "account",
       "apiKey",
       "oauthToken",
       "operation",
       "organization",
+      "organizationInvitation",
       "organizationUser",
       "session",
       "user",
@@ -266,6 +267,7 @@ describe("schema", () => {
       "oauth_token",
       "operation",
       "organization",
+      "organization_invitation",
       "organization_user",
       "user",
       "user_account",
@@ -282,6 +284,7 @@ describe("schema", () => {
       "auth_oauth_token",
       "auth_operation",
       "auth_organization",
+      "auth_organization_invitation",
       "auth_organization_user",
       "auth_user",
       "auth_user_account",

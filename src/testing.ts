@@ -41,9 +41,12 @@ export interface TestSessions {
    * signing up would have produced, without the password hash.
    *
    * Each call creates a distinct user, so tests that need separate tenants stay
-   * independent of one another.
+   * independent of one another. The address is verified unless
+   * `emailVerified: false`. An address with a pending invitation gets no
+   * organization of its own, so `human()` refuses it; sign such a person up
+   * instead.
    */
-  human(input?: { email?: string; name?: string }): Promise<TestHuman>;
+  human(input?: { email?: string; name?: string; emailVerified?: boolean }): Promise<TestHuman>;
   /** A fresh session id for an existing user. */
   sessionIdFor(userId: string): Promise<string>;
   /**
@@ -118,7 +121,7 @@ export const createTestSessions = (cfAuth: CfAuth): TestSessions => {
       const user = await internalAdapter.createUser({
         email,
         name,
-        emailVerified: true,
+        emailVerified: input.emailVerified ?? true,
       });
 
       // Idempotent, and the same call better-auth's `user.create.after` hook

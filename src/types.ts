@@ -192,6 +192,59 @@ export interface CreatedApiKey extends ApiKeySummary {
 }
 
 /**
+ * Where an invitation stands. Only `pending` can be accepted; the others are
+ * final. `expired` is derived from `expiresAt` rather than written.
+ */
+export const invitationStates = ["pending", "accepted", "declined", "revoked", "expired"] as const;
+export type InvitationState = (typeof invitationStates)[number];
+
+/** The answers an invitation can be closed with, as stored. */
+export const invitationResponses = ["accepted", "declined", "revoked"] as const;
+export type InvitationResponse = (typeof invitationResponses)[number];
+
+/** An invitation to join an organization, as its managers see it. */
+export interface OrganizationInvitation {
+  id: string;
+  organizationId: string;
+  /** The address the invitation was sent to, lowercased. Only that person may accept it. */
+  email: string;
+  /** The role the person gets when they accept. */
+  role: OrganizationRole;
+  state: InvitationState;
+  /** Who sent it; null once that identity has been deleted. */
+  invitedBy: { id: string; name: string | null; email: string | null } | null;
+  createdAt: string;
+  expiresAt: string;
+  /** When it reached `accepted`, `declined` or `revoked`; null while pending or expired. */
+  respondedAt: string | null;
+}
+
+/**
+ * An invitation together with the one-time token that accepts it.
+ *
+ * Only the token's SHA-256 digest is stored, so this is the one chance to put
+ * the token in a link; issuing it again means a new token.
+ */
+export interface IssuedInvitation {
+  invitation: OrganizationInvitation;
+  token: string;
+}
+
+/**
+ * What the holder of an invitation token, or the verified invitee, sees before
+ * answering: which organization, who asked, and as what.
+ */
+export interface InvitationPreview {
+  id: string;
+  organization: { id: string; name: string };
+  email: string;
+  role: OrganizationRole;
+  state: InvitationState;
+  invitedBy: { name: string | null; email: string | null } | null;
+  expiresAt: string;
+}
+
+/**
  * Lifecycle events emitted by the library so a consuming app can write its own
  * audit log without this package owning an audit table.
  */
@@ -205,6 +258,62 @@ export type CfAuthEvent =
       name: string;
     }
   | { type: "organization.claimed"; userId: string; organizationId: string }
+  | { type: "organization.renamed"; actorUserId: string; organizationId: string; name: string }
+  | { type: "user.email_verified"; userId: string; email: string }
+  | {
+      type: "member.added";
+      actorUserId: string;
+      organizationId: string;
+      userId: string;
+      role: OrganizationRole;
+      /** Set when the member joined by accepting this invitation. */
+      invitationId?: string;
+    }
+  | {
+      type: "member.role_changed";
+      actorUserId: string;
+      organizationId: string;
+      userId: string;
+      previousRole: OrganizationRole;
+      role: OrganizationRole;
+    }
+  | {
+      type: "member.removed";
+      /** Equal to `userId` when the member left on their own. */
+      actorUserId: string;
+      organizationId: string;
+      userId: string;
+      role: OrganizationRole;
+    }
+  | {
+      type: "invitation.created";
+      actorUserId: string;
+      organizationId: string;
+      invitationId: string;
+      email: string;
+      role: OrganizationRole;
+    }
+  | {
+      type: "invitation.resent";
+      actorUserId: string;
+      organizationId: string;
+      invitationId: string;
+      email: string;
+    }
+  | {
+      type: "invitation.revoked";
+      actorUserId: string;
+      organizationId: string;
+      invitationId: string;
+      email: string;
+    }
+  | {
+      type: "invitation.declined";
+      userId: string;
+      organizationId: string;
+      invitationId: string;
+      email: string;
+    }
   | {
       type: "api_key.created";
       actorUserId: string;

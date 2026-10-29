@@ -3,6 +3,7 @@ import { check, index, integer, sqliteTable, text, uniqueIndex } from "drizzle-o
 import {
   apiKeyCredentialTypes,
   credentialGrants,
+  invitationResponses,
   operationStates,
   organizationMemberStatuses,
   organizationRoles,
@@ -13,7 +14,8 @@ export interface CfAuthTablesOptions {
    * Prefix applied to every physical table and index name, e.g. `"auth_"`
    * produces `auth_user`, `auth_user_session`, ... Defaults to `""` (unprefixed:
    * `user`, `user_session`, `user_account`, `verification`, `organization`,
-   * `organization_user`, `api_key`, `operation`, `oauth_token`).
+   * `organization_user`, `organization_invitation`, `api_key`, `operation`,
+   * `oauth_token`).
    *
    * If you set this, you must regenerate the reference migration — see the
    * README "Migrations" section.
@@ -168,6 +170,52 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
         sql`${table.role} in ('owner', 'admin', 'member')`,
       ),
       check(`${prefix}organization_user_status_check`, sql`${table.status} in ('active')`),
+    ],
+  );
+
+  // An invitation is not a membership: it names an email address, not a user,
+  // because the person may not have an account yet. Accepting turns it into an
+  // `organization_user` row in the same batch that closes it.
+  const organizationInvitation = sqliteTable(
+    t("organization_invitation"),
+    {
+      id: text("id").primaryKey(),
+      organizationId: text("organization_id")
+        .notNull()
+        .references(() => organization.id, { onDelete: "cascade" }),
+      /** Lowercased; only an account with this address may accept. */
+      email: text("email").notNull(),
+      role: text("role", { enum: organizationRoles }).notNull(),
+      /** SHA-256 of the token in the link. The token itself is never stored. */
+      tokenHash: text("token_hash").notNull(),
+      invitedByUserId: text("invited_by_user_id").references(() => user.id, {
+        onDelete: "set null",
+      }),
+      createdAt: text("created_at").notNull(),
+      expiresAt: text("expires_at").notNull(),
+      /** Null while the invitation is open; `expired` is derived, never written. */
+      response: text("response", { enum: invitationResponses }),
+      respondedAt: text("responded_at"),
+      respondedByUserId: text("responded_by_user_id").references(() => user.id, {
+        onDelete: "set null",
+      }),
+    },
+    (table) => [
+      uniqueIndex(ix("organization_invitation_token_hash_unique")).on(table.tokenHash),
+      // One open invitation per address and organization. Partial, so the
+      // closed ones stay as history without blocking a new invitation.
+      uniqueIndex(ix("organization_invitation_open_unique"))
+        .on(table.organizationId, table.email)
+        .where(sql`${table.response} is null`),
+      index(ix("idx_organization_invitation_email")).on(table.email),
+      check(
+        `${prefix}organization_invitation_role_check`,
+        sql`${table.role} in ('owner', 'admin', 'member')`,
+      ),
+      check(
+        `${prefix}organization_invitation_response_check`,
+        sql`${table.response} is null or ${table.response} in ('accepted', 'declined', 'revoked')`,
+      ),
     ],
   );
 
@@ -370,6 +418,7 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
     verification,
     organization,
     organizationUser,
+    organizationInvitation,
     apiKey,
     operation,
     oauthToken,
@@ -384,7 +433,8 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
  * ```ts
  * import { cfAuthTables } from "@maxceem/cf-auth/schema";
  * export const {
- *   user, session, account, verification, organization, organizationUser, apiKey, operation, oauthToken,
+ *   user, session, account, verification, organization, organizationUser,
+ *   organizationInvitation, apiKey, operation, oauthToken,
  * } = cfAuthTables;
  * export const myAppTable = sqliteTable("my_app", { ... });
  * ```
@@ -412,6 +462,7 @@ export const {
   verification: verificationTable,
   organization: organizationTable,
   organizationUser: organizationUserTable,
+  organizationInvitation: organizationInvitationTable,
   apiKey: apiKeyTable,
   operation: operationTable,
   oauthToken: oauthTokenTable,
