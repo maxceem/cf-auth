@@ -38,6 +38,9 @@ import {
   type OrganizationSummary,
 } from "./types.js";
 
+/** How stale `lastActiveAt` may get before a request writes it again: an hour. */
+export const MEMBER_ACTIVITY_INTERVAL_MS = 60 * 60 * 1000;
+
 const ensureNonEmpty = (value: string | null | undefined, label: string) => {
   const normalized = value?.trim();
 
@@ -359,6 +362,13 @@ export interface CfAuthService {
    * fresh default one, like any member who was removed.
    */
   leaveOrganization(input: { actor: AuthState; organizationId: string }): Promise<OrganizationMembership>;
+  /**
+   * Records that `userId` used `organizationId` at `at`, at most once per
+   * {@link MEMBER_ACTIVITY_INTERVAL_MS}. The auth middleware calls this after
+   * resolving a caller when `memberActivity` is on; it is a trusted boundary
+   * and checks no actor.
+   */
+  recordMemberActivity(input: { organizationId: string; userId: string; at: Date }): Promise<void>;
   /** Renames an organization. Requires an owner or admin and the `manage` grant. */
   renameOrganization(input: {
     actor: AuthState;
@@ -1065,6 +1075,15 @@ export const createAuthService = (
         role: removed.role,
       });
       return removed;
+    },
+
+    async recordMemberActivity(input) {
+      await repository.touchMembershipActivity({
+        organizationId: input.organizationId,
+        userId: input.userId,
+        at: input.at.toISOString(),
+        staleBefore: new Date(input.at.getTime() - MEMBER_ACTIVITY_INTERVAL_MS).toISOString(),
+      });
     },
 
     async renameOrganization(input) {

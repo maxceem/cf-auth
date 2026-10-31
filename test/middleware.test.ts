@@ -179,3 +179,68 @@ describe("provisioning self-heal", () => {
     expect(await harness.cfAuth.repository.countOrganizationOwners(defaultOrgId)).toBe(1);
   });
 });
+
+describe("memberActivity", () => {
+  const waitUntilCollector = () => {
+    const pending: Promise<unknown>[] = [];
+    return {
+      ctx: {
+        waitUntil: (promise: Promise<unknown>) => pending.push(promise),
+        passThroughOnException: () => {},
+        props: {},
+      },
+      settle: () => Promise.all(pending.splice(0)),
+    };
+  };
+
+  const setup = async (memberActivity: boolean) => {
+    const harness = await createTestAuth({ memberActivity });
+    const user = await createUser(harness, `activity-${memberActivity}@example.com`);
+    const [membership] = await harness.cfAuth.repository.listOrganizationsForUser(user.id);
+    const organizationId = membership!.organization.id;
+    const key = await harness.cfAuth.service.createApiKey({
+      organizationId,
+      actor: await harness.actorFor(user.id),
+      name: "Activity",
+    });
+    const app = new Hono<{ Variables: CfAuthVariables }>();
+    app.use("*", harness.cfAuth.middleware());
+    app.get("/either", (c) => c.json(requireOrganization(c.get("authState")).organization));
+    const lastActiveAt = async () =>
+      (await harness.cfAuth.repository.listOrganizationsForUser(user.id)).find(
+        (entry) => entry.organization.id === organizationId,
+      )!.lastActiveAt;
+    const call = async (ctx: ReturnType<typeof waitUntilCollector>["ctx"]) =>
+      app.request(
+        `${testBaseUrl}/either`,
+        { headers: { Authorization: `Bearer ${key.plaintext}` } },
+        {},
+        ctx as unknown as ExecutionContext,
+      );
+    return { lastActiveAt, call };
+  };
+
+  it("stamps the membership after the response, then leaves it alone for an hour", async () => {
+    const { lastActiveAt, call } = await setup(true);
+    const collector = waitUntilCollector();
+    expect(await lastActiveAt()).toBeNull();
+
+    expect((await call(collector.ctx)).status).toBe(200);
+    await collector.settle();
+    const first = await lastActiveAt();
+    expect(first).not.toBeNull();
+
+    expect((await call(collector.ctx)).status).toBe(200);
+    // A fresh stamp queues no write at all.
+    expect(await collector.settle()).toEqual([]);
+    expect(await lastActiveAt()).toBe(first);
+  });
+
+  it("writes nothing when it is off, the default", async () => {
+    const { lastActiveAt, call } = await setup(false);
+    const collector = waitUntilCollector();
+    expect((await call(collector.ctx)).status).toBe(200);
+    expect(await collector.settle()).toEqual([]);
+    expect(await lastActiveAt()).toBeNull();
+  });
+});

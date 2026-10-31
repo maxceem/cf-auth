@@ -322,6 +322,14 @@ export interface CfAuthConfig {
   openAPI?: boolean;
 
   /**
+   * Record when each member last used their organization, as the membership's
+   * `lastActiveAt`. The auth middleware writes it after the response, at most
+   * once an hour per member, for sessions, API keys and OAuth connections
+   * alike. Nothing else is stored. Default: `false`.
+   */
+  memberActivity?: boolean;
+
+  /**
    * Called after auth lifecycle events (signup, org creation, API key
    * create/revoke) so the host app can write its own audit log. Errors thrown
    * here are swallowed and reported to {@link CfAuthConfig.onError}.
@@ -817,6 +825,7 @@ export interface ResolvedCfAuthConfig {
     domain: string | undefined;
   };
   openAPI: boolean;
+  memberActivity: boolean;
   onEvent: ((event: CfAuthEvent) => void | Promise<void>) | undefined;
   onError: (error: unknown, context: { scope: string }) => void;
   logger: BetterAuthOptions["logger"];
@@ -965,6 +974,7 @@ export const resolveConfig = (config: CfAuthConfig): ResolvedCfAuthConfig => {
       domain: config.cookies?.domain,
     },
     openAPI: config.openAPI ?? false,
+    memberActivity: config.memberActivity ?? false,
     onEvent: config.onEvent,
     onError:
       config.onError ??

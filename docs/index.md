@@ -212,6 +212,7 @@ ones worth knowing about.
 | `oauth`                                 | off                 | `{ enabled: true, issuer, tokenPrefix }`. See [OAuth connections](#oauth-connections).    |
 | `organizations.defaultOrganizationName` | `"My Organization"` | A string, or a function of the user.                                                      |
 | `cookies.prefix`                        | from `appName`      | See below.                                                                                |
+| `memberActivity`                        | `false`             | Record when each member last used their organization. See [Last active](#last-active).    |
 | `onEvent`                               | —                   | Called for sign-ups and key changes. See [Audit events](#audit-events).                   |
 | `onError`                               | `console.error`     | Called with a failure cf-auth recovered from, and the scope it happened in.               |
 | `logger`                                | better-auth's       | better-auth's own `logger` options, passed through. Use `log` to choose what is logged.   |
@@ -438,6 +439,24 @@ await service.renameOrganization({ actor: state, organizationId, name: "Acme" })
 
 Someone who leaves, or is removed from, their last organization gets a fresh
 default one on their next request, as a new signup would.
+
+### Last active
+
+Turn on `memberActivity` to know when each member last used their
+organization, for a members list or your own admin view. The middleware then
+stamps the caller's membership with `lastActiveAt` (an ISO string) whenever
+the copy it already read is missing or over an hour old. That covers sessions,
+API keys and OAuth connections alike.
+
+- It costs no extra read: `lastActiveAt` comes with the membership the
+  middleware loads anyway.
+- The write is one row, at most once an hour per member, and runs after the
+  response through `waitUntil`, so no request waits for it.
+- A failed write goes to `onError` and never fails the request.
+- Only the time is stored, nothing about the request.
+
+`lastActiveAt` is on every `OrganizationMembership`, and null until the first
+stamp (or always, with the option off).
 
 ### What each role may do
 

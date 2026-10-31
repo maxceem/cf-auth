@@ -112,6 +112,8 @@ export interface OrganizationMembership {
   role: OrganizationRole;
   status: OrganizationMemberStatus;
   joinedAt: string;
+  /** See `memberActivity` in the config. Null when it is off or not yet recorded. */
+  lastActiveAt: string | null;
 }
 
 export interface OrganizationMember extends AuthUser {

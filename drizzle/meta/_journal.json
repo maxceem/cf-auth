@@ -43,6 +43,13 @@
       "when": 1793245840603,
       "tag": "0005_cf_auth_organization_invitation",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1793413887321,
+      "tag": "0006_cf_auth_member_last_active",
+      "breakpoints": true
     }
   ]
 }
