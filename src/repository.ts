@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq, gt, inArray, isNull, ne, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, inArray, isNull, lt, ne, or, sql, type SQL } from "drizzle-orm";
 import { alias } from "drizzle-orm/sqlite-core";
 import type { CfAuthDatabase } from "./config.js";
 import { deterministicUuid } from "./crypto.js";
@@ -238,6 +238,18 @@ export interface CfAuthRepository {
   }): Promise<OrganizationSummary | null>;
 
   /**
+   * Stamps `lastActiveAt` with `at`, unless it is already at or after
+   * `staleBefore`. The condition is in the statement, so concurrent requests
+   * write the row once rather than once each.
+   */
+  touchMembershipActivity(input: {
+    organizationId: string;
+    userId: string;
+    at: string;
+    staleBefore: string;
+  }): Promise<void>;
+
+  /**
    * Opens an invitation, or reissues an expired one for the same address in
    * place. Null when a live invitation to that address is already open — the
    * partial unique index decides, inside the statement.
@@ -348,6 +360,7 @@ export const authRowColumns = ({ user, organization, organizationUser }: CfAuthT
     role: organizationUser.role,
     status: organizationUser.status,
     joinedAt: organizationUser.joinedAt,
+    lastActiveAt: organizationUser.lastActiveAt,
     organizationId: organization.id,
     organizationName: organization.name,
     organizationCreatedAt: organization.createdAt,
@@ -384,6 +397,7 @@ export const toMembership = (row: {
   role: OrganizationRole;
   status: "active";
   joinedAt: string;
+  lastActiveAt?: string | null;
   organizationId: string;
   organizationName: string;
   organizationCreatedAt: string;
@@ -393,6 +407,7 @@ export const toMembership = (row: {
   role: row.role,
   status: row.status,
   joinedAt: row.joinedAt,
+  lastActiveAt: row.lastActiveAt ?? null,
   organization: {
     claimed: Boolean(row.claimed),
     expiresAt: row.expiresAt,
@@ -678,6 +693,7 @@ export const createCfAuthRepository = (
       role: "owner",
       status: "active",
       joinedAt: now,
+      lastActiveAt: null,
       organization: {
         id: organizationId,
         name: input.name,
@@ -781,7 +797,7 @@ export const createCfAuthRepository = (
       db
         .insert(organizationUser)
         .select(
-          sql`select ${crypto.randomUUID()}, ${input.organizationId}, ${input.userId}, 'owner', 'active', ${nowIso} where ${entry}`,
+          sql`select ${crypto.randomUUID()}, ${input.organizationId}, ${input.userId}, 'owner', 'active', ${nowIso}, null where ${entry}`,
         )
         .onConflictDoNothing({
           target: [organizationUser.organizationId, organizationUser.userId],
@@ -1027,6 +1043,7 @@ export const createCfAuthRepository = (
               role: "owner",
               status: "active",
               joinedAt: inserted[0]?.joinedAt ?? now,
+              lastActiveAt: null,
               organization: {
                 id: organizationId,
                 name: input.name,
@@ -1150,6 +1167,19 @@ export const createCfAuthRepository = (
       }
 
       return { ok: true, membership: existing };
+    },
+
+    async touchMembershipActivity(input) {
+      await db
+        .update(organizationUser)
+        .set({ lastActiveAt: input.at })
+        .where(
+          and(
+            eq(organizationUser.organizationId, input.organizationId),
+            eq(organizationUser.userId, input.userId),
+            or(isNull(organizationUser.lastActiveAt), lt(organizationUser.lastActiveAt, input.staleBefore)),
+          ),
+        );
     },
 
     async updateOrganizationName(input) {
@@ -1335,7 +1365,7 @@ export const createCfAuthRepository = (
         db
           .insert(organizationUser)
           .select(
-            sql`select ${crypto.randomUUID()}, ${input.organizationId}, ${input.userId}, ${organizationInvitation.role}, 'active', ${nowIso} from ${organizationInvitation} where ${organizationInvitation.id} = ${input.invitationId} and ${acceptedNow}`,
+            sql`select ${crypto.randomUUID()}, ${input.organizationId}, ${input.userId}, ${organizationInvitation.role}, 'active', ${nowIso}, null from ${organizationInvitation} where ${organizationInvitation.id} = ${input.invitationId} and ${acceptedNow}`,
           )
           .onConflictDoNothing({
             target: [organizationUser.organizationId, organizationUser.userId],

@@ -4,7 +4,7 @@ import type { CurrentOrganizationCookie } from "./cookies.js";
 import { forbidden, grantInsufficient, sessionRequired, unauthorized, validationError } from "./errors.js";
 import type { CfBetterAuth } from "./better-auth.js";
 import type { CfAuthOAuth } from "./oauth/service.js";
-import type { CfAuthService } from "./service.js";
+import { MEMBER_ACTIVITY_INTERVAL_MS, type CfAuthService } from "./service.js";
 import {
   canManageOrganization,
   createEmptyAuthState,
@@ -62,6 +62,34 @@ const deriveApiKeySource = (value: string | null | undefined): ActionSource => {
 const deriveOAuthSource = (value: string | null | undefined): OAuthActionSource =>
   value?.trim().toLowerCase() === "mcp" ? "mcp" : "api";
 
+/**
+ * Stamps the caller's membership as active, when the copy this request already
+ * read is missing or over an hour old. The write runs after the response
+ * through `waitUntil`, so it never delays the request, and a failure is only
+ * reported: activity is not worth failing a request for.
+ */
+const createActivityRecorder =
+  (config: ResolvedCfAuthConfig, service: CfAuthService) =>
+  (c: Context, state: AuthState): void => {
+    if (!state.authenticated || !state.user || !state.organization) return;
+    const organizationId = state.organization.id;
+    const membership = state.memberships.find((entry) => entry.organization.id === organizationId);
+    if (!membership) return;
+    const now = new Date();
+    const last = membership.lastActiveAt ? Date.parse(membership.lastActiveAt) : Number.NaN;
+    if (Number.isFinite(last) && now.getTime() - last < MEMBER_ACTIVITY_INTERVAL_MS) return;
+
+    const write = service
+      .recordMemberActivity({ organizationId, userId: state.user.id, at: now })
+      .catch((error: unknown) => config.onError(error, { scope: "middleware.memberActivity" }));
+    try {
+      c.executionCtx.waitUntil(write);
+    } catch {
+      // No execution context outside a Worker (tests, other runtimes): the
+      // write still runs, just without being held open past the response.
+    }
+  };
+
 export const createAuthMiddleware = (
   config: ResolvedCfAuthConfig,
   deps: {
@@ -73,6 +101,7 @@ export const createAuthMiddleware = (
   },
 ) => {
   const { auth, service, oauth, currentOrganizationCookie } = deps;
+  const recordActivity = createActivityRecorder(config, service);
 
   return <E extends Env = CfAuthEnv>(options: AuthMiddlewareOptions = {}): MiddlewareHandler<E> => {
     const apiKeysEnabled = options.apiKeys ?? config.apiKeys.enabled;
@@ -90,6 +119,7 @@ export const createAuthMiddleware = (
         // Cast: the middleware is generic over the host app's Env, which we
         // only require to carry an `authState` variable.
         (c as unknown as Context<CfAuthEnv>).set("authState", state);
+        if (config.memberActivity) recordActivity(c, state);
       };
 
       const authorization = c.req.header("Authorization");

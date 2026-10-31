@@ -157,6 +157,13 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
       role: text("role", { enum: organizationRoles }).notNull(),
       status: text("status", { enum: organizationMemberStatuses }).notNull(),
       joinedAt: text("joined_at").notNull(),
+      /**
+       * When this member last used the organization, through any credential:
+       * a session, an API key or an OAuth connection. Written by the auth
+       * middleware at most once an hour, and only when `memberActivity` is on;
+       * null until then.
+       */
+      lastActiveAt: text("last_active_at"),
     },
     (table) => [
       uniqueIndex(ix("organization_user_organization_id_user_id_unique")).on(
