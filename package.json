@@ -57,6 +57,7 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
+    "release": "node scripts/release.mjs",
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "prepare": "pnpm build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
