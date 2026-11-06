@@ -329,6 +329,13 @@ reading the auth state, organizations and roles, API keys, operations approved
 in a browser and reservations, OAuth connections, the organization cookie,
 audit events, and the environment variables.
 
+## Releasing
+
+Run `pnpm release <version>` on an up-to-date `main`. It bumps `package.json`,
+runs `pnpm check`, commits `Release <version>`, and pushes that commit with a
+`v<version>` tag. The tag runs `.github/workflows/release.yml`, which attaches
+the packed tarball to a GitHub release. Add `--dry-run` to see the plan first.
+
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
