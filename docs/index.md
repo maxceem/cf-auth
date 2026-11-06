@@ -1583,9 +1583,10 @@ written.
 this order:
 
 1. the proof, or nothing else runs;
-2. an authorization already completed, by either door, answers its redirect
-   (and its `organizationId`) without calling anything below, so a retry
-   after a lost response is never admitted or counted again;
+2. an authorization already completed through the guest door answers its
+   redirect (and its `organizationId`) without calling anything below, so a
+   retry after a lost response is never admitted or counted again; one the
+   person door completed is `409 already_completed`;
 3. `admit()`: throw to refuse; answer `null`, or an SQL condition the
    completing batch must satisfy (an emptiness rule such as `not exists
    (select 1 from organization)`, say). A refusal never reaches the rate
@@ -1616,19 +1617,24 @@ A guest connection is always `manage`, since it is the account's only way
 in: the record keeps `requestedGrant` beside `grant` so the page can say
 so when the client asked for `read`.
 
-**Both approvals are idempotent**, and either answers the other's result: a
-person's approval racing a guest's, two guest clicks, or a retry after the
-code was exchanged all answer the same redirect, byte for byte, and one
-account. The redirect is `redirect_uri` with `code`, `state` when one was
-sent, and `iss`. How it is rebuilt: the code is 32 random bytes made when
-the authorization opens; the operation's id is `oauth-` and the code's
-SHA-256 (hex), so the exchange finds it by the code's digest; and the
-payload keeps the code sealed with AES-256-GCM under a key derived by
-HKDF-SHA256 from the browser proof, which the database holds only a digest
-of. Whoever presents the proof again reopens it; nothing else can, not even
-with the database and `secret`. The engine's own token for the operation is
-a separate random value nothing keeps, so the code does not lead to the
-proof either.
+**Both approvals are idempotent for whoever approved**: two guest clicks,
+the same person approving twice, or a retry after the code was exchanged all
+answer the same redirect, byte for byte, and one account. Anyone else is
+refused with `409 already_completed` and gets no code: the guest door once a
+person approved, the person door once a guest did, and through the person
+door any other person, or nobody (`403 session_required`). The proof is not
+enough on its own, because whoever opened the authorization holds it too and
+may have sent the consent link to someone else; so of a person and a guest
+racing, the loser is refused. The redirect is `redirect_uri` with `code`,
+`state` when one was sent, and `iss`. How it is rebuilt: the code is 32
+random bytes made when the authorization opens; the operation's id is
+`oauth-` and the code's SHA-256 (hex), so the exchange finds it by the
+code's digest; and the payload keeps the code sealed with AES-256-GCM under
+a key derived by HKDF-SHA256 from the browser proof, which the database
+holds only a digest of. Only the proof reopens it, not even the database
+and `secret` together. The engine's own token for the operation is a
+separate random value nothing keeps, so the code does not lead to the proof
+either.
 
 **`denyAuthorization`** denies it and answers the `access_denied` redirect,
 with `state` and `iss`; a repeat answers the same. Approving a denied

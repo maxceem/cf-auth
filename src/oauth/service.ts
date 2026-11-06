@@ -158,14 +158,16 @@ export interface CfAuthOAuth {
   }): Promise<OAuthAuthorizationDetails>;
   /**
    * The signed-in person allows the client into one of their accounts, with
-   * the grant they chose. Idempotent: a completed authorization answers its
-   * redirect again, whichever door completed it.
+   * the grant they chose. Idempotent for the same person: a completed
+   * authorization answers its redirect again only if this person approved
+   * it, and `409 already_completed` to anyone else.
    */
   approveAuthorization(input: ApproveAuthorizationInput): Promise<{ redirect: string }>;
   /**
-   * "Continue without an account": proof, then an already completed
-   * authorization's redirect, then `admit`, then `rateLimit`, then
-   * `provision` inside the batch that completes it.
+   * "Continue without an account": proof, then the redirect of an
+   * authorization this door already completed (`409 already_completed` if
+   * the person door did), then `admit`, then `rateLimit`, then `provision`
+   * inside the batch that completes it.
    */
   approveGuestAuthorization(input: ApproveGuestAuthorizationInput): Promise<{ redirect: string; organizationId: string }>;
   /** The person declines: the `access_denied` redirect. */
