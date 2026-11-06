@@ -14,11 +14,14 @@
  * finds the operation by the code's digest through the primary key and never
  * stores or compares the code itself. The payload keeps the code sealed
  * (AES-256-GCM) under a key derived from the browser proof, which the
- * database holds only a digest of: whoever presents the proof again — a
- * retried approval, either door — reopens it and rebuilds the same redirect,
- * byte for byte, and nobody else can. The engine's own token for the
- * operation is a separate random value that nothing keeps, so the code does
- * not lead to the proof.
+ * database holds only a digest of: a retried approval presents the proof
+ * again, reopens it and rebuilds the same redirect, byte for byte, and nobody
+ * without the proof can. The proof is not proof of being the approver,
+ * though: whoever opened the authorization holds it too, and may have handed
+ * the consent link to someone else. So a completed authorization answers its
+ * code only to the door that completed it, and through the person door only
+ * to the same person. The engine's own token for the operation is a separate
+ * random value that nothing keeps, so the code does not lead to the proof.
  *
  * Nothing here is an HTTP route. Each function answers a plain value: a
  * consent reference, a redirect, an error page, or a token response.
@@ -29,6 +32,7 @@ import { credentialAuthoritySql, sqliteNowMs } from "../authority.js";
 import type { CfAuthDatabase, ResolvedCfAuthConfig, ResolvedOAuthConfig } from "../config.js";
 import { openTextForToken, randomToken, sealTextForToken, sha256Hex, timingSafeEqual } from "../crypto.js";
 import {
+  alreadyCompleted,
   CfAuthError,
   notAMember,
   operationDenied,
@@ -580,9 +584,32 @@ export const createOAuthAuthorization = (deps: {
     ]);
 
   /**
+   * The redirect for whoever completed the authorization, and nobody else:
+   * the guest door again, or the same person through the person door. The
+   * proof alone does not do, since whoever opened the authorization holds it
+   * too and must not read a code that someone else approved.
+   */
+  const approverRedirect = async (
+    id: string,
+    proof: string,
+    payload: OAuthAuthorizationPayload,
+    record: OAuthAuthorizationRecord | null | undefined,
+    approver: { door: "person"; userId: string } | { door: "guest" },
+  ) => {
+    if (
+      !record ||
+      record.door !== approver.door ||
+      (approver.door === "person" && record.userId !== approver.userId)
+    ) {
+      throw alreadyCompleted("This authorization was already approved");
+    }
+    return codeRedirect(id, proof, payload);
+  };
+
+  /**
    * Runs the engine's approval with `approval`. One already completed — by
    * either door, before this call or racing it — is not an error here: the
-   * caller answers its canonical redirect.
+   * caller reads the record and answers its redirect if it is the approver's.
    */
   const approveThroughEngine = async (id: string, proof: string, approval: AuthorizationApproval) => {
     try {
@@ -779,11 +806,14 @@ export const createOAuthAuthorization = (deps: {
     },
 
     async approveAuthorization(input: ApproveAuthorizationInput): Promise<{ redirect: string }> {
-      const { state, payload } = await loadForBrowser(input.id, input.proof);
-      if (state === "completed") return { redirect: await codeRedirect(input.id, input.proof, payload) };
+      const { state, payload, record } = await loadForBrowser(input.id, input.proof);
+      const { userId, sessionId } = requireInteractiveSession(input.actor ?? createEmptyAuthState());
+      const approver = { door: "person", userId } as const;
+      if (state === "completed") {
+        return { redirect: await approverRedirect(input.id, input.proof, payload, record, approver) };
+      }
       assertPending(state);
 
-      const { userId, sessionId } = requireInteractiveSession(input.actor ?? createEmptyAuthState());
       if (!isCredentialGrant(input.grant)) throw validationError('grant must be "read" or "manage"');
       if (typeof input.organizationId !== "string" || !input.organizationId) {
         throw validationError("organizationId is required");
@@ -801,7 +831,8 @@ export const createOAuthAuthorization = (deps: {
         organizationId: input.organizationId,
         grant: input.grant,
       });
-      return { redirect: await codeRedirect(input.id, input.proof, payload) };
+      const completed = await readAuthorization(input.id);
+      return { redirect: await approverRedirect(input.id, input.proof, payload, completed?.record, approver) };
     },
 
     async approveGuestAuthorization(
@@ -809,10 +840,13 @@ export const createOAuthAuthorization = (deps: {
     ): Promise<{ redirect: string; organizationId: string }> {
       // 1. The proof.
       const { state, payload, record } = await loadForBrowser(input.id, input.proof);
-      // 2. Already completed, by either door: its redirect, never re-admitted or counted.
+      // 2. Already completed: its redirect if this door completed it, never re-admitted or counted.
       if (state === "completed") {
         if (!record) throw operationExpired("This authorization's record can no longer be read");
-        return { redirect: await codeRedirect(input.id, input.proof, payload), organizationId: record.organizationId };
+        return {
+          redirect: await approverRedirect(input.id, input.proof, payload, record, { door: "guest" }),
+          organizationId: record.organizationId,
+        };
       }
       assertPending(state);
       if (
@@ -838,7 +872,7 @@ export const createOAuthAuthorization = (deps: {
       const completed = await readAuthorization(input.id);
       if (!completed?.record) throw operationNotFound();
       return {
-        redirect: await codeRedirect(input.id, input.proof, payload),
+        redirect: await approverRedirect(input.id, input.proof, payload, completed.record, { door: "guest" }),
         organizationId: completed.record.organizationId,
       };
     },

@@ -653,6 +653,23 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         await expectCode(approveAs({ id: flow.id, proof: "f".repeat(64) }, person), "invalid_proof");
       });
 
+      it("answers the code to nobody but the person who approved, whoever else holds the proof", async () => {
+        // Whoever opens an authorization holds its proof, and can hand the consent link to someone else.
+        const victim = await h.human();
+        const opener = await h.human();
+        const flow = await start();
+        const { redirect } = await approveAs(flow, victim);
+        await expectCode(guest(flow), "already_completed");
+        await expectCode(approveAs(flow, opener), "already_completed");
+        await expectCode(
+          h.cfAuth.oauth.approveAuthorization({ ...flow, actor: null, organizationId: victim.organizationId, grant: "manage" }),
+          "session_required",
+        );
+        // The person who approved still gets it back, and the refusals wrote nothing.
+        expect((await approveAs(flow, victim)).redirect).toBe(redirect);
+        expect(await recordOf(flow.id)).toMatchObject({ door: "person", userId: victim.userId, organizationId: victim.organizationId });
+      });
+
       it("denies with an access_denied redirect, idempotently, and refuses approval afterwards", async () => {
         const person = await h.human();
         const flow = await start();
@@ -759,18 +776,19 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         expect(await accounts(flow.id)).toHaveLength(1);
       });
 
-      it("answers a person and a guest racing with the winner's redirect", async () => {
+      it("answers a person and a guest racing with the winner's redirect, and refuses the other", async () => {
         const person = await h.human();
         const flow = await start();
-        const [byPerson, byGuest] = await Promise.all([approveAs(flow, person), guest(flow)]);
-        expect(byPerson.redirect).toBe(byGuest.redirect);
+        const [byPerson, byGuest] = await Promise.allSettled([approveAs(flow, person), guest(flow)]);
         const record = await recordOf(flow.id);
-        expect(byGuest.organizationId).toBe(record.organizationId);
+        const [won, lost] = record.door === "person" ? [byPerson, byGuest] : [byGuest, byPerson];
+        expect(won.status).toBe("fulfilled");
+        expect(lost).toMatchObject({ status: "rejected", reason: { code: "already_completed" } });
         expect(await accounts(flow.id)).toHaveLength(record.door === "guest" ? 1 : 0);
-        // And a person approving after a guest won answers the guest's redirect.
+        // And a person approving after a guest won is refused, without the guest's code.
         const later = await start();
-        const won = await guest(later);
-        expect((await approveAs(later, person)).redirect).toBe(won.redirect);
+        await guest(later);
+        await expectCode(approveAs(later, person), "already_completed");
         expect((await recordOf(later.id)).door).toBe("guest");
       });
     });
@@ -865,7 +883,7 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
           const person = await e.human();
           const actor = await e.actorFor(person.userId, person.organizationId);
           // The person's own organization now exists, so the admission refuses the guest: the
-          // person wins, and the guest answers the person's redirect or is refused.
+          // person wins, and the guest is refused without the person's code.
           const [byPerson, byGuest] = await Promise.allSettled([
             e.cfAuth.oauth.approveAuthorization({
               id: flow.id,
@@ -877,16 +895,15 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
             guestOn(e, flow),
           ]);
           expect(byPerson.status).toBe("fulfilled");
-          const redirect = (byPerson as PromiseFulfilledResult<{ redirect: string }>).value.redirect;
-          if (byGuest.status === "fulfilled") expect(byGuest.value.redirect).toBe(redirect);
-          else expect(byGuest.reason).toMatchObject({ code: "conflict" });
+          expect(byGuest.status).toBe("rejected");
+          expect(["already_completed", "conflict"]).toContain((byGuest as PromiseRejectedResult).reason.code);
           const record = JSON.parse(
             String((await e.exec("SELECT outcome FROM operation WHERE id = ?", flow.id))[0]!.outcome),
           ) as OAuthAuthorizationRecord;
           expect(record).toMatchObject({ door: "person", organizationId: person.organizationId });
           expect(await e.exec("SELECT id FROM organization WHERE id = ?", `acct-${flow.id}`)).toHaveLength(0);
-          // A repeat of the guest door now answers the person's redirect without admitting.
-          expect((await guestOn(e, flow)).redirect).toBe(redirect);
+          // A repeat of the guest door is refused too, without admitting.
+          await expectCode(guestOn(e, flow), "already_completed");
         });
       });
     });
