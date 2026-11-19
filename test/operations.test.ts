@@ -9,10 +9,12 @@ import {
   operationSweepStatementCount,
   type OperationKind,
 } from "../src/operations.js";
+import { createLoginKind, loginKind } from "./fixtures/login-kind.js";
 import { createTestAuth, testSecret, type TestAuth, type TestOverrides } from "./helpers.js";
 
+/** Operations on, with the test `login` kind registered before any kinds the test adds. */
 const enabled = (overrides: TestOverrides["operations"] = {}): TestOverrides => ({
-  operations: { enabled: true, realm: "test-deployment", ...overrides },
+  operations: { enabled: true, realm: "test-deployment", ...overrides, kinds: [loginKind, ...(overrides?.kinds ?? [])] },
 });
 
 const expectCode = async (promise: Promise<unknown>, code: string) => {
@@ -20,10 +22,7 @@ const expectCode = async (promise: Promise<unknown>, code: string) => {
 };
 
 /** Opens a `login` the way a CLI would, and returns what the CLI would hold. */
-const openLogin = async (
-  harness: TestAuth,
-  client: { loopbackRedirect?: string; ip?: string; rateLimitKey?: string } = {},
-) => {
+const openLogin = async (harness: TestAuth, client: { ip?: string; rateLimitKey?: string } = {}) => {
   const token = createOperationToken();
   const view = await harness.cfAuth.operations.open({
     kind: "login",
@@ -32,13 +31,12 @@ const openLogin = async (
     client: {
       label: "CLI on mac-studio",
       meta: { os: "darwin", ...(client.ip ? { ip: client.ip } : {}), userAgent: "agw/1.0" },
-      ...(client.loopbackRedirect ? { loopbackRedirect: client.loopbackRedirect } : {}),
     },
   });
   return { token, view };
 };
 
-describe("login operation", () => {
+describe("a login-shaped operation", () => {
   it("opens, is approved in a browser, and hands the key to the CLI exactly once", async () => {
     const harness = await createTestAuth(enabled());
     const { operations } = harness.cfAuth;
@@ -66,7 +64,6 @@ describe("login operation", () => {
       payload: { grant: "manage" },
       client: { label: "CLI on mac-studio", meta: { os: "darwin", userAgent: "agw/1.0" } },
       organization: null,
-      hasLoopbackRedirect: false,
       blockedBy: null,
     });
     expect(details.viewer?.user.id).toBe(human.userId);
@@ -87,8 +84,6 @@ describe("login operation", () => {
       kind: "login",
       state: "completed",
       organizationId: human.organizationId,
-      redeemCode: null,
-      redirectUrl: null,
     });
 
     const completed = await operations.poll({ id: view.id, token });
@@ -131,13 +126,6 @@ describe("login operation", () => {
         enabled: true,
       }),
     ]);
-    expect(harness.events).toContainEqual({
-      type: "api_key.created",
-      actorUserId: human.userId,
-      organizationId: human.organizationId,
-      apiKeyId: outcome.apiKeyId,
-      name: "CLI on mac-studio",
-    });
 
     // Handed over once: the next poll reports completion and the record only.
     const again = await operations.poll({ id: view.id, token });
@@ -152,81 +140,6 @@ describe("login operation", () => {
     expect(JSON.stringify(row)).not.toContain(token);
   });
 
-  it("with a loopback redirect, releases the key only to redeem", async () => {
-    const harness = await createTestAuth(enabled());
-    const { operations } = harness.cfAuth;
-    const human = await harness.sessions.human();
-    const actor = await harness.actorFor(human.userId);
-
-    const { token, view } = await openLogin(harness, {
-      loopbackRedirect: "http://127.0.0.1:53682/callback",
-    });
-    const details = await operations.details({ id: view.id, proof: view.browserProof!, viewer: actor });
-    expect(details.hasLoopbackRedirect).toBe(true);
-
-    const approval = await operations.approve({
-      id: view.id,
-      proof: view.browserProof!,
-      actor,
-      organizationId: human.organizationId,
-    });
-    expect(approval.redeemCode).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    const redirect = new URL(approval.redirectUrl!);
-    expect(`${redirect.origin}${redirect.pathname}`).toBe("http://127.0.0.1:53682/callback");
-    expect(redirect.searchParams.get("code")).toBe(approval.redeemCode);
-
-    // Polling reports completion but never hands over the key.
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const polled = await operations.poll({ id: view.id, token });
-      expect(polled).toMatchObject({ state: "completed", collect: "redeem" });
-      expect(polled).not.toHaveProperty("outcome");
-    }
-
-    await expectCode(
-      operations.redeem({ id: view.id, token, redeemCode: createOperationToken() }),
-      "invalid_proof",
-    );
-    // The redeem code alone is not enough: the token must match too.
-    await expectCode(
-      operations.redeem({ id: view.id, token: createOperationToken(), redeemCode: approval.redeemCode! }),
-      "operation_not_found",
-    );
-
-    const redeemed = await operations.redeem({ id: view.id, token, redeemCode: approval.redeemCode! });
-    expect(redeemed).toMatchObject({ id: view.id, kind: "login", organizationId: human.organizationId });
-    expect((redeemed.outcome as { credential: { token: string } }).credential.token).toMatch(/^key_/);
-
-    await expectCode(
-      operations.redeem({ id: view.id, token, redeemCode: approval.redeemCode! }),
-      "already_completed",
-    );
-    expect(await operations.poll({ id: view.id, token })).toMatchObject({ collect: null });
-  });
-
-  it("refuses to redeem before approval", async () => {
-    const harness = await createTestAuth(enabled());
-    const { token, view } = await openLogin(harness, {
-      loopbackRedirect: "http://[::1]:4000/cb",
-    });
-    await expectCode(
-      harness.cfAuth.operations.redeem({ id: view.id, token, redeemCode: createOperationToken() }),
-      "operation_pending",
-    );
-  });
-
-  it("accepts only a loopback IP literal with a port as the redirect", async () => {
-    const harness = await createTestAuth(enabled());
-    for (const loopbackRedirect of [
-      "http://localhost:5000/callback",
-      "https://127.0.0.1:5000/callback",
-      "http://127.0.0.1/callback",
-      "http://example.com:5000/callback",
-      "http://127.0.0.1:5000/callback?next=/evil",
-    ]) {
-      await expectCode(openLogin(harness, { loopbackRedirect }), "validation_error");
-    }
-  });
-
   it("requires a client label", async () => {
     const harness = await createTestAuth(enabled());
     await expectCode(
@@ -235,7 +148,7 @@ describe("login operation", () => {
     );
   });
 
-  it("can be denied, after which it cannot be approved or redeemed", async () => {
+  it("can be denied, after which it cannot be approved", async () => {
     const harness = await createTestAuth(enabled());
     const { operations } = harness.cfAuth;
     const human = await harness.sessions.human();
@@ -257,10 +170,6 @@ describe("login operation", () => {
     });
     await expectCode(
       operations.approve({ id: view.id, proof: view.browserProof!, actor, organizationId: human.organizationId }),
-      "operation_denied",
-    );
-    await expectCode(
-      operations.redeem({ id: view.id, token, redeemCode: createOperationToken() }),
       "operation_denied",
     );
     const row = (
@@ -524,10 +433,10 @@ describe("login operation", () => {
     expect(await harness.cfAuth.repository.listApiKeys(owner.organizationId)).toEqual([]);
   });
 
-  it("needs an admin to approve a login unless configured down to member", async () => {
+  it("needs the kind's approver role, admin unless the kind says member", async () => {
     for (const [overrides, allowed] of [
       [enabled(), false],
-      [enabled({ login: { minRole: "member" } }), true],
+      [{ operations: { enabled: true, realm: "test-deployment", kinds: [createLoginKind({ minRole: "member" })] } }, true],
     ] as const) {
       const harness = await createTestAuth(overrides);
       const { operations } = harness.cfAuth;
@@ -556,35 +465,6 @@ describe("login operation", () => {
     }
   });
 
-  it("holds the built-in login to the same kind rules", async () => {
-    await expect(
-      createTestAuth(enabled({ login: { pendingTtlMs: 2 * 86_400_000, recordTtlMs: 86_400_000 } })),
-    ).rejects.toMatchObject({ code: "validation_error" });
-  });
-
-  it("switches a loopback operation to polling when its sealed outcome is amended", async () => {
-    const harness = await createTestAuth(enabled());
-    const { operations } = harness.cfAuth;
-    const human = await harness.sessions.human();
-    const actor = await harness.actorFor(human.userId);
-    const { token, view } = await openLogin(harness, { loopbackRedirect: "http://127.0.0.1:5000/cb" });
-    const approval = await operations.approve({
-      id: view.id,
-      proof: view.browserProof!,
-      actor,
-      organizationId: human.organizationId,
-    });
-    await operations.redeem({ id: view.id, token, redeemCode: approval.redeemCode! });
-
-    expect(await operations.amend({ id: view.id, outcome: { renewed: true }, seal: true })).toBe(true);
-    const polled = await operations.poll({ id: view.id, token });
-    expect(polled.outcome).toEqual({ renewed: true });
-    await expectCode(
-      operations.redeem({ id: view.id, token, redeemCode: approval.redeemCode! }),
-      "already_completed",
-    );
-  });
-
   it("withdraws a login key revoked before it was collected", async () => {
     const harness = await createTestAuth(enabled());
     const { operations, service } = harness.cfAuth;
@@ -609,19 +489,6 @@ describe("login operation", () => {
     await expectCode(operations.poll({ id: polled.view.id, token: polled.token }), "operation_expired");
     // Withdrawn for good, not just this once.
     expect(await operations.poll({ id: polled.view.id, token: polled.token })).toMatchObject({ collect: null });
-
-    const redeemed = await openLogin(harness, { loopbackRedirect: "http://127.0.0.1:5000/cb" });
-    const approval = await operations.approve({
-      id: redeemed.view.id,
-      proof: redeemed.view.browserProof!,
-      actor,
-      organizationId: human.organizationId,
-    });
-    await revokeAll();
-    await expectCode(
-      operations.redeem({ id: redeemed.view.id, token: redeemed.token, redeemCode: approval.redeemCode! }),
-      "operation_expired",
-    );
   });
 
   it("reports an unreadable sealed outcome as expired without erasing it", async () => {
@@ -631,14 +498,13 @@ describe("login operation", () => {
       secret: "a-rotated-secret-not-a-real-credential-9876",
       db: harness.db,
       apiKeys: { enabled: true },
-      operations: { enabled: true, realm: "test-deployment" },
+      operations: { enabled: true, realm: "test-deployment", kinds: [loginKind] },
       onError: () => {},
     });
     const human = await harness.sessions.human();
     const actor = await harness.actorFor(human.userId);
 
     const polling = await openLogin(harness);
-    const looping = await openLogin(harness, { loopbackRedirect: "http://127.0.0.1:5000/cb" });
     // The page still loads after a rotation; it just cannot echo the code.
     const details = await rotated.operations.details({ id: polling.view.id, proof: polling.view.browserProof! });
     expect(details.userCode).toBeNull();
@@ -649,30 +515,13 @@ describe("login operation", () => {
       actor,
       organizationId: human.organizationId,
     });
-    const approval = await harness.cfAuth.operations.approve({
-      id: looping.view.id,
-      proof: looping.view.browserProof!,
-      actor,
-      organizationId: human.organizationId,
-    });
 
     await expectCode(
       rotated.operations.poll({ id: polling.view.id, token: polling.token }),
       "operation_expired",
     );
-    await expectCode(
-      rotated.operations.redeem({ id: looping.view.id, token: looping.token, redeemCode: approval.redeemCode! }),
-      "operation_expired",
-    );
-    // Nothing was spent: the original secret still collects both.
+    // Nothing was spent: the original secret still collects it.
     expect((await harness.cfAuth.operations.poll({ id: polling.view.id, token: polling.token })).outcome).toBeTruthy();
-    expect(
-      (await harness.cfAuth.operations.redeem({
-        id: looping.view.id,
-        token: looping.token,
-        redeemCode: approval.redeemCode!,
-      })).outcome,
-    ).toBeTruthy();
   });
 
   it("refuses an API key or an anonymous state as the approver", async () => {
@@ -712,22 +561,6 @@ describe("login operation", () => {
     );
     expect((await operations.poll({ id: view.id, token })).state).toBe("pending");
     expect(await harness.cfAuth.repository.listApiKeys(human.organizationId)).toEqual([]);
-  });
-
-  it("needs apiKeys, and can be turned off", async () => {
-    await expect(
-      createTestAuth({ apiKeys: { enabled: false }, operations: { enabled: true } }),
-    ).rejects.toMatchObject({ code: "validation_error" });
-
-    const harness = await createTestAuth({
-      apiKeys: { enabled: false },
-      operations: { enabled: true, login: false },
-    });
-    expect([...harness.cfAuth.operations.kinds.keys()]).toEqual([]);
-    await expectCode(
-      harness.cfAuth.operations.open({ kind: "login", token: createOperationToken() }),
-      "validation_error",
-    );
   });
 
   it("refuses every call while operations are disabled", async () => {
@@ -859,7 +692,7 @@ describe("app-defined operation kinds", () => {
       proof: opened.browserProof!,
       viewer: actor,
     });
-    expect(details.organization).toMatchObject({ id: human.organizationId, claimed: true, expiresAt: null });
+    expect(details.organization).toMatchObject({ id: human.organizationId });
     expect(details.userCode).toBeNull();
   });
 
@@ -1191,20 +1024,14 @@ describe("app-defined operation kinds", () => {
     const key = await service.createApiKey({ organizationId: owner.organizationId, actor: ownerActor, name: "CLI" });
     const opener = await service.resolveApiKeyAuthState(key.plaintext, "cli");
 
-    const openApproved = async (kind: string, loopbackRedirect?: string) => {
+    const openApproved = async (kind: string) => {
       const token = createOperationToken();
-      const opened = await operations.open({
-        kind,
-        token,
-        opener,
-        ...(loopbackRedirect ? { client: { loopbackRedirect } } : {}),
-      });
-      const approval = await operations.approve({ id: opened.id, proof: opened.browserProof!, actor: ownerActor });
-      return { token, id: opened.id, redeemCode: approval.redeemCode };
+      const opened = await operations.open({ kind, token, opener });
+      await operations.approve({ id: opened.id, proof: opened.browserProof!, actor: ownerActor });
+      return { token, id: opened.id };
     };
     const once = await openApproved("grant.sealed");
     const window = await openApproved("grant.window");
-    const loop = await openApproved("grant.sealed", "http://127.0.0.1:5000/cb");
 
     await service.revokeApiKey({ organizationId: owner.organizationId, actor: ownerActor, apiKeyId: key.id });
 
@@ -1213,10 +1040,6 @@ describe("app-defined operation kinds", () => {
       expect(polled).toMatchObject({ state: "completed", collect: null });
       expect(polled).not.toHaveProperty("outcome");
     }
-    await expectCode(
-      operations.redeem({ id: loop.id, token: loop.token, redeemCode: loop.redeemCode! }),
-      "operation_expired",
-    );
   });
 
   it("answers a proof kind only with its proof, and judges the viewer alike in details and approve", async () => {
@@ -1289,45 +1112,46 @@ describe("app-defined operation kinds", () => {
     await operations.open({ kind: "write", token: createOperationToken(), opener });
   });
 
-  it("lets only one of a racing claim approval and denial land", async () => {
-    let cfAuth!: TestAuth["cfAuth"];
+  it("lets only one of a racing approval and denial land", async () => {
     let beforeBatch: (() => Promise<void>) | undefined;
-    const claim = defineOperationKind({
-      name: "claim",
+    // Approving makes the approver an owner, in the batch that completes it.
+    const handOver = defineOperationKind({
+      name: "hand.over",
       open: { minRole: "owner" },
       browser: true,
       approverMinRole: null,
-      approve: async ({ actor, organizationId, operation, guard }) => {
+      approve: async ({ user, organizationId, operation, guard, db, tables, now }) => {
         await beforeBatch?.();
+        const joinedAt = new Date(now).toISOString();
         return {
-          outcome: { claimed: organizationId },
-          ...cfAuth.service.claimOrganizationStatements({
-            actor: actor!,
-            organizationId: organizationId!,
-            provisioning: {
-              userId: operation.openerUserId!,
-              credentialId: operation.openerCredentialId!,
-              revokeAccess: false,
-            },
-            condition: guard,
-          }),
+          outcome: { handedOver: organizationId },
+          statements: [
+            guardedInsert(
+              db,
+              tables.organizationUser,
+              {
+                id: `member-${operation.id}`,
+                organizationId: organizationId!,
+                userId: user!.id,
+                role: "owner",
+                status: "active",
+                joinedAt,
+              },
+              guard,
+            ),
+          ],
         };
       },
     });
-    const harness = await createTestAuth(enabled({ kinds: [claim] }));
-    cfAuth = harness.cfAuth;
-    const { operations, service } = cfAuth;
+    const harness = await createTestAuth(enabled({ kinds: [handOver] }));
+    const { operations, service } = harness.cfAuth;
 
     const unclaimed = async () => {
       const identity = await service.createServiceIdentity({ name: "CLI service" });
-      const { organization } = await service.createOrganization(identity.id, "Unclaimed");
-      await harness.client.execute({
-        sql: "UPDATE organization SET expires_at = ? WHERE id = ?",
-        args: [new Date(Date.now() + 86_400_000).toISOString(), organization.id],
-      });
+      const { organization } = await service.createOrganization(identity.id, "Handed over");
       const key = await service.issueServiceApiKey({ userId: identity.id, organizationId: organization.id, name: "boot" });
       const opener = await service.resolveApiKeyAuthState(key.plaintext, "cli");
-      const opened = await operations.open({ kind: "claim", token: createOperationToken(), opener });
+      const opened = await operations.open({ kind: "hand.over", token: createOperationToken(), opener });
       return { organizationId: organization.id, opened };
     };
     const owners = async (organizationId: string) =>
@@ -1351,9 +1175,8 @@ describe("app-defined operation kinds", () => {
       "operation_denied",
     );
     expect(await owners(first.organizationId)).toEqual(["service"]);
-    expect((await cfAuth.repository.findOrganization(first.organizationId))?.expiresAt).not.toBeNull();
 
-    // The approval commits first: the claim lands, and the denial changes nothing.
+    // The approval commits first: its write lands, and the denial changes nothing.
     beforeBatch = undefined;
     const second = await unclaimed();
     await operations.approve({ id: second.opened.id, proof: second.opened.browserProof!, actor });
@@ -1362,12 +1185,6 @@ describe("app-defined operation kinds", () => {
       "already_completed",
     );
     expect((await owners(second.organizationId)).sort()).toEqual(["human", "service"]);
-    expect((await cfAuth.repository.findOrganization(second.organizationId))?.expiresAt).toBeNull();
-    expect(harness.events).toContainEqual({
-      type: "organization.claimed",
-      userId: claimer.userId,
-      organizationId: second.organizationId,
-    });
   });
 
   it("rejects conflicting or malformed kind declarations", async () => {
@@ -1682,7 +1499,7 @@ describe("operation grants", () => {
 
   it("withholds a sealed manage outcome from a downgraded key, even once its kind is gone", async () => {
     const harness = await createTestAuth(enabled({ kinds }));
-    const { opener, actor, key } = await keyState(harness, "manage");
+    const { opener, key } = await keyState(harness, "manage");
     const withoutKinds = createCfAuth({
       appName: "Test App",
       secret: testSecret,
@@ -1701,20 +1518,6 @@ describe("operation grants", () => {
       seal: true,
     });
 
-    // Collected by redeem: a browser kind with a loopback redirect.
-    const redeemToken = createOperationToken();
-    const redeemed = await harness.cfAuth.operations.open({
-      kind: "change",
-      token: redeemToken,
-      opener,
-      client: { loopbackRedirect: "http://127.0.0.1:5000/cb" },
-    });
-    const approval = await harness.cfAuth.operations.approve({
-      id: redeemed.id,
-      proof: redeemed.browserProof!,
-      actor,
-    });
-
     await harness.client.execute({
       sql: `UPDATE api_key SET "grant" = 'read' WHERE id = ?`,
       args: [key.id],
@@ -1723,10 +1526,6 @@ describe("operation grants", () => {
     for (const operations of [harness.cfAuth.operations, withoutKinds]) {
       const answer = await operations.poll({ id: polled.id, token: pollToken });
       expect(answer).not.toHaveProperty("outcome");
-      await expectCode(
-        operations.redeem({ id: redeemed.id, token: redeemToken, redeemCode: approval.redeemCode! }),
-        "operation_expired",
-      );
     }
     // Withheld, not spent: it is still sealed, waiting for a key that may have it.
     const sealed = (
@@ -1735,7 +1534,7 @@ describe("operation grants", () => {
         args: [],
       })
     ).rows.map((row) => row.id);
-    expect(sealed.sort()).toEqual([polled.id, redeemed.id].sort());
+    expect(sealed).toEqual([polled.id]);
   });
 
   it("rejects a grant on a public kind, and one that is not a grant", async () => {

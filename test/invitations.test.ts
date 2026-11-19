@@ -357,21 +357,6 @@ describe("organization invitations", () => {
     );
   });
 
-  it("will not accept into an organization past its deadline", async () => {
-    const harness = await createTestAuth();
-    const { ownerId, organizationId } = await ownerWithOrganization(harness);
-    const invitee = await harness.sessions.human({ email: "invitee@example.com" });
-    const { token } = await invite(harness, { actorId: ownerId, organizationId, email: "invitee@example.com" });
-    await harness.client.execute({
-      sql: "update organization set expires_at = ? where id = ?",
-      args: [new Date(Date.now() - 1000).toISOString(), organizationId],
-    });
-
-    await expect(
-      harness.cfAuth.service.acceptInvitation({ actor: await harness.actorFor(invitee.userId), token }),
-    ).rejects.toMatchObject({ code: "organization_expired" });
-  });
-
   it("accepts once when the same person accepts concurrently", async () => {
     const harness = await createTestAuth();
     const { ownerId, organizationId } = await ownerWithOrganization(harness);

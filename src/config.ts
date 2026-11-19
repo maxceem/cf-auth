@@ -12,7 +12,6 @@ import {
   organizationRoles,
   type AuthUser,
   type CfAuthEvent,
-  type OrganizationRole,
 } from "./types.js";
 
 /**
@@ -105,20 +104,6 @@ export interface ApiKeysConfig {
   clientHeader?: string;
 }
 
-/** The built-in `login` operation: a CLI asks, a person approves, the CLI gets an API key. */
-export interface LoginOperationConfig {
-  /**
-   * The least role the approver must hold in the organization they log the
-   * CLI in to. Default: `"admin"`, matching who may create an API key in the
-   * console; lower it to `"member"` to let every member log a CLI in.
-   */
-  minRole?: OrganizationRole;
-  /** How long the person has to approve. Default: 15 minutes. */
-  pendingTtlMs?: number;
-  /** How long the record is kept, counted from when the CLI asked. Default: 90 days. */
-  recordTtlMs?: number;
-}
-
 export interface OperationsConfig {
   /** Turn on browser-approved operations and the `operations` service. Default: `false`. */
   enabled?: boolean;
@@ -129,10 +114,8 @@ export interface OperationsConfig {
    * proofs of operations still pending. Default: `appName`.
    */
   realm?: string;
-  /** Your own operation kinds. Names must be unique; `login` is taken while the built-in one is on. */
+  /** Your own operation kinds. Names must be unique. */
   kinds?: readonly OperationKind[];
-  /** The built-in `login` kind. Needs `apiKeys.enabled`. Default: on; pass `false` to leave it out. */
-  login?: boolean | LoginOperationConfig;
   limits?: {
     /** Pending operations one organization may have at once. Default: `10`. */
     pendingPerOrganization?: number;
@@ -159,6 +142,39 @@ export interface OAuthClientConfig {
    * presentation), or a private-use scheme in reverse-DNS form.
    */
   redirectUris: string[];
+  /**
+   * Whether the client may use the device flow (RFC 8628). Needs
+   * `oauth.deviceFlow`. Default: `false`.
+   */
+  deviceFlow?: boolean;
+}
+
+/**
+ * The command-line tool as a built-in public client (RFC 8252): signing in
+ * with a browser on the same machine sends the code back to a loopback port,
+ * any port, at `redirectPath`; without one, it uses the device flow when
+ * `oauth.deviceFlow` is on.
+ */
+export interface OAuthCliClientConfig {
+  clientId: string;
+  /** Shown on the consent page and copied onto the connection. */
+  name: string;
+  /** The path of the loopback redirect, on `127.0.0.1` and `[::1]`. Default: `"/callback"`. */
+  redirectPath?: string;
+}
+
+/** The device flow (RFC 8628), for a client with no browser on its machine. */
+export interface OAuthDeviceFlowConfig {
+  /**
+   * The page where a person enters the user code: absolute, `https`, or `http`
+   * on a loopback host, with no query or fragment. It is told the code as
+   * `?user_code=` in `verification_uri_complete`.
+   */
+  verificationUri: string;
+  /** How long a device code and its user code stay valid. Default: 10 minutes. */
+  codeTtlMs?: number;
+  /** The least number of seconds between two polls of the token endpoint. Default: 5. */
+  intervalSeconds?: number;
 }
 
 /** Client ID Metadata Documents: a `client_id` that is an https URL names its own metadata. */
@@ -181,9 +197,10 @@ export interface OAuthConfig {
    */
   enabled?: boolean;
   /**
-   * The issuer and the single protected resource: an origin with no path and
-   * no trailing slash, `https`, or `http` on a loopback host (`127.0.0.1`,
-   * `[::1]`, `localhost` or a name under `.localhost`). Required when enabled.
+   * The issuer and the single protected resource: an origin, optionally with
+   * a path (`https://example.com/v2`), with no trailing slash, query or
+   * fragment; `https`, or `http` on a loopback host (`127.0.0.1`, `[::1]`,
+   * `localhost` or a name under `.localhost`). Required when enabled.
    */
   issuer?: string;
   /** Paths under the issuer also accepted as `resource`; tokens are bound to the issuer either way. Default: `["/mcp"]`. */
@@ -204,6 +221,10 @@ export interface OAuthConfig {
   tokenPrefix?: { access: string; refresh: string };
   /** Pre-registered clients. */
   clients?: OAuthClientConfig[];
+  /** The command-line tool as a built-in client. Default: none. */
+  cli?: OAuthCliClientConfig;
+  /** The device flow. Default: off. */
+  deviceFlow?: false | OAuthDeviceFlowConfig;
   /** Client ID Metadata Documents. On by default; `false` turns them off. */
   cimd?: false | OAuthCimdConfig;
 }
@@ -364,9 +385,8 @@ const normalizeBasePath = (value: string) => {
 export interface ResolvedOperationsConfig {
   enabled: boolean;
   realm: string;
-  /** The app's own kinds; the built-in `login` is added by the service when {@link login} is set. */
+  /** The app's own kinds. cf-auth's internal kinds are added by the service. */
   kinds: readonly OperationKind[];
-  login: Required<LoginOperationConfig> | null;
   limits: { pendingPerOrganization: number; pendingPerOpener: number };
   sealTtlMs: number;
   reserveTtlMs: number;
@@ -498,56 +518,12 @@ export const assertOperationsDatabase = (db: CfAuthDatabase): void =>
     "a completion, an execution and a sweep are each one batch, and a refused completion rolls its whole batch back",
   );
 
-const resolveOperations = (
-  config: CfAuthConfig,
-  db: CfAuthDatabase,
-  apiKeysEnabled: boolean,
-): ResolvedOperationsConfig => {
+const resolveOperations = (config: CfAuthConfig, db: CfAuthDatabase): ResolvedOperationsConfig => {
   const input = config.operations ?? {};
   const enabled = input.enabled ?? false;
   if (enabled) assertOperationsDatabase(db);
-  const loginInput = input.login ?? true;
-  const login =
-    enabled && loginInput !== false
-      ? {
-          minRole: (loginInput === true ? undefined : loginInput.minRole) ?? "admin",
-          pendingTtlMs: positiveNumber(
-            loginInput === true ? undefined : loginInput.pendingTtlMs,
-            operationDefaults.pendingTtlMs,
-            "operations.login.pendingTtlMs",
-          ),
-          recordTtlMs: positiveNumber(
-            loginInput === true ? undefined : loginInput.recordTtlMs,
-            operationDefaults.recordTtlMs,
-            "operations.login.recordTtlMs",
-          ),
-        }
-      : null;
-
-  if (login && !organizationRoles.includes(login.minRole)) {
-    throw validationError("`operations.login.minRole` must be an organization role");
-  }
-  if (login) {
-    // The built-in kind obeys the same rules as an app's own.
-    validateOperationKind({
-      name: "login",
-      open: "public",
-      browser: true,
-      userCode: true,
-      requireClientLabel: true,
-      approverMinRole: login.minRole,
-      pendingTtlMs: login.pendingTtlMs,
-      recordTtlMs: login.recordTtlMs,
-    }, "operations.login");
-  }
-  if (login && !apiKeysEnabled) {
-    throw validationError(
-      "The `login` operation issues API keys; set `apiKeys.enabled: true` or `operations.login: false`",
-    );
-  }
-
   const kinds = input.kinds ?? [];
-  const names = new Set<string>(login ? ["login"] : []);
+  const names = new Set<string>();
   for (const kind of kinds) {
     validateOperationKind(kind);
     if (names.has(kind.name)) {
@@ -562,7 +538,6 @@ const resolveOperations = (
     enabled,
     realm,
     kinds,
-    login,
     limits: {
       pendingPerOrganization: positiveInteger(
         input.limits?.pendingPerOrganization,
@@ -584,8 +559,17 @@ const resolveOperations = (
   };
 };
 
+export interface ResolvedOAuthClient {
+  clientId: string;
+  name: string;
+  redirectUris: readonly string[];
+  deviceFlow: boolean;
+}
+
 export interface ResolvedOAuthConfig {
   issuer: string;
+  /** The issuer's path: `""` for an origin, `"/v2"` for `https://example.com/v2`. */
+  issuerPath: string;
   resourcePaths: readonly string[];
   /** Every accepted spelling of `resource`: the issuer, then the issuer with each path. */
   resources: readonly string[];
@@ -594,7 +578,11 @@ export interface ResolvedOAuthConfig {
   connectionMaxAgeMs: number | null;
   authorizationTtlMs: number;
   tokenPrefix: { access: string; refresh: string };
-  clients: readonly OAuthClientConfig[];
+  /** The registered clients, the built-in CLI client included. */
+  clients: readonly ResolvedOAuthClient[];
+  /** The CLI client's id, or null when there is none. */
+  cliClientId: string | null;
+  deviceFlow: { verificationUri: string; codeTtlMs: number; intervalSeconds: number } | null;
   /** Null when CIMD is off; `fetch` and `allowUrl` null when not configured. */
   cimd: {
     fetch: typeof fetch | null;
@@ -608,6 +596,9 @@ export const oauthDefaults = {
   accessTokenTtlMs: 10 * minute,
   refreshTokenTtlMs: 30 * day,
   authorizationTtlMs: 10 * minute,
+  deviceCodeTtlMs: 10 * minute,
+  deviceIntervalSeconds: 5,
+  cliRedirectPath: "/callback",
 } as const;
 
 /** Loopback for `oauth.issuer`: the loopback literals, `localhost`, or a name under `.localhost` (RFC 6761 §6.3). */
@@ -656,12 +647,16 @@ const resolveOAuth = (
       "`oauth.issuer` must be https, or http on a loopback host (`127.0.0.1`, `[::1]`, `localhost` or a name under `.localhost`)",
     );
   }
-  if (input.issuer !== issuerUrl.origin) {
+  const issuerPath = issuerUrl.pathname === "/" ? "" : issuerUrl.pathname;
+  if (
+    input.issuer !== `${issuerUrl.origin}${issuerPath}` ||
+    (issuerPath !== "" && !resourcePathPattern.test(issuerPath))
+  ) {
     throw validationError(
-      "`oauth.issuer` must be an origin: no path, no trailing slash, no query, no fragment and no credentials",
+      "`oauth.issuer` must be an origin, optionally with a path such as /v2: no trailing slash, no query, no fragment and no credentials",
     );
   }
-  const issuer = issuerUrl.origin;
+  const issuer = input.issuer;
 
   const resourcePaths = input.resourcePaths ?? [...oauthDefaults.resourcePaths];
   if (!Array.isArray(resourcePaths)) throw validationError("`oauth.resourcePaths` must be an array");
@@ -714,11 +709,51 @@ const resolveOAuth = (
     );
   }
 
+  let deviceFlow: ResolvedOAuthConfig["deviceFlow"] = null;
+  if (input.deviceFlow !== undefined && input.deviceFlow !== false) {
+    const device = input.deviceFlow;
+    if (!device || typeof device !== "object") {
+      throw validationError("`oauth.deviceFlow` must be false or { verificationUri, codeTtlMs?, intervalSeconds? }");
+    }
+    let verification: URL | null = null;
+    try {
+      verification = typeof device.verificationUri === "string" ? new URL(device.verificationUri) : null;
+    } catch {
+      verification = null;
+    }
+    if (
+      !verification ||
+      !(
+        verification.protocol === "https:" ||
+        (verification.protocol === "http:" && isLoopbackIssuerHost(verification.hostname))
+      ) ||
+      verification.username ||
+      verification.password ||
+      verification.search ||
+      verification.hash ||
+      device.verificationUri.includes("#") ||
+      device.verificationUri.includes("?")
+    ) {
+      throw validationError(
+        "`oauth.deviceFlow.verificationUri` must be an absolute https URL (or http on a loopback host) with no query or fragment",
+      );
+    }
+    const intervalSeconds = positiveInteger(
+      device.intervalSeconds,
+      oauthDefaults.deviceIntervalSeconds,
+      "oauth.deviceFlow.intervalSeconds",
+    );
+    deviceFlow = {
+      verificationUri: device.verificationUri,
+      codeTtlMs: positiveNumber(device.codeTtlMs, oauthDefaults.deviceCodeTtlMs, "oauth.deviceFlow.codeTtlMs"),
+      intervalSeconds,
+    };
+  }
+
   const clients = input.clients ?? [];
   if (!Array.isArray(clients)) throw validationError("`oauth.clients` must be an array");
   const clientIds = new Set<string>();
-  const resolvedClients = clients.map((client, index): OAuthClientConfig => {
-    const label = `oauth.clients[${index}]`;
+  const checkClientIdentity = (client: { clientId?: unknown; name?: unknown } | undefined, label: string) => {
     if (!client || typeof client.clientId !== "string" || !client.clientId.trim()) {
       throw validationError(`\`${label}.clientId\` is required`);
     }
@@ -732,6 +767,11 @@ const resolveOAuth = (
     if (typeof client.name !== "string" || !client.name.trim() || client.name.trim().length > 200) {
       throw validationError(`\`${label}.name\` is required, at most 200 characters`);
     }
+    return { clientId: client.clientId, name: client.name.trim() };
+  };
+  const resolvedClients = clients.map((client, index): ResolvedOAuthClient => {
+    const label = `oauth.clients[${index}]`;
+    const identity = checkClientIdentity(client, label);
     if (!Array.isArray(client.redirectUris) || client.redirectUris.length === 0) {
       throw validationError(`\`${label}.redirectUris\` must list at least one redirect URI`);
     }
@@ -742,8 +782,33 @@ const resolveOAuth = (
         );
       }
     }
-    return { clientId: client.clientId, name: client.name.trim(), redirectUris: [...client.redirectUris] };
+    if (client.deviceFlow !== undefined && typeof client.deviceFlow !== "boolean") {
+      throw validationError(`\`${label}.deviceFlow\` must be a boolean`);
+    }
+    if (client.deviceFlow && !deviceFlow) {
+      throw validationError(`\`${label}.deviceFlow\` needs \`oauth.deviceFlow\``);
+    }
+    return { ...identity, redirectUris: [...client.redirectUris], deviceFlow: client.deviceFlow ?? false };
   });
+
+  let cliClientId: string | null = null;
+  if (input.cli !== undefined) {
+    const cli = input.cli;
+    if (!cli || typeof cli !== "object") throw validationError("`oauth.cli` must be { clientId, name, redirectPath? }");
+    const identity = checkClientIdentity(cli, "oauth.cli");
+    const redirectPath = cli.redirectPath ?? oauthDefaults.cliRedirectPath;
+    if (typeof redirectPath !== "string" || !resourcePathPattern.test(redirectPath)) {
+      throw validationError(
+        "`oauth.cli.redirectPath` must be a path such as \"/callback\": a leading slash, no query or fragment",
+      );
+    }
+    resolvedClients.push({
+      ...identity,
+      redirectUris: [`http://127.0.0.1${redirectPath}`, `http://[::1]${redirectPath}`],
+      deviceFlow: deviceFlow !== null,
+    });
+    cliClientId = identity.clientId;
+  }
 
   let cimd: ResolvedOAuthConfig["cimd"];
   if (input.cimd === false) {
@@ -764,6 +829,7 @@ const resolveOAuth = (
 
   return {
     issuer,
+    issuerPath,
     resourcePaths: [...resourcePaths],
     resources: [issuer, ...resourcePaths.map((path) => `${issuer}${path}`)],
     accessTokenTtlMs: positiveNumber(input.accessTokenTtlMs, oauthDefaults.accessTokenTtlMs, "oauth.accessTokenTtlMs"),
@@ -780,6 +846,8 @@ const resolveOAuth = (
     ),
     tokenPrefix: { access: prefix.access, refresh: prefix.refresh },
     clients: resolvedClients,
+    cliClientId,
+    deviceFlow,
     cimd,
   };
 };
@@ -890,7 +958,7 @@ export const resolveConfig = (config: CfAuthConfig): ResolvedCfAuthConfig => {
   }
 
   const apiKeysEnabled = config.apiKeys?.enabled ?? false;
-  const operations = resolveOperations(config, db, apiKeysEnabled);
+  const operations = resolveOperations(config, db);
   const apiKeyTokenPrefix = config.apiKeys?.tokenPrefix ?? "key_";
   const oauth = resolveOAuth(
     config,

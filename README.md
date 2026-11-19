@@ -17,8 +17,10 @@ multi-tenant part that every one of these apps ends up writing again:
 - Email verification through better-auth, with the sending left to you.
 - A signed cookie that remembers which organization the user picked.
 - **Operations approved in a browser**: a CLI asks, a signed-in person approves
-  on your page, and the CLI collects the result. The built-in `login` gives a
-  CLI an API key of its own that way.
+  on your page, and the CLI collects the result.
+- **OAuth sign-in** for MCP clients and command-line tools: the
+  authorization-code flow with PKCE, and the device flow for a machine with no
+  browser. Each ends with a connection the person can revoke.
 
 This is a library, not a service. Your app keeps its own users, organizations
 and API keys in its **own** D1 database. There is no central server and nothing
@@ -77,12 +79,11 @@ A role says what a person or service may do in an organization; a **grant**
 says how much of that one credential may use. It is `"read"` or `"manage"`,
 and what a request may do is the role and the grant together. A session is
 always `manage`. An API key is `manage` unless it was issued with
-`grant: "read"` — through `createApiKey`, `issueServiceApiKey`, or the
-`login` operation's payload `{ grant: "read" }` — and keys from before grants
-existed are `manage`.
+`grant: "read"` — through `createApiKey` or `issueServiceApiKey` — and keys
+from before grants existed are `manage`.
 
-`c.get("authState").grant` carries it. cf-auth's own writes — members, keys,
-claims — need `manage` and refuse a `read` credential with
+`c.get("authState").grant` carries it. cf-auth's own writes — members and
+keys — need `manage` and refuse a `read` credential with
 `403 grant_insufficient`; a credential never issues a key with more than it
 holds, and a `read` one issues none. Gate your own writes the same way:
 
@@ -113,32 +114,35 @@ const { cookie, organizationId } = await createTestSessions(cfAuth).human();
 
 See [the documentation](./docs/index.md#testing-your-own-app).
 
-## Logging in a CLI
+## Signing in a command-line tool
 
-Turn on operations and the built-in `login` is there. Your routes call the
-service; the CLI keeps one random token and never sees a password:
+A command-line tool signs in through the same OAuth server as an MCP client
+(see [OAuth connections](#oauth-connections)). With a browser on the machine
+it uses the authorization-code flow with a loopback redirect on any port;
+without one (over SSH, on a server) it uses the device flow: it shows a link
+and a short code, and the person approves in any browser.
 
 ```ts
 const cfAuth = createCfAuth({
-  // ...the usual settings
-  apiKeys: { enabled: true },
-  operations: { enabled: true, realm: env.DEPLOYMENT_ID },
+  // ...the usual settings, with apiKeys and operations on, on D1 or libsql
+  oauth: {
+    enabled: true,
+    issuer: "https://api.example.com/v2",
+    tokenPrefix: { access: "agw_oat_", refresh: "agw_ort_" },
+    cli: { clientId: "agw-cli", name: "agw" },
+    deviceFlow: { verificationUri: "https://console.example.com/v2/device" },
+  },
 });
 
-// The CLI asks, and prints the link and the code.
-const view = await cfAuth.operations.open({
-  kind: "login",
-  token,
-  client: { label: "CLI on mac-studio" },
-});
-// A signed-in person approves on your page.
-await cfAuth.operations.approve({ id, proof, actor: c.get("authState"), organizationId });
-// The CLI collects its key, once.
-const { outcome } = await cfAuth.operations.poll({ id, token });
+// The tool asks for a device code; your route sends the answer as JSON.
+const asked = await cfAuth.oauth.deviceAuthorization({ body, rateLimitKey: clientAddress(c) });
+// Your code-entry page finds it by the code the person typed, rate-limited, then approves.
+const found = await cfAuth.oauth.lookupDevice({ userCode, rateLimit: () => limitGuesses(c) });
+await cfAuth.oauth.approveDevice({ id: found!.id, userCode, actor: c.get("authState"), organizationId, grant: "manage" });
+// The tool polls `token` with the device grant until the connection is issued.
 ```
 
-See [Operations approved in a browser](docs/index.md#operations-approved-in-a-browser)
-for the loopback redirect, user codes, your own kinds and the sweep.
+See [Signing in a command-line tool](docs/index.md#signing-in-a-command-line-tool).
 
 ## Reservations
 
@@ -187,11 +191,11 @@ const cfAuth = createCfAuth({
   // ...the usual settings, with apiKeys and operations on, on D1 or libsql
   oauth: {
     enabled: true,
-    issuer: "https://console.example.com",
+    issuer: "https://console.example.com", // an origin, or an origin and a path such as /v2
     tokenPrefix: { access: "agw_oat_", refresh: "agw_ort_" },
     // Optional: clients you register yourself. Others identify themselves
     // with a Client ID Metadata Document (an https client_id), unless cimd: false.
-    clients: [{ clientId: "my-cli", name: "My CLI", redirectUris: ["http://127.0.0.1/callback"] }],
+    clients: [{ clientId: "my-app", name: "My app", redirectUris: ["com.example.app:/oauth"] }],
   },
 });
 
@@ -217,10 +221,12 @@ const state = await cfAuth.oauth.resolveAccessTokenAuthState(token, { source: "m
 **What your app mounts, and what cf-auth decides.** cf-auth mounts no
 routes. Your app mounts the discovery documents
 (`protectedResourceMetadata`, `authorizationServerMetadata`),
-`/oauth/authorize`, `/oauth/token` and `/oauth/revoke`, the consent page and
-its API (`authorizationDetails`, `approveAuthorization`,
-`approveGuestAuthorization`, `denyAuthorization`), and the bearer gate; it
-owns statuses, headers, CORS and the page. cf-auth decides everything that
+`/oauth/authorize`, `/oauth/token`, `/oauth/revoke` and, with the device
+flow, `/oauth/device_authorization`, the consent page and its API
+(`authorizationDetails`, `approveAuthorization`, `denyAuthorization`), the
+code-entry page and its API, and the bearer gate; `routePaths()` answers
+every path, the issuer's own path included. It owns statuses, headers, CORS
+and the pages. cf-auth decides everything that
 is a security rule:
 
 - whether an authorization request is valid and for which client — a
@@ -236,15 +242,12 @@ is a security rule:
   support may hand over more before the cancel). Its declared name is
   untrusted text: render it escaped;
 - what a consent may do: the person's session and membership are re-read in
-  the batch that completes it, and "continue without an account" runs your
-  admission rule, then your rate limit, then provisions your account inside
-  that same batch, whose first write judges and latches the admission so
-  provisioning cannot undo it (an empty-deployment rule works);
+  the batch that completes it;
 - when a code is good: once, for 10 minutes, with its verifier; a code
   presented again revokes the connection it issued.
 
-Both approvals are idempotent: approving again, by either door, answers the
-same redirect byte for byte, because the code is kept sealed under the
+Approving is idempotent for the person who approved: approving again answers
+the same redirect byte for byte, because the code is kept sealed under the
 browser proof. A refresh rotates the tokens, at most once per 5 s: sooner is `429
 slow_down` with a `Retry-After`, and the token stays good. The previous refresh token
 replays the same response for 30 s, and after that its return revokes the
@@ -252,6 +255,54 @@ whole connection. See [OAuth connections](docs/index.md#oauth-connections)
 and [Authorization](docs/index.md#authorization).
 
 Upgrading from 0.7.0: see [Upgrading to 0.8.0](#upgrading-to-080).
+
+## Upgrading to 1.0.0
+
+1.0 replaces the custom CLI login with standard OAuth, and drops unclaimed
+accounts. Management keys, reservations and reveals are unchanged.
+
+- **Apply `0007_cf_auth_1_0.sql`.** First it deletes every organization that
+  was never claimed (it still has a deadline and no human owner, expired or
+  not), with its memberships, keys, OAuth connections, operations and
+  invitations. Without the deadline, those accounts' keys would sign in
+  again. Service identities stay: the migration removes their memberships
+  and keys in the deleted organizations only. Then it drops
+  `organization.expires_at`, `operation.loopback_redirect` and
+  `operation.redeem_code_hash`. If your own tables reference `organization`
+  without `ON DELETE CASCADE`, remove your rows for those organizations
+  first. If you regenerate with drizzle-kit instead, it writes only the
+  three `DROP COLUMN` statements: copy the deletes from `0007` in front of
+  them.
+- **The built-in `login` operation is gone**, with `operations.login`,
+  `LoginOperationConfig` and the `login*` exports. Sign a command-line tool
+  in with `oauth.cli` and, without a browser, `oauth.deviceFlow`: see
+  [Signing in a command-line tool](#signing-in-a-command-line-tool). A
+  `login` operation left in the table is never answered again; the sweep
+  deletes it.
+- **Loopback redirects on operations are gone**: `client.loopbackRedirect`,
+  `redeem`, `redeemCode` and `redirectUrl` on an approval, and
+  `hasLoopbackRedirect`. A sealed outcome is collected by `poll`, and
+  `collect` is `"poll"` or `null`.
+- **Unclaimed accounts are gone**: `claimOrganization`,
+  `claimOrganizationStatements`, `ClaimOrganizationInput`,
+  `ClaimOrganizationWrite`, the `organization.claimed` event, the
+  organization's `expiresAt` deadline and `claimed` flag on
+  `OrganizationSummary`, `isOrganizationExpired` and `organizationExpired`
+  (`403 organization_expired`). An exhaustive switch over `CfAuthEvent`
+  loses a case.
+- **"Continue without an account" is gone** from OAuth consent:
+  `approveGuestAuthorization` and its types, and the `door` field of an
+  authorization's record. Every connection belongs to a person who signed in.
+- **`oauth.issuer` may now have a path**, such as
+  `https://api.example.com/v2`. Its discovery documents move to
+  `/.well-known/oauth-authorization-server/v2` and
+  `/.well-known/oauth-protected-resource/v2`, and its endpoints to
+  `/v2/oauth/...`; `routePaths()` lists them. An issuer that is an origin
+  keeps every path it had.
+- `OAuthErrorCode` has new members (`authorization_pending`,
+  `access_denied`, `expired_token`) and `AuthorizationServerMetadata` an
+  optional `device_authorization_endpoint`; both appear only with the device
+  flow on.
 
 ## Upgrading to 0.9.0
 

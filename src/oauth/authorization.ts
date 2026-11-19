@@ -3,9 +3,8 @@
  * decisions, the code exchange, and the discovery documents.
  *
  * A pending authorization is an operation of the built-in internal kind
- * `cf-auth:oauth.authorize`, opened by `authorize` and completed by one of
- * two doors — a signed-in person (`approveAuthorization`) or an account
- * provisioned on the spot (`approveGuestAuthorization`) — or denied. Its
+ * `cf-auth:oauth.authorize`, opened by `authorize` and completed by a
+ * signed-in person (`approveAuthorization`), or denied. Its
  * completion record says who approved what; the code exchange turns it into
  * a connection, once.
  *
@@ -19,17 +18,16 @@
  * without the proof can. The proof is not proof of being the approver,
  * though: whoever opened the authorization holds it too, and may have handed
  * the consent link to someone else. So a completed authorization answers its
- * code only to the door that completed it, and through the person door only
- * to the same person. The engine's own token for the operation is a separate
+ * code only to the person who approved it. The engine's own token for the operation is a separate
  * random value that nothing keeps, so the code does not lead to the proof.
  *
  * Nothing here is an HTTP route. Each function answers a plain value: a
  * consent reference, a redirect, an error page, or a token response.
  */
-import { and, eq, is, isNull, sql, SQL } from "drizzle-orm";
+import { and, eq, sql, type SQL } from "drizzle-orm";
 import { alias } from "drizzle-orm/sqlite-core";
 import { credentialAuthoritySql, sqliteNowMs } from "../authority.js";
-import type { CfAuthDatabase, ResolvedCfAuthConfig, ResolvedOAuthConfig } from "../config.js";
+import type { ResolvedCfAuthConfig, ResolvedOAuthConfig } from "../config.js";
 import { openTextForToken, randomToken, sealTextForToken, sha256Hex, timingSafeEqual } from "../crypto.js";
 import {
   alreadyCompleted,
@@ -38,7 +36,6 @@ import {
   operationDenied,
   operationExpired,
   operationNotFound,
-  organizationExpired,
   validationError,
 } from "../errors.js";
 import {
@@ -47,12 +44,10 @@ import {
   type OperationKind,
 } from "../operations.js";
 import type { CfAuthRepository } from "../repository.js";
-import type { CfAuthTables } from "../schema.js";
 import { requireInteractiveSession } from "../service.js";
 import {
   createEmptyAuthState,
   isCredentialGrant,
-  isOrganizationExpired,
   organizationRoles,
   type AuthState,
   type AuthUser,
@@ -60,7 +55,7 @@ import {
   type OperationState,
   type OrganizationMembership,
 } from "../types.js";
-import { oauthMembershipLiveSql, oauthOrganizationLiveSql } from "./authority.js";
+import { oauthOrganizationLiveSql } from "./authority.js";
 import { ClientMetadataRefusal, fetchClientMetadataDocument } from "./cimd.js";
 import { duplicateDescription, duplicatedParameter, formParams, type FormParams } from "./params.js";
 import { redirectUriMatches } from "./redirect-uri.js";
@@ -104,12 +99,10 @@ export interface OAuthAuthorizationPayload {
 
 /** What a completed authorization records, in the clear. Never the code. */
 export interface OAuthAuthorizationRecord {
-  /** Which door completed it. */
-  door: "person" | "guest";
-  /** The user the connection will belong to: the person, or the provisioned service user. */
+  /** The person who approved it: the user the connection will belong to. */
   userId: string;
   organizationId: string;
-  /** The grant the connection will carry. A guest connection is always `manage`. */
+  /** The grant the connection will carry. */
   grant: CredentialGrant;
   /** What the client asked for, which may differ from `grant`. */
   requestedGrant: CredentialGrant;
@@ -125,47 +118,13 @@ export interface OAuthAuthorizationRecord {
   connectionId: string | null;
 }
 
-/** What `approveGuestAuthorization`'s `provision` is handed. */
-export interface OAuthGuestProvisionContext {
-  /** The authorization's operation id: derive the new ids from it, so a retry names the same rows. */
-  operationId: string;
-  /**
-   * AND this into the WHERE of every statement: true once the batch's first
-   * write has judged the engine's guard (the authorization pending and in
-   * time) and the admission condition, and latched that judgement on the
-   * operation row. The admission is not evaluated again, so provisioning
-   * may change what it reads.
-   */
-  guard: SQL;
-  db: CfAuthDatabase;
-  tables: CfAuthTables;
-  now: number;
-}
-
-/** What `provision` answers: the account it creates, and the statements that create it. */
-export interface OAuthGuestProvision {
-  userId: string;
-  organizationId: string;
-  /** drizzle query builders (`guardedInsert`, `db.update`, ...), each guarded with `guard`. */
-  statements: readonly unknown[];
-}
-
 /** The approval the consent functions hand the kind. Built here, never by a page. */
-type AuthorizationApproval =
-  | {
-      door: "person";
-      userId: string;
-      sessionId: string;
-      organizationId: string;
-      grant: CredentialGrant;
-    }
-  | {
-      door: "guest";
-      admission: SQL | null;
-      provision: (
-        context: OAuthGuestProvisionContext,
-      ) => OAuthGuestProvision | Promise<OAuthGuestProvision>;
-    };
+interface AuthorizationApproval {
+  userId: string;
+  sessionId: string;
+  organizationId: string;
+  grant: CredentialGrant;
+}
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
@@ -191,44 +150,23 @@ const parsePayload = (value: unknown): OAuthAuthorizationPayload => {
 };
 
 const parseApproval = (value: unknown): AuthorizationApproval => {
-  if (isObject(value) && value.door === "person") {
-    if (
-      typeof value.userId === "string" &&
-      typeof value.sessionId === "string" &&
-      typeof value.organizationId === "string" &&
-      isCredentialGrant(value.grant)
-    ) {
-      return value as unknown as AuthorizationApproval;
-    }
-  }
-  if (isObject(value) && value.door === "guest") {
-    if ((value.admission === null || is(value.admission, SQL)) && typeof value.provision === "function") {
-      return value as unknown as AuthorizationApproval;
-    }
+  if (
+    isObject(value) &&
+    typeof value.userId === "string" &&
+    typeof value.sessionId === "string" &&
+    typeof value.organizationId === "string" &&
+    isCredentialGrant(value.grant)
+  ) {
+    return value as unknown as AuthorizationApproval;
   }
   throw validationError("Invalid authorization approval");
-};
-
-/** The provisioned ids, as `provision` must answer them. */
-const parseProvision = (value: unknown): OAuthGuestProvision => {
-  if (
-    !isObject(value) ||
-    typeof value.userId !== "string" ||
-    !value.userId ||
-    typeof value.organizationId !== "string" ||
-    !value.organizationId ||
-    !Array.isArray(value.statements)
-  ) {
-    throw validationError("provision must answer { userId, organizationId, statements }");
-  }
-  return value as unknown as OAuthGuestProvision;
 };
 
 /**
  * The built-in internal kind `cf-auth:oauth.authorize`. Public (anyone may
  * start one; the browser's address is what the pending cap counts),
- * approved by the browser proof alone, with the person's or the guest's
- * authority carried into the completing batch by the kind itself.
+ * approved by the browser proof, with the person's authority carried into
+ * the completing batch by the kind itself.
  */
 export const createOAuthAuthorizeKind = (oauth: ResolvedOAuthConfig): OperationKind => ({
   name: oauthAuthorizeKindName,
@@ -269,69 +207,21 @@ export const createOAuthAuthorizeKind = (oauth: ResolvedOAuthConfig): OperationK
         .set({ updatedAt: new Date(now) })
         .where(and(eq(tables.operation.id, operation.id), guard, condition));
 
-    if (approval.door === "person") {
-      const { userId, sessionId, organizationId, grant } = approval;
-      const record: OAuthAuthorizationRecord = { ...base, door: "person", userId, organizationId, grant };
-      // The person's session, live, and their membership — any role — in an
-      // organization inside its deadline, re-read when the write lands.
-      const authority = and(
-        credentialAuthoritySql(tables, {
-          organizationId,
-          userId,
-          credentialId: sessionId,
-          allowedRoles: organizationRoles,
-          nowMs: now,
-        }),
-        oauthOrganizationLiveSql(tables, { organizationId, nowMs: now }),
-      )!;
-      return { outcome: record, seal: false, statements: [carry(authority)] };
-    }
-
-    // The admission is judged once, by the first write of the batch, before
-    // anything is provisioned: a rule about the deployment's state (that it
-    // is empty, say) would turn false as soon as the account's own rows land.
-    // That write latches the judgement on the operation row with a claim of
-    // this call's own, the `execution_claim` a reservation's execution holds
-    // it by; every later statement asks for the claim, not the admission
-    // again. Completing clears it, and a refused batch rolls it back.
-    const claim = randomToken(32);
-    const latch = db
-      .update(tables.operation)
-      .set({ executionClaim: claim, updatedAt: new Date(now) })
-      .where(
-        and(
-          eq(tables.operation.id, operation.id),
-          isNull(tables.operation.executionClaim),
-          guard,
-          ...(approval.admission ? [approval.admission] : []),
-        ),
-      );
-    const admittedRow = alias(tables.operation, "cf_auth_oauth_admitted");
-    const admitted = sql`exists (select 1 from ${tables.operation} as ${sql.identifier("cf_auth_oauth_admitted")}
-      where ${admittedRow.id} = ${operation.id}
-        and ${admittedRow.state} = 'pending'
-        and ${admittedRow.executionClaim} = ${claim})`;
-    const provided = parseProvision(
-      await approval.provision({ operationId: operation.id, guard: admitted, db, tables, now }),
-    );
-    const record: OAuthAuthorizationRecord = {
-      ...base,
-      door: "guest",
-      userId: provided.userId,
-      organizationId: provided.organizationId,
-      // A guest connection is the account's only way in, so it manages it.
-      grant: "manage",
-    };
-    // At the end of the batch the admission is still latched and the
-    // provisioned membership and organization exist and are live: otherwise
-    // the completion is refused and every statement, the latch included,
-    // rolls back.
-    const provisioned = and(
-      admitted,
-      oauthMembershipLiveSql(tables, { userId: provided.userId, organizationId: provided.organizationId }),
-      oauthOrganizationLiveSql(tables, { organizationId: provided.organizationId, nowMs: now }),
+    const { userId, sessionId, organizationId, grant } = approval;
+    const record: OAuthAuthorizationRecord = { ...base, userId, organizationId, grant };
+    // The person's session, live, and their membership — any role — in an
+    // organization that still exists, re-read when the write lands.
+    const authority = and(
+      credentialAuthoritySql(tables, {
+        organizationId,
+        userId,
+        credentialId: sessionId,
+        allowedRoles: organizationRoles,
+        nowMs: now,
+      }),
+      oauthOrganizationLiveSql(tables, { organizationId }),
     )!;
-    return { outcome: record, seal: false, statements: [latch, ...provided.statements, carry(provisioned)] };
+    return { outcome: record, seal: false, statements: [carry(authority)] };
   },
 });
 
@@ -380,20 +270,6 @@ export interface ApproveAuthorizationInput {
   grant: CredentialGrant;
 }
 
-export interface ApproveGuestAuthorizationInput {
-  id: string;
-  proof: string;
-  /**
-   * The deployment's admission: throw to refuse, or answer null, or a
-   * condition the completing batch must also satisfy.
-   */
-  admit: () => Promise<SQL | null>;
-  /** The rate limit, keyed on the browser's address: throw when exceeded. */
-  rateLimit: () => Promise<void>;
-  /** The account to provision, as guarded statements for the completing batch. */
-  provision: (context: OAuthGuestProvisionContext) => OAuthGuestProvision | Promise<OAuthGuestProvision>;
-}
-
 /** RFC 9728 protected resource metadata. */
 export interface ProtectedResourceMetadata {
   resource: string;
@@ -408,6 +284,8 @@ export interface AuthorizationServerMetadata {
   authorization_endpoint: string;
   token_endpoint: string;
   revocation_endpoint: string;
+  /** Present while the device flow is on. */
+  device_authorization_endpoint?: string;
   response_types_supported: string[];
   grant_types_supported: string[];
   code_challenge_methods_supported: string[];
@@ -423,7 +301,28 @@ export const oauthEndpointPaths = {
   authorize: "/oauth/authorize",
   token: "/oauth/token",
   revoke: "/oauth/revoke",
+  deviceAuthorization: "/oauth/device_authorization",
 } as const;
+
+/** The device flow's grant type (RFC 8628 §3.4). */
+export const deviceCodeGrantType = "urn:ietf:params:oauth:grant-type:device_code";
+
+/**
+ * Every path the app mounts for OAuth, on the issuer's host. The discovery
+ * documents sit at the host's root with the issuer's path after the
+ * well-known part (RFC 8414 §3.1, RFC 9728 §3.1), so an issuer of
+ * `https://example.com/v2` publishes `/.well-known/oauth-authorization-server/v2`.
+ */
+export interface OAuthRoutePaths {
+  authorizationServerMetadata: string;
+  /** One per protected resource: `""` (the issuer) and each of `resourcePaths`. */
+  protectedResourceMetadata: { resourcePath: string; path: string }[];
+  authorize: string;
+  token: string;
+  revoke: string;
+  /** Null while the device flow is off. */
+  deviceAuthorization: string | null;
+}
 
 /** What the code exchange answers, shaped as `token`'s result. */
 export type OAuthExchangeResult =
@@ -553,11 +452,12 @@ export const createOAuthAuthorization = (deps: {
    * invalid_proof` for a wrong proof.
    */
   const loadForBrowser = async (id: string, proof: string, viewer: AuthState | null = null) => {
-    settings();
+    const oauth = settings();
+    // One another issuer sharing the database opened is not this consent page's.
+    const authorization = await readAuthorization(id);
+    if (!authorization || authorization.payload.resource !== oauth.issuer) throw operationNotFound();
     const details = await engine().details({ id, proof, viewer });
     if (details.kind !== oauthAuthorizeKindName) throw operationNotFound();
-    const authorization = await readAuthorization(id);
-    if (!authorization) throw operationNotFound();
     return { details, ...authorization };
   };
 
@@ -584,23 +484,18 @@ export const createOAuthAuthorization = (deps: {
     ]);
 
   /**
-   * The redirect for whoever completed the authorization, and nobody else:
-   * the guest door again, or the same person through the person door. The
-   * proof alone does not do, since whoever opened the authorization holds it
-   * too and must not read a code that someone else approved.
+   * The redirect for the person who completed the authorization, and nobody
+   * else. The proof alone does not do, since whoever opened the authorization
+   * holds it too and must not read a code that someone else approved.
    */
   const approverRedirect = async (
     id: string,
     proof: string,
     payload: OAuthAuthorizationPayload,
     record: OAuthAuthorizationRecord | null | undefined,
-    approver: { door: "person"; userId: string } | { door: "guest" },
+    userId: string,
   ) => {
-    if (
-      !record ||
-      record.door !== approver.door ||
-      (approver.door === "person" && record.userId !== approver.userId)
-    ) {
+    if (!record || record.userId !== userId) {
       throw alreadyCompleted("This authorization was already approved");
     }
     return codeRedirect(id, proof, payload);
@@ -608,7 +503,7 @@ export const createOAuthAuthorization = (deps: {
 
   /**
    * Runs the engine's approval with `approval`. One already completed — by
-   * either door, before this call or racing it — is not an error here: the
+   * anyone, before this call or racing it — is not an error here: the
    * caller reads the record and answers its redirect if it is the approver's.
    */
   const approveThroughEngine = async (id: string, proof: string, approval: AuthorizationApproval) => {
@@ -683,6 +578,22 @@ export const createOAuthAuthorization = (deps: {
       };
     },
 
+    routePaths(): OAuthRoutePaths {
+      const oauth = settings();
+      const under = (path: string) => `${oauth.issuerPath}${path}`;
+      return {
+        authorizationServerMetadata: `/.well-known/oauth-authorization-server${oauth.issuerPath}`,
+        protectedResourceMetadata: ["", ...oauth.resourcePaths].map((resourcePath) => ({
+          resourcePath,
+          path: `/.well-known/oauth-protected-resource${oauth.issuerPath}${resourcePath}`,
+        })),
+        authorize: under(oauthEndpointPaths.authorize),
+        token: under(oauthEndpointPaths.token),
+        revoke: under(oauthEndpointPaths.revoke),
+        deviceAuthorization: oauth.deviceFlow ? under(oauthEndpointPaths.deviceAuthorization) : null,
+      };
+    },
+
     authorizationServerMetadata(): AuthorizationServerMetadata {
       const oauth = settings();
       return {
@@ -690,8 +601,15 @@ export const createOAuthAuthorization = (deps: {
         authorization_endpoint: `${oauth.issuer}${oauthEndpointPaths.authorize}`,
         token_endpoint: `${oauth.issuer}${oauthEndpointPaths.token}`,
         revocation_endpoint: `${oauth.issuer}${oauthEndpointPaths.revoke}`,
+        ...(oauth.deviceFlow
+          ? { device_authorization_endpoint: `${oauth.issuer}${oauthEndpointPaths.deviceAuthorization}` }
+          : {}),
         response_types_supported: ["code"],
-        grant_types_supported: ["authorization_code", "refresh_token"],
+        grant_types_supported: [
+          "authorization_code",
+          "refresh_token",
+          ...(oauth.deviceFlow ? [deviceCodeGrantType] : []),
+        ],
         code_challenge_methods_supported: ["S256"],
         token_endpoint_auth_methods_supported: ["none"],
         revocation_endpoint_auth_methods_supported: ["none"],
@@ -808,9 +726,8 @@ export const createOAuthAuthorization = (deps: {
     async approveAuthorization(input: ApproveAuthorizationInput): Promise<{ redirect: string }> {
       const { state, payload, record } = await loadForBrowser(input.id, input.proof);
       const { userId, sessionId } = requireInteractiveSession(input.actor ?? createEmptyAuthState());
-      const approver = { door: "person", userId } as const;
       if (state === "completed") {
-        return { redirect: await approverRedirect(input.id, input.proof, payload, record, approver) };
+        return { redirect: await approverRedirect(input.id, input.proof, payload, record, userId) };
       }
       assertPending(state);
 
@@ -822,59 +739,15 @@ export const createOAuthAuthorization = (deps: {
       if (!membership || membership.status !== "active") {
         throw notAMember("Approving needs a membership in this organization");
       }
-      if (isOrganizationExpired(membership.organization)) throw organizationExpired();
 
       await approveThroughEngine(input.id, input.proof, {
-        door: "person",
         userId,
         sessionId,
         organizationId: input.organizationId,
         grant: input.grant,
       });
       const completed = await readAuthorization(input.id);
-      return { redirect: await approverRedirect(input.id, input.proof, payload, completed?.record, approver) };
-    },
-
-    async approveGuestAuthorization(
-      input: ApproveGuestAuthorizationInput,
-    ): Promise<{ redirect: string; organizationId: string }> {
-      // 1. The proof.
-      const { state, payload, record } = await loadForBrowser(input.id, input.proof);
-      // 2. Already completed: its redirect if this door completed it, never re-admitted or counted.
-      if (state === "completed") {
-        if (!record) throw operationExpired("This authorization's record can no longer be read");
-        return {
-          redirect: await approverRedirect(input.id, input.proof, payload, record, { door: "guest" }),
-          organizationId: record.organizationId,
-        };
-      }
-      assertPending(state);
-      if (
-        typeof input.admit !== "function" ||
-        typeof input.rateLimit !== "function" ||
-        typeof input.provision !== "function"
-      ) {
-        throw validationError("admit, rateLimit and provision are required");
-      }
-      // 3. Admission: a refusal never reaches the rate limit.
-      const admission = (await input.admit()) ?? null;
-      if (admission !== null && !is(admission, SQL)) {
-        throw validationError("admit must answer null or an SQL condition");
-      }
-      // 4. The rate limit.
-      await input.rateLimit();
-      // 5. Provision, inside the batch that completes the authorization.
-      await approveThroughEngine(input.id, input.proof, {
-        door: "guest",
-        admission,
-        provision: input.provision,
-      });
-      const completed = await readAuthorization(input.id);
-      if (!completed?.record) throw operationNotFound();
-      return {
-        redirect: await approverRedirect(input.id, input.proof, payload, completed.record, { door: "guest" }),
-        organizationId: completed.record.organizationId,
-      };
+      return { redirect: await approverRedirect(input.id, input.proof, payload, completed?.record, userId) };
     },
 
     async denyAuthorization(input: { id: string; proof: string }): Promise<{ redirect: string }> {
@@ -910,6 +783,9 @@ export const createOAuthAuthorization = (deps: {
       const found = await readAuthorization(id);
       if (!found || found.state !== "completed" || !found.record) return unknown();
       const record = found.record;
+      // Issued by this issuer: another one sharing the database neither
+      // exchanges nor revokes through it, whatever `resource` says.
+      if (record.resource !== oauth.issuer) return unknown();
 
       // The client, the redirect and the verifier must be the authorization's;
       // a mismatch is refused and changes nothing, so the code alone ends nothing.

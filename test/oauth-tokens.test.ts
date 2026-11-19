@@ -367,7 +367,7 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         expect((await resolve(tokens.access_token)).authenticated).toBe(false);
       });
 
-      it("answers an empty state for a revoked or expired connection, or an expired organization", async () => {
+      it("answers an empty state for a revoked or expired connection, or an ended membership", async () => {
         const revoked = await connect();
         await h.exec("UPDATE api_key SET revoked_at = ?, enabled = 0 WHERE id = ?", Date.now(), revoked.connectionId);
         expect((await resolve(revoked.tokens.access_token)).authenticated).toBe(false);
@@ -376,13 +376,13 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         await h.exec("UPDATE api_key SET expires_at = ? WHERE id = ?", Date.now() - 1, expired.connectionId);
         expect((await resolve(expired.tokens.access_token)).authenticated).toBe(false);
 
-        const lapsed = await connect();
+        const removed = await connect();
         await h.exec(
-          "UPDATE organization SET expires_at = ? WHERE id = ?",
-          new Date(Date.now() - 1000).toISOString(),
-          lapsed.human.organizationId,
+          "DELETE FROM organization_user WHERE user_id = ? AND organization_id = ?",
+          removed.human.userId,
+          removed.human.organizationId,
         );
-        expect((await resolve(lapsed.tokens.access_token)).authenticated).toBe(false);
+        expect((await resolve(removed.tokens.access_token)).authenticated).toBe(false);
       });
     });
 
@@ -567,19 +567,10 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         ok(await refresh(tokens.refresh_token));
       });
 
-      it("answers invalid_grant without changing a connection that is revoked, expired, or whose membership or organization ended", async () => {
+      it("answers invalid_grant without changing a connection that is revoked, expired, or whose membership ended", async () => {
         const cases: [string, (c: Awaited<ReturnType<typeof connect>>) => Promise<unknown>][] = [
           ["revoked", (c) => h.exec("UPDATE api_key SET revoked_at = ?, enabled = 0 WHERE id = ?", Date.now(), c.connectionId)],
           ["expired", (c) => h.exec("UPDATE api_key SET expires_at = ? WHERE id = ?", Date.now() - 1, c.connectionId)],
-          [
-            "organization expired",
-            (c) =>
-              h.exec(
-                "UPDATE organization SET expires_at = ? WHERE id = ?",
-                new Date(Date.now() - 1000).toISOString(),
-                c.human.organizationId,
-              ),
-          ],
           [
             "membership removed",
             (c) =>
@@ -704,12 +695,6 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
           h.exec(
             "DELETE FROM organization_user WHERE user_id = ? AND organization_id = ?",
             c.human.userId,
-            c.human.organizationId,
-          ),
-        "organization expired": (c) =>
-          h.exec(
-            "UPDATE organization SET expires_at = ? WHERE id = ?",
-            new Date(Date.now() - 1000).toISOString(),
             c.human.organizationId,
           ),
         // A revocation that left the generations in place, as a direct write would.
@@ -974,49 +959,6 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         const rebound = await connect();
         await rebind(rebound.connectionId);
         expect((await resolve(rebound.tokens.access_token)).authenticated).toBe(false);
-      });
-    });
-
-    describe("the organization deadline, by the database's clock", () => {
-      it("refuses a rotation whose caller clock is behind a deadline the database has passed", async () => {
-        const { human, tokens, connectionId } = await connect();
-        // The request read the state at `stale`; by the time its batch lands
-        // the deadline, between the two, has passed.
-        const stale = Date.now() - 10_000;
-        await h.exec(
-          "UPDATE organization SET expires_at = ? WHERE id = ?",
-          new Date(stale + 5_000).toISOString(),
-          human.organizationId,
-        );
-        const before = await snapshot(connectionId);
-        vi.spyOn(Date, "now").mockReturnValue(stale);
-        const result = await refresh(tokens.refresh_token);
-        vi.restoreAllMocks();
-
-        expect(result.body).toMatchObject({ error: "invalid_grant" });
-        expect(await snapshot(connectionId)).toEqual(before);
-      });
-
-      it("refuses an issuance prepared before a deadline the database has passed", async () => {
-        const human = await h.human();
-        const stale = Date.now() - 10_000;
-        await h.exec(
-          "UPDATE organization SET expires_at = ? WHERE id = ?",
-          new Date(stale + 5_000).toISOString(),
-          human.organizationId,
-        );
-        await expect(
-          h.cfAuth.oauth.createConnection({
-            userId: human.userId,
-            organizationId: human.organizationId,
-            clientId,
-            clientName,
-            resource: issuer,
-            grant: "manage",
-            now: stale,
-          }),
-        ).rejects.toMatchObject({ code: "connection_refused" });
-        expect(await h.exec("SELECT id FROM api_key WHERE organization_id = ?", human.organizationId)).toHaveLength(0);
       });
     });
 
@@ -1416,6 +1358,7 @@ describe("OAuth configuration", () => {
     expect(resolveConfig({ ...base, oauth: { enabled: false, issuer: "nonsense" } }).oauth).toBeNull();
     expect(resolve({}).oauth).toEqual({
       issuer,
+      issuerPath: "",
       resourcePaths: ["/mcp"],
       resources: [issuer, `${issuer}/mcp`],
       accessTokenTtlMs: 600_000,
@@ -1424,6 +1367,8 @@ describe("OAuth configuration", () => {
       authorizationTtlMs: 600_000,
       tokenPrefix,
       clients: [],
+      cliClientId: null,
+      deviceFlow: null,
       cimd: { fetch: null, allowUrl: null },
     });
     expect(resolve({ issuer: "http://127.0.0.1:8787", cimd: false }).oauth).toMatchObject({
@@ -1449,13 +1394,16 @@ describe("OAuth configuration", () => {
     expect(() => resolve({}, { db: {} as CfAuthDatabase })).toThrow(/batches atomically/);
   });
 
-  it("refuses an issuer that is not an https origin, or http on loopback", () => {
+  it("refuses an issuer that is not an https origin with an optional path, or http on loopback", () => {
     for (const bad of [
       "",
       "console.example.com",
       "http://console.example.com",
       "https://console.example.com/",
-      "https://console.example.com/mcp",
+      "https://console.example.com/v2/",
+      "https://console.example.com/v2?x=1",
+      "https://console.example.com/v2#x",
+      "https://console.example.com/a/../v2",
       "https://console.example.com?x=1",
       "https://user@console.example.com",
       "https://Console.example.com",
@@ -1488,6 +1436,12 @@ describe("OAuth configuration", () => {
       expect(resolve({ issuer: good }).oauth?.issuer, good).toBe(good);
     }
     expect(() => resolveConfig({ ...base, oauth: { enabled: true, tokenPrefix } })).toThrow(/oauth\.issuer/);
+    // A path names the issuer and the resources under it.
+    expect(resolve({ issuer: "https://console.example.com/v2" }).oauth).toMatchObject({
+      issuer: "https://console.example.com/v2",
+      issuerPath: "/v2",
+      resources: ["https://console.example.com/v2", "https://console.example.com/v2/mcp"],
+    });
   });
 
   it("refuses token prefixes that are missing, equal, or could collide with API keys", () => {

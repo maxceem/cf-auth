@@ -20,14 +20,16 @@ export {
   type EmailVerificationConfig,
   type GoogleOAuthConfig,
   type InvitationsConfig,
-  type LoginOperationConfig,
   type OAuthCimdConfig,
+  type OAuthCliClientConfig,
   type OAuthClientConfig,
   type OAuthConfig,
+  type OAuthDeviceFlowConfig,
   type OAuthProxyConfig,
   type OperationsConfig,
   type OrganizationsConfig,
   type ResolvedCfAuthConfig,
+  type ResolvedOAuthClient,
   type ResolvedOAuthConfig,
   type ResolvedOperationsConfig,
   type UserHooksConfig,
@@ -54,7 +56,6 @@ export {
   invitationStates,
   isApiKeyActionSource,
   isCredentialGrant,
-  isOrganizationExpired,
   oauthActionSources,
   operationStates,
   organizationMemberStatuses,
@@ -102,7 +103,6 @@ export {
   operationMismatch,
   operationNotFound,
   operationPending,
-  organizationExpired,
   sessionRequired,
   tooManyPending,
   unauthorized,
@@ -133,14 +133,12 @@ export {
   toOAuthAuthState,
   toSessionAuthState,
   type CfAuthService,
-  type ClaimOrganizationInput,
   type IssueIdentityApiKeyInput,
 } from "./service.js";
 
 export {
   createCfAuthRepository,
   type CfAuthRepository,
-  type ClaimOrganizationWrite,
   type CfAuthRepositoryOptions,
   type EnsureDefaultOrganizationResult,
   type MembershipMutationResult,
@@ -190,13 +188,6 @@ export {
 } from "./operations.js";
 
 export {
-  loginOperationKindName,
-  type LoginOperationOutcome,
-  type LoginOperationPayload,
-  type LoginOperationRecord,
-} from "./login-operation.js";
-
-export {
   createOAuthService,
   oauthRefreshGraceMs,
   oauthRotationIntervalMs,
@@ -211,19 +202,26 @@ export {
   type OAuthTokenResult,
 } from "./oauth/service.js";
 export {
+  deviceCodeGrantType,
   oauthEndpointPaths,
   oauthScopes,
   type ApproveAuthorizationInput,
-  type ApproveGuestAuthorizationInput,
   type AuthorizationServerMetadata,
   type OAuthAuthorizationDetails,
   type OAuthAuthorizeErrorPage,
   type OAuthAuthorizeResult,
   type OAuthClientIdentity,
-  type OAuthGuestProvision,
-  type OAuthGuestProvisionContext,
+  type OAuthRoutePaths,
   type ProtectedResourceMetadata,
 } from "./oauth/authorization.js";
+export {
+  oauthDevicePollToleranceMs,
+  type ApproveDeviceInput,
+  type OAuthDeviceAuthorizationResponse,
+  type OAuthDeviceAuthorizationResult,
+  type OAuthDeviceDetails,
+  type OAuthDeviceErrorCode,
+} from "./oauth/device.js";
 export {
   cimdFetchTimeoutMs,
   cimdMaxClientNameLength,

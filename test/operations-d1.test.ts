@@ -12,6 +12,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { createOperationToken } from "../src/crypto.js";
 import { guardedInsert } from "../src/guarded-insert.js";
 import { defineOperationKind, type ExecuteOperationFunction } from "../src/operations.js";
+import { loginKind } from "./fixtures/login-kind.js";
 import { createD1TestAuth, holdReveal, type D1TestAuth } from "./helpers.js";
 
 const bootstrap = defineOperationKind({
@@ -46,26 +47,6 @@ const windowedGrant = defineOperationKind({
   approverMinRole: "admin",
   deliver: "window",
   approve: () => ({ outcome: { secret: "s" }, seal: true }),
-});
-
-const claim = defineOperationKind({
-  name: "claim",
-  open: { minRole: "owner" },
-  browser: true,
-  approverMinRole: null,
-  approve: ({ actor, organizationId, operation, guard }) => ({
-    outcome: { claimed: organizationId },
-    ...harness.cfAuth.service.claimOrganizationStatements({
-      actor: actor!,
-      organizationId: organizationId!,
-      provisioning: {
-        userId: operation.openerUserId!,
-        credentialId: operation.openerCredentialId!,
-        revokeAccess: false,
-      },
-      condition: guard,
-    }),
-  }),
 });
 
 const reservedWrite = defineOperationKind({
@@ -119,7 +100,7 @@ let harness: D1TestAuth;
 
 beforeAll(async () => {
   harness = await createD1TestAuth({
-    operations: { enabled: true, realm: "d1-test", kinds: [bootstrap, grant, secretEntry, windowedGrant, claim, reservedWrite, keyIssue, approveWrites] },
+    operations: { enabled: true, realm: "d1-test", kinds: [loginKind, bootstrap, grant, secretEntry, windowedGrant, reservedWrite, keyIssue, approveWrites] },
   });
   await harness.execute("CREATE TABLE side_effect (id TEXT PRIMARY KEY)");
 }, 60_000);
@@ -129,7 +110,7 @@ afterAll(async () => {
 });
 
 describe("operations on D1", () => {
-  it("approves a login, writing its key in the completion batch, and redeems it", async () => {
+  it("approves a login, writing its key in the completion batch, and hands it over once", async () => {
     const { operations, service } = harness.cfAuth;
     const human = await harness.sessions.human();
     const actor = await harness.actorFor(human.userId);
@@ -137,28 +118,27 @@ describe("operations on D1", () => {
     const view = await operations.open({
       kind: "login",
       token,
-      client: { label: "CLI on d1", loopbackRedirect: "http://127.0.0.1:40123/callback" },
+      client: { label: "CLI on d1" },
     });
 
     const details = await operations.details({ id: view.id, proof: view.browserProof!, viewer: actor });
     expect(details.userCode).toBe(view.userCode);
 
-    const approval = await operations.approve({
+    await operations.approve({
       id: view.id,
       proof: view.browserProof!,
       actor,
       organizationId: human.organizationId,
     });
-    expect(await operations.poll({ id: view.id, token })).toMatchObject({ state: "completed", collect: "redeem" });
 
-    const { outcome } = await operations.redeem({ id: view.id, token, redeemCode: approval.redeemCode! });
+    const { outcome } = await operations.poll({ id: view.id, token });
     const key = (outcome as { credential: { token: string } }).credential.token;
     const state = await service.resolveApiKeyAuthState(key, "cli");
     expect(state).toMatchObject({ authenticated: true, source: "cli" });
     expect(state.organization?.id).toBe(human.organizationId);
-    await expect(
-      operations.redeem({ id: view.id, token, redeemCode: approval.redeemCode! }),
-    ).rejects.toMatchObject({ code: "already_completed" });
+    const again = await operations.poll({ id: view.id, token });
+    expect(again).toMatchObject({ state: "completed", collect: null });
+    expect(again).not.toHaveProperty("outcome");
   });
 
   it("shows the organization an operation acts in, and approves it with an admin session", async () => {
@@ -169,7 +149,7 @@ describe("operations on D1", () => {
     const opened = await operations.open({ kind: "grant", token, payload: { note: "n" }, opener: actor });
 
     const details = await operations.details({ id: opened.id, proof: opened.browserProof! });
-    expect(details.organization).toMatchObject({ id: human.organizationId, claimed: true });
+    expect(details.organization).toMatchObject({ id: human.organizationId });
 
     await operations.approve({ id: opened.id, proof: opened.browserProof!, actor });
     expect((await operations.poll({ id: opened.id, token })).record).toEqual({ granted: "n" });
@@ -244,47 +224,17 @@ describe("operations on D1", () => {
     const human = await harness.sessions.human();
     const actor = await harness.actorFor(human.userId);
 
-    for (const loopbackRedirect of [undefined, "http://127.0.0.1:40124/callback"]) {
-      const token = createOperationToken();
-      const view = await operations.open({
-        kind: "login",
-        token,
-        client: { label: "CLI on d1", ...(loopbackRedirect ? { loopbackRedirect } : {}) },
-      });
-      const approval = await operations.approve({
-        id: view.id,
-        proof: view.browserProof!,
-        actor,
-        organizationId: human.organizationId,
-      });
-      const { apiKeyId } = (await operations.findByToken({ token }))!.record as { apiKeyId: string };
-      await service.revokeApiKey({ organizationId: human.organizationId, actor, apiKeyId });
-      const collecting = loopbackRedirect
-        ? operations.redeem({ id: view.id, token, redeemCode: approval.redeemCode! })
-        : operations.poll({ id: view.id, token });
-      await expect(collecting).rejects.toMatchObject({ code: "operation_expired" });
-    }
-  });
-
-  it("claims an organization in the batch that completes the operation", async () => {
-    const { operations, service } = harness.cfAuth;
-    const identity = await service.createServiceIdentity({ name: "CLI service" });
-    const { organization } = await service.createOrganization(identity.id, "Unclaimed");
-    await harness.execute(
-      "UPDATE organization SET expires_at = ? WHERE id = ?",
-      new Date(Date.now() + 86_400_000).toISOString(),
-      organization.id,
-    );
-    const key = await service.issueServiceApiKey({ userId: identity.id, organizationId: organization.id, name: "b" });
-    const opener = await service.resolveApiKeyAuthState(key.plaintext, "cli");
     const token = createOperationToken();
-    const opened = await operations.open({ kind: "claim", token, opener });
-    const claimer = await harness.sessions.human();
-
-    await operations.approve({ id: opened.id, proof: opened.browserProof!, actor: await harness.actorFor(claimer.userId) });
-    expect((await service.getIdentity(claimer.userId))?.kind).toBe("human");
-    expect((await harness.cfAuth.repository.findMembership(claimer.userId, organization.id))?.role).toBe("owner");
-    expect((await harness.cfAuth.repository.findOrganization(organization.id))?.expiresAt).toBeNull();
+    const view = await operations.open({ kind: "login", token, client: { label: "CLI on d1" } });
+    await operations.approve({
+      id: view.id,
+      proof: view.browserProof!,
+      actor,
+      organizationId: human.organizationId,
+    });
+    const { apiKeyId } = (await operations.findByToken({ token }))!.record as { apiKeyId: string };
+    await service.revokeApiKey({ organizationId: human.organizationId, actor, apiKeyId });
+    await expect(operations.poll({ id: view.id, token })).rejects.toMatchObject({ code: "operation_expired" });
   });
 
   it("reserves, executes once in a guarded batch, replays, reveals once and shows its status", async () => {
@@ -473,7 +423,7 @@ describe("operations on D1", () => {
     ]);
   });
 
-  it("reveals on the person's authority, judged with deliverability and the deadline in the consuming write", async () => {
+  it("reveals on the person's authority, judged with deliverability and the seal's deadline in the consuming write", async () => {
     const { operations, service } = harness.cfAuth;
     const owner = await harness.sessions.human();
     const ownerActor = await harness.actorFor(owner.userId);
@@ -621,30 +571,6 @@ describe("operations on D1", () => {
     await expect(operations.reveal({ id: plain.id, actor })).rejects.toMatchObject({ code: "already_revealed" });
   });
 
-  it("reveals in an organization whose deadline, ISO text with fractional seconds, is still ahead", async () => {
-    const { operations } = harness.cfAuth;
-    const owner = await harness.sessions.human();
-    const actor = await harness.actorFor(owner.userId);
-    const reserved = await operations.reserve({ kind: "key.issue", opener: actor });
-    await operations.execute({ handle: reserved.handle, kind: "key.issue", opener: actor }, () => ({
-      outcome: { key: "before-the-deadline" },
-      record: { keyId: reserved.id },
-    }));
-    const deadline = new Date(Math.floor(Date.now() / 1_000) * 1_000 + 120_456);
-    const iso = deadline.toISOString();
-    expect(iso).toMatch(/\.456Z$/);
-    await harness.execute("UPDATE organization SET expires_at = ? WHERE id = ?", iso, owner.organizationId);
-    expect(
-      await harness.execute(
-        "SELECT cast(unixepoch(expires_at, 'subsec') * 1000 as integer) AS ms FROM organization WHERE id = ?",
-        owner.organizationId,
-      ),
-    ).toEqual([{ ms: deadline.getTime() }]);
-    expect(await operations.reveal({ id: reserved.id, actor })).toMatchObject({
-      outcome: { key: "before-the-deadline" },
-    });
-  });
-
   describe("reveal with something changing between reading the outcome and taking it", () => {
     const raced = async (
       at: "decrypt" | "update",
@@ -703,18 +629,6 @@ describe("operations on D1", () => {
           );
         });
         await expect(revealing).rejects.toMatchObject({ code: "conflict" });
-        expect((await stored()).sealed_outcome).not.toBeNull();
-      });
-
-      it("refuses once the organization's deadline passed meanwhile", async () => {
-        const { revealing, stored } = await raced(at, async ({ organizationId }) => {
-          await harness.execute(
-            "UPDATE organization SET expires_at = ? WHERE id = ?",
-            new Date(Date.now() - 1_000).toISOString(),
-            organizationId,
-          );
-        });
-        await expect(revealing).rejects.toMatchObject({ code: "organization_expired" });
         expect((await stored()).sealed_outcome).not.toBeNull();
       });
 

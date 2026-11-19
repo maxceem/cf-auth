@@ -163,10 +163,6 @@ describe("credential grants", () => {
       service.revokeApiKey({ actor: state, organizationId, apiKeyId: key.id }),
       "grant_insufficient",
     );
-    await expectCode(service.claimOrganization({ actor: state, organizationId }), "grant_insufficient");
-    expect(() => service.claimOrganizationStatements({ actor: state, organizationId })).toThrow(
-      expect.objectContaining({ code: "grant_insufficient", status: 403 }),
-    );
 
     // Nothing changed: still one member, one live key.
     expect((await service.listOrganizationMembers({ actor: state, organizationId })).length).toBe(1);
@@ -202,35 +198,6 @@ describe("credential grants", () => {
       }),
       "forbidden",
     );
-  });
-
-  it("put the organization binding before the grant in a claim", async () => {
-    const harness = await createTestAuth();
-    const { state: reader } = await ownerWithKey(harness, "read");
-    const { state: manager } = await ownerWithKey(harness, "manage");
-    const elsewhere = await harness.sessions.human();
-    const organizationId = elsewhere.organizationId;
-
-    for (const actor of [reader, manager]) {
-      await expectCode(harness.cfAuth.service.claimOrganization({ actor, organizationId }), "forbidden");
-      expect(() => harness.cfAuth.service.claimOrganizationStatements({ actor, organizationId })).toThrow(
-        expect.objectContaining({ code: "forbidden", status: 403 }),
-      );
-    }
-  });
-
-  it("put the grant before the session requirement of a claim", async () => {
-    const harness = await createTestAuth();
-    const { owner, state } = await ownerWithKey(harness, "manage");
-
-    // A manage key in its own organization has the grant, so what it lacks is a session.
-    await expectCode(
-      harness.cfAuth.service.claimOrganization({ actor: state, organizationId: owner.organizationId }),
-      "session_required",
-    );
-    expect(() =>
-      harness.cfAuth.service.claimOrganizationStatements({ actor: state, organizationId: owner.organizationId }),
-    ).toThrow(expect.objectContaining({ code: "session_required" }));
   });
 
   it("bound what a credential may issue", async () => {
