@@ -239,6 +239,8 @@ export const createOAuthDeviceKind = (
 /** 32 bytes, base64url: what `deviceAuthorization` makes. Anything else is unknown without a lookup. */
 const deviceCodePattern = /^[A-Za-z0-9_-]{43}$/;
 const maxClientIdLength = 2048;
+/** How many device codes `deviceAuthorization` tries when a user code collides with a pending one. */
+const deviceOpenAttempts = 3;
 
 /** The operation id of the device authorization a device code belongs to: the code's digest. */
 const operationIdForDeviceCode = async (deviceCode: string) => `oauth-device-${await sha256Hex(deviceCode)}`;
@@ -471,29 +473,36 @@ export const createOAuthDevice = (deps: {
         return deviceFail(400, "invalid_target", "resource must be the issuer or one of its resource paths");
       }
 
-      const deviceCode = randomToken(32);
-      const id = await operationIdForDeviceCode(deviceCode);
       const payload: OAuthDevicePayload = {
         client: { id: registered.clientId, name: registered.name, domain: null, source: "registered" },
         requestedGrant: scope,
         resource: oauth.issuer,
       };
-      let userCode: string | null;
-      try {
-        const view = await engine().open({
-          kind: oauthDeviceKindName,
-          token: deviceCode,
-          id,
-          payload,
-          rateLimitKey,
-          client: { label: registered.name },
-        });
-        userCode = view.userCode;
-      } catch (error) {
-        if (isCode(error, "too_many_pending")) {
-          return deviceFail(429, "slow_down", "Too many device authorizations are waiting from this address");
+      // A user code is derived from the device code, and two pending ones may
+      // not share it. A new device code gives a new user code, so a collision
+      // is retried with a fresh one, a few times.
+      let deviceCode = "";
+      let userCode: string | null = null;
+      for (let attempt = 1; ; attempt += 1) {
+        deviceCode = randomToken(32);
+        try {
+          const view = await engine().open({
+            kind: oauthDeviceKindName,
+            token: deviceCode,
+            id: await operationIdForDeviceCode(deviceCode),
+            payload,
+            rateLimitKey,
+            client: { label: registered.name },
+          });
+          userCode = view.userCode;
+          break;
+        } catch (error) {
+          if (isCode(error, "too_many_pending")) {
+            return deviceFail(429, "slow_down", "Too many device authorizations are waiting from this address");
+          }
+          if (isCode(error, "conflict") && attempt < deviceOpenAttempts) continue;
+          throw error;
         }
-        throw error;
       }
       if (!userCode) throw new Error("cf-auth: a device authorization opened without a user code");
       const complete = new URL(device.verificationUri);

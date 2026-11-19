@@ -6,8 +6,9 @@
  * The device flow writes in batches, so it runs on libsql and on a real D1
  * (Miniflare, on workerd), as the authorization-code flow does.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createCfAuth, type CfAuth } from "../src/cf-auth.js";
+import { defineOperationKind } from "../src/operations.js";
 import { resolveConfig, type CfAuthConfig, type CfAuthDatabase, type OAuthConfig } from "../src/config.js";
 import type { OAuthDeviceAuthorizationResponse } from "../src/oauth/device.js";
 import type { OAuthTokenResponse, OAuthTokenResult } from "../src/oauth/service.js";
@@ -369,6 +370,37 @@ describe("the device flow's edges", () => {
     await t.client.execute("UPDATE operation SET updated_at = updated_at - 1000");
     expect((await poll()).body).toMatchObject({ error: "authorization_pending" });
     expect((await poll()).body).toMatchObject({ error: "slow_down" });
+  });
+
+  it("tries a fresh device code when the first one's user code is taken", async () => {
+    const codePage = defineOperationKind({ name: "code.page", open: "public", browser: true, userCode: true });
+    const t = await createTestAuth({
+      ...oauthOptions(),
+      operations: { ...oauthOptions().operations, kinds: [codePage] },
+    });
+    // A pending operation already holds the token, and so the user code, the
+    // first device code will be.
+    const taken = new Uint8Array(32).fill(7);
+    const takenToken = btoa(String.fromCharCode(...taken)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    await t.cfAuth.operations.open({ kind: "code.page", token: takenToken });
+    const random = crypto.getRandomValues.bind(crypto);
+    let handedOut = false;
+    vi.spyOn(crypto, "getRandomValues").mockImplementation(<T extends ArrayBufferView | null>(array: T): T => {
+      if (!handedOut && array instanceof Uint8Array && array.length === 32) {
+        handedOut = true;
+        array.set(taken);
+        return array;
+      }
+      return random(array as never) as T;
+    });
+    const asked = await t.cfAuth.oauth.deviceAuthorization({
+      body: new URLSearchParams({ client_id: cli.clientId }),
+      rateLimitKey: null,
+    });
+    vi.restoreAllMocks();
+    expect(handedOut).toBe(true);
+    expect(asked.status).toBe(200);
+    expect((asked.body as OAuthDeviceAuthorizationResponse).device_code).not.toBe(takenToken);
   });
 
   it("keeps another issuer sharing the database out of a device authorization", async () => {

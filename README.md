@@ -265,8 +265,8 @@ accounts. Management keys, reservations and reveals are unchanged.
   was never claimed (it still has a deadline and no human owner, expired or
   not), with its memberships, keys, OAuth connections, operations and
   invitations. Without the deadline, those accounts' keys would sign in
-  again. The service identities that provisioned them stay, with no
-  organization and no key, so they cannot sign in. Then it drops
+  again. Service identities stay: the migration removes their memberships
+  and keys in the deleted organizations only. Then it drops
   `organization.expires_at`, `operation.loopback_redirect` and
   `operation.redeem_code_hash`. If your own tables reference `organization`
   without `ON DELETE CASCADE`, remove your rows for those organizations
