@@ -449,6 +449,81 @@ describe("the device flow's edges", () => {
   });
 });
 
+describe("two issuers sharing one database, in the authorization-code flow", () => {
+  const root = "https://api.example.com";
+  const setup = async () => {
+    const t = await createTestAuth(oauthOptions());
+    // The root issuer also accepts `/v2` as a resource of its own.
+    const rootAuth = createCfAuth({
+      appName: "Test App",
+      secret: testSecret,
+      baseUrl: testBaseUrl,
+      apiKeys: { enabled: true },
+      ...oauthOptions({ issuer: root, resourcePaths: ["/mcp", "/v2"] }),
+      db: t.db,
+    }).oauth;
+    const verifier = "v".repeat(43);
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
+    const challenge = btoa(String.fromCharCode(...digest)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const redirectUri = "http://127.0.0.1:54321/callback";
+    const opened = await t.cfAuth.oauth.authorize({
+      query: new URLSearchParams({
+        response_type: "code",
+        client_id: cli.clientId,
+        redirect_uri: redirectUri,
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        resource: issuer,
+      }),
+      rateLimitKey: null,
+    });
+    if (!("consent" in opened)) throw new Error(JSON.stringify(opened));
+    const person = await t.sessions.human();
+    const actor = await t.actorFor(person.userId, person.organizationId);
+    return { t, rootAuth, consent: opened.consent, verifier, redirectUri, person, actor };
+  };
+
+  it("keeps the other issuer's consent page from approving or denying", async () => {
+    const { t, rootAuth, consent, person, actor } = await setup();
+    await expectCode(
+      rootAuth.approveAuthorization({ ...consent, actor, organizationId: person.organizationId, grant: "manage" }),
+      "operation_not_found",
+    );
+    await expectCode(rootAuth.denyAuthorization(consent), "operation_not_found");
+    const [row] = (await t.client.execute({ sql: "SELECT state FROM operation WHERE id = ?", args: [consent.id] })).rows;
+    expect(row).toMatchObject({ state: "pending" });
+  });
+
+  it("refuses a code at the other issuer even with no resource named", async () => {
+    const { t, rootAuth, consent, verifier, redirectUri, person, actor } = await setup();
+    const { redirect } = await t.cfAuth.oauth.approveAuthorization({
+      ...consent,
+      actor,
+      organizationId: person.organizationId,
+      grant: "manage",
+    });
+    const code = new URL(redirect).searchParams.get("code")!;
+    const exchange = (oauth: CfAuth["oauth"]) =>
+      oauth.token({
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: redirectUri,
+          client_id: cli.clientId,
+          code_verifier: verifier,
+        }),
+      });
+    expect((await exchange(rootAuth)).body).toMatchObject({ error: "invalid_grant" });
+    const connections = await t.client.execute({
+      sql: "SELECT 1 FROM api_key WHERE organization_id = ? AND credential_type = 'oauth'",
+      args: [person.organizationId],
+    });
+    expect(connections.rows).toHaveLength(0);
+    // Its own issuer still exchanges it.
+    expect((await exchange(t.cfAuth.oauth)).status).toBe(200);
+  });
+});
+
 describe("the command-line tool as a client, and an issuer on a path", () => {
   it("signs the tool in with a loopback redirect on any port, on 127.0.0.1 or [::1] only", async () => {
     const t = await createTestAuth(oauthOptions());

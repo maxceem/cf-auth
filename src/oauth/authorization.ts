@@ -452,11 +452,12 @@ export const createOAuthAuthorization = (deps: {
    * invalid_proof` for a wrong proof.
    */
   const loadForBrowser = async (id: string, proof: string, viewer: AuthState | null = null) => {
-    settings();
+    const oauth = settings();
+    // One another issuer sharing the database opened is not this consent page's.
+    const authorization = await readAuthorization(id);
+    if (!authorization || authorization.payload.resource !== oauth.issuer) throw operationNotFound();
     const details = await engine().details({ id, proof, viewer });
     if (details.kind !== oauthAuthorizeKindName) throw operationNotFound();
-    const authorization = await readAuthorization(id);
-    if (!authorization) throw operationNotFound();
     return { details, ...authorization };
   };
 
@@ -782,6 +783,9 @@ export const createOAuthAuthorization = (deps: {
       const found = await readAuthorization(id);
       if (!found || found.state !== "completed" || !found.record) return unknown();
       const record = found.record;
+      // Issued by this issuer: another one sharing the database neither
+      // exchanges nor revokes through it, whatever `resource` says.
+      if (record.resource !== oauth.issuer) return unknown();
 
       // The client, the redirect and the verifier must be the authorization's;
       // a mismatch is refused and changes nothing, so the code alone ends nothing.
