@@ -161,6 +161,8 @@ describe("the 1.0 migration", () => {
           ],
           "write",
         );
+        // A service identity not given an organization yet.
+        const unplaced = await service.createServiceIdentity({ name: "Not placed yet" });
         // Before 1.0, only the deadline kept the expired account's key out.
         expect((await service.resolveApiKeyAuthState(waiting.key.plaintext, "cli")).authenticated).toBe(true);
 
@@ -172,11 +174,16 @@ describe("the 1.0 migration", () => {
             ["organization", "id", gone.organizationId],
             ["organization_user", "organization_id", gone.organizationId],
             ["api_key", "organization_id", gone.organizationId],
-            ["user", "id", gone.identityId],
           ] as const) {
             const rows = await client.execute({ sql: `SELECT 1 FROM "${table}" WHERE ${column} = ?`, args: [value] });
             expect(rows.rows, `${table} of ${gone.organizationId}`).toHaveLength(0);
           }
+        }
+        // Service identities stay: one left with no organization and no key can do nothing.
+        for (const kept of [expired.identityId, waiting.identityId, unplaced.id]) {
+          expect(await service.getIdentity(kept), kept).toMatchObject({ kind: "service" });
+          const keys = await client.execute({ sql: "SELECT 1 FROM api_key WHERE user_id = ?", args: [kept] });
+          expect(keys.rows, kept).toHaveLength(0);
         }
         expect((await service.resolveApiKeyAuthState(claimed.key.plaintext, "cli")).authenticated).toBe(true);
         expect(await cfAuth.repository.findMembership(person.userId, claimed.organizationId)).toMatchObject({ role: "owner" });

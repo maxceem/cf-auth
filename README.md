@@ -264,8 +264,9 @@ accounts. Management keys, reservations and reveals are unchanged.
 - **Apply `0007_cf_auth_1_0.sql`.** First it deletes every organization that
   was never claimed (it still has a deadline and no human owner, expired or
   not), with its memberships, keys, OAuth connections, operations and
-  invitations, and the service identities left in no organization. Without
-  the deadline, those accounts' keys would sign in again. Then it drops
+  invitations. Without the deadline, those accounts' keys would sign in
+  again. The service identities that provisioned them stay, with no
+  organization and no key, so they cannot sign in. Then it drops
   `organization.expires_at`, `operation.loopback_redirect` and
   `operation.redeem_code_hash`. If your own tables reference `organization`
   without `ON DELETE CASCADE`, remove your rows for those organizations
