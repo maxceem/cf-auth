@@ -1,3 +1,21 @@
+-- cf-auth 1.0 drops unclaimed accounts. An organization still waiting to be
+-- claimed (it has a deadline and no human owner) is removed with everything
+-- that belongs to it, before its deadline column goes: without the deadline,
+-- its keys would sign in again. Children are deleted explicitly, in order,
+-- so nothing is left behind whether or not foreign keys are enforced.
+DELETE FROM `oauth_token` WHERE `api_key_id` IN (SELECT `id` FROM `api_key` WHERE `organization_id` IN (SELECT `o`.`id` FROM `organization` AS `o` WHERE `o`.`expires_at` IS NOT NULL AND NOT EXISTS (SELECT 1 FROM `organization_user` AS `m` JOIN `user` AS `u` ON `u`.`id` = `m`.`user_id` WHERE `m`.`organization_id` = `o`.`id` AND `m`.`role` = 'owner' AND `u`.`kind` = 'human')));--> statement-breakpoint
+DELETE FROM `api_key` WHERE `organization_id` IN (SELECT `o`.`id` FROM `organization` AS `o` WHERE `o`.`expires_at` IS NOT NULL AND NOT EXISTS (SELECT 1 FROM `organization_user` AS `m` JOIN `user` AS `u` ON `u`.`id` = `m`.`user_id` WHERE `m`.`organization_id` = `o`.`id` AND `m`.`role` = 'owner' AND `u`.`kind` = 'human'));--> statement-breakpoint
+DELETE FROM `operation` WHERE `organization_id` IN (SELECT `o`.`id` FROM `organization` AS `o` WHERE `o`.`expires_at` IS NOT NULL AND NOT EXISTS (SELECT 1 FROM `organization_user` AS `m` JOIN `user` AS `u` ON `u`.`id` = `m`.`user_id` WHERE `m`.`organization_id` = `o`.`id` AND `m`.`role` = 'owner' AND `u`.`kind` = 'human'));--> statement-breakpoint
+DELETE FROM `organization_invitation` WHERE `organization_id` IN (SELECT `o`.`id` FROM `organization` AS `o` WHERE `o`.`expires_at` IS NOT NULL AND NOT EXISTS (SELECT 1 FROM `organization_user` AS `m` JOIN `user` AS `u` ON `u`.`id` = `m`.`user_id` WHERE `m`.`organization_id` = `o`.`id` AND `m`.`role` = 'owner' AND `u`.`kind` = 'human'));--> statement-breakpoint
+DELETE FROM `organization_user` WHERE `organization_id` IN (SELECT `o`.`id` FROM `organization` AS `o` WHERE `o`.`expires_at` IS NOT NULL AND NOT EXISTS (SELECT 1 FROM `organization_user` AS `m` JOIN `user` AS `u` ON `u`.`id` = `m`.`user_id` WHERE `m`.`organization_id` = `o`.`id` AND `m`.`role` = 'owner' AND `u`.`kind` = 'human'));--> statement-breakpoint
+DELETE FROM `organization` WHERE `expires_at` IS NOT NULL AND NOT EXISTS (SELECT 1 FROM `organization_user` AS `m` JOIN `user` AS `u` ON `u`.`id` = `m`.`user_id` WHERE `m`.`organization_id` = `organization`.`id` AND `m`.`role` = 'owner' AND `u`.`kind` = 'human');--> statement-breakpoint
+-- The service identities that provisioned them, now in no organization and
+-- the creator of none, go too, with their keys and operations.
+DELETE FROM `oauth_token` WHERE `api_key_id` IN (SELECT `id` FROM `api_key` WHERE `user_id` IN (SELECT `s`.`id` FROM `user` AS `s` WHERE `s`.`kind` = 'service' AND NOT EXISTS (SELECT 1 FROM `organization_user` WHERE `user_id` = `s`.`id`) AND NOT EXISTS (SELECT 1 FROM `organization` WHERE `created_by_user_id` = `s`.`id`)));--> statement-breakpoint
+DELETE FROM `api_key` WHERE `user_id` IN (SELECT `s`.`id` FROM `user` AS `s` WHERE `s`.`kind` = 'service' AND NOT EXISTS (SELECT 1 FROM `organization_user` WHERE `user_id` = `s`.`id`) AND NOT EXISTS (SELECT 1 FROM `organization` WHERE `created_by_user_id` = `s`.`id`));--> statement-breakpoint
+DELETE FROM `operation` WHERE `opener_user_id` IN (SELECT `s`.`id` FROM `user` AS `s` WHERE `s`.`kind` = 'service' AND NOT EXISTS (SELECT 1 FROM `organization_user` WHERE `user_id` = `s`.`id`) AND NOT EXISTS (SELECT 1 FROM `organization` WHERE `created_by_user_id` = `s`.`id`));--> statement-breakpoint
+UPDATE `operation` SET `decided_by_user_id` = NULL WHERE `decided_by_user_id` IN (SELECT `s`.`id` FROM `user` AS `s` WHERE `s`.`kind` = 'service' AND NOT EXISTS (SELECT 1 FROM `organization_user` WHERE `user_id` = `s`.`id`) AND NOT EXISTS (SELECT 1 FROM `organization` WHERE `created_by_user_id` = `s`.`id`));--> statement-breakpoint
+DELETE FROM `user` WHERE `kind` = 'service' AND NOT EXISTS (SELECT 1 FROM `organization_user` WHERE `user_id` = `user`.`id`) AND NOT EXISTS (SELECT 1 FROM `organization` WHERE `created_by_user_id` = `user`.`id`);--> statement-breakpoint
 ALTER TABLE `operation` DROP COLUMN `loopback_redirect`;--> statement-breakpoint
 ALTER TABLE `operation` DROP COLUMN `redeem_code_hash`;--> statement-breakpoint
 ALTER TABLE `organization` DROP COLUMN `expires_at`;

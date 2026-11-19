@@ -7,13 +7,13 @@
  * (Miniflare, on workerd), as the authorization-code flow does.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import type { CfAuth } from "../src/cf-auth.js";
+import { createCfAuth, type CfAuth } from "../src/cf-auth.js";
 import { resolveConfig, type CfAuthConfig, type CfAuthDatabase, type OAuthConfig } from "../src/config.js";
 import type { OAuthDeviceAuthorizationResponse } from "../src/oauth/device.js";
 import type { OAuthTokenResponse, OAuthTokenResult } from "../src/oauth/service.js";
 import type { TestHuman } from "../src/testing.js";
 import type { AuthState } from "../src/types.js";
-import { createD1TestAuth, createTestAuth } from "./helpers.js";
+import { createD1TestAuth, createTestAuth, testBaseUrl, testSecret } from "./helpers.js";
 
 const issuer = "https://api.example.com/v2";
 const tokenPrefix = { access: "agw_oat_", refresh: "agw_ort_" };
@@ -237,6 +237,18 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
       expect((await poll(late.device_code)).body).toMatchObject({ error: "expired_token" });
     });
 
+    it("keeps the deadline the device code was issued with when it is approved late (RFC 8628 §3.2)", async () => {
+      const person = await h.human();
+      const codes = await started();
+      const id = await remembered(codes.user_code);
+      // Approved a moment before its pending deadline.
+      const deadline = Date.now() + 5_000;
+      await h.exec("UPDATE operation SET expires_at = ? WHERE id = ?", deadline, id);
+      await approve(codes, person);
+      const [row] = await h.exec("SELECT outcome FROM operation WHERE id = ?", id);
+      expect(JSON.parse(String(row!.outcome)).codeExpiresAt).toBe(deadline);
+    });
+
     it("refuses an unknown device code, or one presented by another client, and changes nothing", async () => {
       const person = await h.human();
       const codes = await started();
@@ -340,6 +352,70 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
     });
   });
 }
+
+describe("the device flow's edges", () => {
+  it("still asks a client to slow down at the shortest interval", async () => {
+    const t = await createTestAuth(oauthOptions({ deviceFlow: { verificationUri, intervalSeconds: 1 } }));
+    const asked = await t.cfAuth.oauth.deviceAuthorization({
+      body: new URLSearchParams({ client_id: cli.clientId }),
+      rateLimitKey: null,
+    });
+    const codes = asked.body as OAuthDeviceAuthorizationResponse;
+    expect(codes.interval).toBe(1);
+    const poll = () =>
+      t.cfAuth.oauth.token({
+        body: new URLSearchParams({ grant_type: deviceGrant, device_code: codes.device_code, client_id: cli.clientId }),
+      });
+    await t.client.execute("UPDATE operation SET updated_at = updated_at - 1000");
+    expect((await poll()).body).toMatchObject({ error: "authorization_pending" });
+    expect((await poll()).body).toMatchObject({ error: "slow_down" });
+  });
+
+  it("keeps another issuer sharing the database out of a device authorization", async () => {
+    const t = await createTestAuth(oauthOptions());
+    const elsewhere = createCfAuth({
+      appName: "Test App",
+      secret: testSecret,
+      baseUrl: testBaseUrl,
+      apiKeys: { enabled: true },
+      ...oauthOptions({ issuer: "https://api.example.com/v3" }),
+      db: t.db,
+    }).oauth;
+    const asked = await t.cfAuth.oauth.deviceAuthorization({
+      body: new URLSearchParams({ client_id: cli.clientId }),
+      rateLimitKey: null,
+    });
+    const codes = asked.body as OAuthDeviceAuthorizationResponse;
+    const id = (await t.cfAuth.oauth.lookupDevice({ userCode: codes.user_code, rateLimit: noLimit }))!.id;
+    const poll = (oauth: CfAuth["oauth"]) =>
+      oauth.token({
+        body: new URLSearchParams({ grant_type: deviceGrant, device_code: codes.device_code, client_id: cli.clientId }),
+      });
+    const row = async () => (await t.client.execute({ sql: "SELECT updated_at, outcome FROM operation WHERE id = ?", args: [id] })).rows[0];
+
+    // The other issuer finds nothing, and touches nothing.
+    expect(await elsewhere.lookupDevice({ userCode: codes.user_code, rateLimit: noLimit })).toBeNull();
+    await expectCode(elsewhere.deviceDetails({ id, userCode: codes.user_code, viewer: null }), "operation_not_found");
+    await expectCode(elsewhere.denyDevice({ id, userCode: codes.user_code }), "operation_not_found");
+    await t.client.execute({ sql: "UPDATE operation SET updated_at = updated_at - 60000 WHERE id = ?", args: [id] });
+    const before = await row();
+    expect((await poll(elsewhere)).body).toMatchObject({ error: "invalid_grant" });
+    expect(await row()).toEqual(before);
+
+    // Approved and exchanged here, a replay at the other issuer revokes nothing.
+    const person = await t.sessions.human();
+    await t.cfAuth.oauth.approveDevice({
+      id,
+      userCode: codes.user_code,
+      actor: await t.actorFor(person.userId, person.organizationId),
+      organizationId: person.organizationId,
+      grant: "manage",
+    });
+    const tokens = ok(await poll(t.cfAuth.oauth));
+    expect((await poll(elsewhere)).body).toMatchObject({ error: "invalid_grant" });
+    expect((await t.cfAuth.oauth.resolveAccessTokenAuthState(tokens.access_token, { source: "api" })).authenticated).toBe(true);
+  });
+});
 
 describe("the command-line tool as a client, and an issuer on a path", () => {
   it("signs the tool in with a loopback redirect on any port, on 127.0.0.1 or [::1] only", async () => {

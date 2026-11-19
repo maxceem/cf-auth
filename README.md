@@ -261,9 +261,17 @@ Upgrading from 0.7.0: see [Upgrading to 0.8.0](#upgrading-to-080).
 1.0 replaces the custom CLI login with standard OAuth, and drops unclaimed
 accounts. Management keys, reservations and reveals are unchanged.
 
-- **Apply `0007_cf_auth_1_0.sql`**, which drops `organization.expires_at`,
-  `operation.loopback_redirect` and `operation.redeem_code_hash`, or
-  regenerate with drizzle-kit.
+- **Apply `0007_cf_auth_1_0.sql`.** First it deletes every organization that
+  was never claimed (it still has a deadline and no human owner, expired or
+  not), with its memberships, keys, OAuth connections, operations and
+  invitations, and the service identities left in no organization. Without
+  the deadline, those accounts' keys would sign in again. Then it drops
+  `organization.expires_at`, `operation.loopback_redirect` and
+  `operation.redeem_code_hash`. If your own tables reference `organization`
+  without `ON DELETE CASCADE`, remove your rows for those organizations
+  first. If you regenerate with drizzle-kit instead, it writes only the
+  three `DROP COLUMN` statements: copy the deletes from `0007` in front of
+  them.
 - **The built-in `login` operation is gone**, with `operations.login`,
   `LoginOperationConfig` and the `login*` exports. Sign a command-line tool
   in with `oauth.cli` and, without a browser, `oauth.deviceFlow`: see

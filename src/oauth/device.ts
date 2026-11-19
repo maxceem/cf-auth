@@ -53,7 +53,8 @@ export const oauthDeviceRecordTtlMs = 24 * 60 * 60_000;
 /**
  * How much earlier than `interval` a poll may come and still not be told to
  * slow down: a client that waits exactly `interval` between requests can
- * land a little early here because of network jitter.
+ * land a little early here because of network jitter. Never more than half
+ * the interval, so a short interval still means something.
  */
 export const oauthDevicePollToleranceMs = 1_000;
 
@@ -76,7 +77,10 @@ export interface OAuthDeviceRecord {
   requestedGrant: CredentialGrant;
   client: OAuthClientIdentity;
   resource: string;
-  /** Approval + `codeTtlMs`, epoch milliseconds: the device code is good until then. */
+  /**
+   * The device code's deadline, epoch milliseconds: when it was issued plus
+   * `codeTtlMs`. Approving does not extend it (RFC 8628 §3.2).
+   */
   codeExpiresAt: number;
   /** When the device code was exchanged, epoch milliseconds; null until it is. */
   exchangedAt: number | null;
@@ -213,7 +217,7 @@ export const createOAuthDeviceKind = (
       ? null
       : "no_eligible_organization";
   },
-  approve: ({ payload, input, user, organizationId, now }) => {
+  approve: ({ operation, payload, input, user, organizationId }) => {
     const device = payload as OAuthDevicePayload;
     const { grant } = input as { grant: CredentialGrant };
     const record: OAuthDeviceRecord = {
@@ -223,7 +227,8 @@ export const createOAuthDeviceKind = (
       requestedGrant: device.requestedGrant,
       client: device.client,
       resource: device.resource,
-      codeExpiresAt: now + oauth.deviceFlow.codeTtlMs,
+      // The deadline the code was issued with: approving late does not lengthen it.
+      codeExpiresAt: Date.parse(operation.expiresAt),
       exchangedAt: null,
       connectionId: null,
     };
@@ -283,14 +288,17 @@ export const createOAuthDevice = (deps: {
     };
   };
 
-  /** The device authorization a browser addresses with its id and user code. */
+  /**
+   * The device authorization a browser addresses with its id and user code.
+   * One issued by another issuer sharing the database is not found here.
+   */
   const loadForBrowser = async (id: string, userCode: string, viewer: AuthState | null = null) => {
-    deviceSettings();
+    const { oauth } = deviceSettings();
     if (typeof id !== "string" || typeof userCode !== "string") throw operationNotFound();
+    const device = await readDevice(id);
+    if (!device || device.payload.resource !== oauth.issuer) throw operationNotFound();
     const details = await engine().details({ id, userCode, viewer });
     if (details.kind !== oauthDeviceKindName) throw operationNotFound();
-    const device = await readDevice(id);
-    if (!device) throw operationNotFound();
     return { details, ...device };
   };
 
@@ -333,8 +341,8 @@ export const createOAuthDevice = (deps: {
     if (!deviceCodePattern.test(deviceCode)) return unknown();
     const id = await operationIdForDeviceCode(deviceCode);
     const found = await readDevice(id);
-    if (!found) return unknown();
-    // The client must be the one the code was issued to; a mismatch changes nothing.
+    // Issued by this issuer, and to this client; anything else changes nothing.
+    if (!found || found.payload.resource !== oauth.issuer) return unknown();
     if (!timingSafeEqual(params.get("client_id")!, found.payload.client.id)) return unknown();
 
     const now = Date.now();
@@ -342,7 +350,8 @@ export const createOAuthDevice = (deps: {
       // At most one poll per interval: the poll itself moves `updated_at`,
       // which only polls touch while the authorization is pending, so two
       // polls racing cannot both get through.
-      const earliest = new Date(now - (device.intervalSeconds * 1000 - oauthDevicePollToleranceMs));
+      const intervalMs = device.intervalSeconds * 1000;
+      const earliest = new Date(now - (intervalMs - Math.min(oauthDevicePollToleranceMs, intervalMs / 2)));
       const polled = await db
         .update(operation)
         .set({ updatedAt: new Date(now) })
@@ -512,12 +521,14 @@ export const createOAuthDevice = (deps: {
       userCode: string;
       rateLimit: () => Promise<void>;
     }): Promise<{ id: string; expiresAt: string } | null> {
-      deviceSettings();
+      const { oauth } = deviceSettings();
       if (typeof input?.rateLimit !== "function") throw validationError("rateLimit is required");
       await input.rateLimit();
       if (typeof input.userCode !== "string") return null;
       const found = await engine().lookupByUserCode({ userCode: input.userCode });
       if (!found || found.kind !== oauthDeviceKindName) return null;
+      // One another issuer sharing the database opened is not this page's.
+      if ((await readDevice(found.id))?.payload.resource !== oauth.issuer) return null;
       return { id: found.id, expiresAt: found.expiresAt };
     },
 

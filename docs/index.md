@@ -163,11 +163,13 @@ existing key at `manage`, `0003_cf_auth_operation_execution_claim.sql` adds
 columns of `api_key` (see [OAuth connections](#oauth-connections)), and
 `0005_cf_auth_organization_invitation.sql` adds the `organization_invitation`
 table (see [Invitations](#invitations)), `0006_cf_auth_member_last_active.sql`
-adds `organization_user.last_active_at`, and `0007_cf_auth_1_0.sql` drops
+adds `organization_user.last_active_at`, and `0007_cf_auth_1_0.sql` deletes
+every organization never claimed, with everything of it, then drops
 `organization.expires_at` and the `loopback_redirect` and `redeem_code_hash`
-columns of `operation`, which 1.0 no longer uses. Each is plain `CREATE`,
-`ALTER TABLE ... ADD` or `ALTER TABLE ... DROP COLUMN`; none rebuilds a
-table. Copy them in, in order. The package's own tests apply these exact files, so
+columns of `operation`, which 1.0 no longer uses (see
+[Upgrading to 1.0.0](../README.md#upgrading-to-100)). Each is plain `CREATE`,
+`ALTER TABLE ... ADD`, `DELETE` or `ALTER TABLE ... DROP COLUMN`; none
+rebuilds a table. Copy them in, in order. The package's own tests apply these exact files, so
 they cannot drift from the schema.
 
 **Upgrading from 0.7.0.** Apply `0002`, `0003` and `0004`, even with OAuth
@@ -1697,7 +1699,8 @@ cfAuth.oauth.denyDevice({ id, userCode, actor? }): Promise<{ state: "denied" }>;
    default `manage`) and `resource`, to `<issuer>/oauth/device_authorization`.
    It gets a device code, which it keeps, and a user code such as
    `KMXT-4R9Q`, which it shows beside `verification_uri`.
-   `verification_uri_complete` carries the code as `?user_code=`. An unknown
+   `verification_uri_complete` carries the code as `?user_code=`, for a link
+   or a QR code. An unknown
    client is `401 invalid_client`; a client not allowed the device flow,
    `unauthorized_client`; too many waiting from `rateLimitKey`, `429
    slow_down`. Send every answer with `Cache-Control: no-store`.
@@ -1706,17 +1709,26 @@ cfAuth.oauth.denyDevice({ id, userCode, actor? }): Promise<{ state: "denied" }>;
    matter) and your rate limit, then `deviceDetails` to show the client and
    the grant it asked for, then `approveDevice` with the account and grant the
    person picks, or `denyDevice`. The id from `lookupDevice` and the user code
-   travel together after that.
+   travel together after that. When the code arrived prefilled from
+   `verification_uri_complete`, the person did not type it, so it proves
+   nothing about which device they are holding: show the code on the page,
+   ask the person to check it matches the one their device shows, and approve
+   only once they confirm (RFC 8628 §3.3.1, §5.4). Someone could have sent
+   them a link for a device code of their own.
 3. Meanwhile the tool polls `<issuer>/oauth/token` with
    `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `device_code`
    and `client_id`, at most once every `interval` seconds (5 by default; a
-   poll up to 1 s early is still accepted). It is answered
+   poll up to 1 s early, or half the interval if that is shorter, is still
+   accepted). It is answered
    `authorization_pending` while the person has not answered, `slow_down`
    when it polls too soon, `access_denied` once they decline, and
    `expired_token` once the code has lapsed (10 minutes by default,
-   `codeTtlMs`). Once approved, the next poll issues the connection, once:
-   a device code presented again revokes the connection it issued, as a
-   replayed authorization code does.
+   `codeTtlMs`, counted from when it was issued: approving does not extend
+   it). Once approved, the next poll issues the connection, once: a device
+   code presented again revokes the connection it issued, as a replayed
+   authorization code does. That holds while the record is kept, a day by
+   default; once the operation sweep has deleted it, the same device code is
+   unknown and answers `invalid_grant` without revoking anything.
 
 **Guessing limits.** A user code is eight characters from a 31-letter
 alphabet, valid only while the request is pending, and unique among pending
@@ -1737,14 +1749,16 @@ signed in.
 A pending device authorization is an operation of the built-in internal kind
 `cf-auth:oauth.device`, registered while the device flow is on. It is public
 (counted toward `pendingPerOpener` under `rateLimitKey`), has a user code, is
-pending for `codeTtlMs` and is kept for a day. Its id is `oauth-device-` and
+pending for `codeTtlMs` and is kept for a day. It belongs to the issuer that
+opened it: another issuer sharing the database neither finds it by its code
+nor exchanges, polls or revokes through it. Its id is `oauth-device-` and
 the device code's SHA-256 (hex). Its completion record, kept in the clear,
 is:
 
 ```ts
 { userId; organizationId; grant; requestedGrant;
   client: { id, name, domain: null, source: "registered" }; resource;
-  codeExpiresAt: number;            // approval + codeTtlMs, epoch ms
+  codeExpiresAt: number;            // issued + codeTtlMs, epoch ms: approving does not extend it
   exchangedAt: number | null;       // set by the exchange
   connectionId: string | null }     // the connection the exchange issued
 ```
