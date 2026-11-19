@@ -59,13 +59,11 @@ import {
   operationMismatch,
   operationNotFound,
   operationPending,
-  organizationExpired,
   tooManyPending,
   unauthorized,
   validationError,
 } from "./errors.js";
 import { guardedInsert } from "./guarded-insert.js";
-import { createLoginOperationKind } from "./login-operation.js";
 import { requireOrganization } from "./middleware.js";
 import type { CfAuthRepository } from "./repository.js";
 import type { CfAuthTables } from "./schema.js";
@@ -74,7 +72,6 @@ import {
   createEmptyAuthState,
   hasGrantAtLeast,
   hasRoleAtLeast,
-  isOrganizationExpired,
   organizationRoles,
   type AuthState,
   type AuthUser,
@@ -122,7 +119,6 @@ export interface OperationRecord<Payload = unknown> {
   openerUserId: string | null;
   openerCredentialId: string | null;
   client: OperationClient;
-  hasLoopbackRedirect: boolean;
   payload: Payload;
   decidedByUserId: string | null;
   createdAt: string;
@@ -278,12 +274,11 @@ export interface OperationKindDefinition<Payload = unknown, Outcome = unknown, I
   approverMinRole?: OrganizationRole | null;
   /**
    * How a sealed outcome is handed over. `"once"` (default): to the first
-   * `poll` or `redeem` that asks, then dropped. `"window"`: to every one that
+   * `poll` that asks, then dropped. `"window"`: to every one that
    * asks until the seal expires, so a client whose response was lost can ask
    * again; the sweep drops it after. `"reveal"`: only through `reveal`, to a
    * person on a page — `poll`, `findByToken` and a retried `open` answer the
-   * record without it, `redeem` answers `409 already_completed`, and none of
-   * them consumes it. For a kind without a
+   * record without it, and none of them consumes it. For a kind without a
    * browser step; use it for every reservation kind whose outcome is a secret
    * the client must not see.
    *
@@ -293,8 +288,8 @@ export interface OperationKindDefinition<Payload = unknown, Outcome = unknown, I
   deliver?: "once" | "window" | "reveal";
   /**
    * A condition a sealed outcome must still meet to be handed over — that the
-   * credential it carries is still live, say. Checked by every `poll`,
-   * `redeem` and `reveal` that would release it (by `reveal` inside the very
+   * credential it carries is still live, say. Checked by every `poll` and
+   * `reveal` that would release it (by `reveal` inside the very
    * write that takes it); when it fails, that sealed outcome is dropped and
    * the answer is `410 operation_expired`. Return undefined to skip the check.
    */
@@ -349,8 +344,6 @@ export interface OpenOperationInput {
   client?: {
     label?: string | null;
     meta?: OperationClientMeta | null;
-    /** `http://127.0.0.1:<port>/<path>` (or `[::1]`), where the approval page sends the redeem code. */
-    loopbackRedirect?: string | null;
   };
 }
 
@@ -371,11 +364,11 @@ export interface OperationView {
   /** The sealed outcome, on an answer that hands it over. */
   outcome?: unknown;
   /**
-   * How a sealed outcome that is still held can be collected: by polling, or
-   * only by `redeem` when a loopback redirect was registered. Null when none is
-   * held — never sealed, already collected, or past its window.
+   * How a sealed outcome that is still held can be collected: by polling.
+   * Null when none is held — never sealed, already collected, or past its
+   * window.
    */
-  collect: "poll" | "redeem" | null;
+  collect: "poll" | null;
 }
 
 /** How a browser addresses an operation: the proof from the URL, or the code a person typed. */
@@ -402,7 +395,6 @@ export interface OperationDetails {
   takesInput: boolean;
   createdAt: string;
   expiresAt: string;
-  hasLoopbackRedirect: boolean;
   /** The kind's `refusal` verdict for this viewer; null when nothing is in the way. */
   blockedBy: string | null;
 }
@@ -427,10 +419,6 @@ export interface OperationApproval {
   kind: string;
   state: "completed";
   organizationId: string | null;
-  /** Set when a loopback redirect was registered: the one-time code the client redeems with. */
-  redeemCode: string | null;
-  /** The loopback redirect with `?code=<redeemCode>`; navigate the browser there. */
-  redirectUrl: string | null;
 }
 
 export interface CompleteOperationInput {
@@ -447,9 +435,7 @@ export interface AmendOperationInput {
   id: string;
   /**
    * A new outcome: sealed afresh for another `sealTtlMs` when `seal`, else
-   * kept in the clear. Sealing one on an operation with a loopback redirect
-   * switches it to poll collection: the redirect is dropped, because its
-   * redeem code was spent on the first outcome.
+   * kept in the clear.
    */
   outcome?: unknown;
   seal?: boolean;
@@ -589,7 +575,7 @@ export type OperationSweepStatements = BatchItem<"sqlite">[];
 export const operationSweepStatementCount = 3;
 
 export interface CfAuthOperations {
-  /** Every registered kind by name, the built-in `login` included and internal ones left out. */
+  /** Every registered kind by name, internal ones left out. */
   readonly kinds: ReadonlyMap<string, OperationKind>;
   /**
    * Opens an operation, or answers again for the one its token already opened.
@@ -602,9 +588,8 @@ export interface CfAuthOperations {
   open(input: OpenOperationInput): Promise<OperationView>;
   /**
    * Where the operation stands, for the client holding its token. Hands over a
-   * sealed outcome as the kind's `deliver` says — never for an operation with a
-   * loopback redirect, whose outcome only `redeem` releases. `404
-   * operation_not_found` for an unknown id and for a wrong token alike.
+   * sealed outcome as the kind's `deliver` says. `404 operation_not_found` for
+   * an unknown id and for a wrong token alike.
    */
   poll(input: { id: string; token: string }): Promise<OperationView>;
   /** The operation a token opened, without handing anything over; null when there is none. */
@@ -628,13 +613,6 @@ export interface CfAuthOperations {
   deny(
     input: { id: string; actor?: AuthState | null } & OperationBrowserCredential,
   ): Promise<{ id: string; kind: string; state: "denied" }>;
-  /** Hands over the outcome to the client holding both its token and the redeem code. */
-  redeem(input: { id: string; token: string; redeemCode: string }): Promise<{
-    id: string;
-    kind: string;
-    organizationId: string | null;
-    outcome: unknown;
-  }>;
   /**
    * The pending operation a typed user code names, for a code-entry page, or
    * null. Rate-limit whatever route calls this. Continue with `{ id, userCode }`.
@@ -762,34 +740,6 @@ const clientText = (value: unknown, label: string): string | undefined => {
   return trimmed || undefined;
 };
 
-/**
- * Where a loopback approval may send the browser: plain http on the machine's
- * own loopback address with an explicit port, per RFC 8252. `localhost` is
- * refused because it can resolve elsewhere.
- */
-const normalizeLoopbackRedirect = (value: string): string => {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw validationError("loopbackRedirect must be a URL");
-  }
-  if (
-    url.protocol !== "http:" ||
-    (url.hostname !== "127.0.0.1" && url.hostname !== "[::1]") ||
-    !url.port ||
-    url.username ||
-    url.password ||
-    url.hash ||
-    url.search
-  ) {
-    throw validationError(
-      "loopbackRedirect must be http://127.0.0.1:<port>/<path> (or [::1]) with no query or fragment",
-    );
-  }
-  return url.toString();
-};
-
 const parseJson = (value: string | null): unknown => (value === null ? null : JSON.parse(value));
 
 const iso = (value: Date) => value.toISOString();
@@ -862,9 +812,6 @@ export const createOperationsEngine = (
   if (settings.enabled) assertOperationsDatabase(db);
 
   const kinds = new Map<string, OperationKind>();
-  if (settings.login) {
-    kinds.set("login", createLoginOperationKind(config, settings.login));
-  }
   for (const kind of [...(options.builtInKinds ?? []), ...settings.kinds]) {
     if (options.builtInKinds?.includes(kind)) {
       validateOperationKind(kind, `built-in operation kind ${kind.name}`, { builtIn: true });
@@ -1016,7 +963,6 @@ export const createOperationsEngine = (
       label: row.clientLabel,
       meta: parseJson(row.clientMeta) as OperationClientMeta | null,
     },
-    hasLoopbackRedirect: row.loopbackRedirect !== null,
     payload: parseJson(row.payload),
     decidedByUserId: row.decidedByUserId,
     createdAt: iso(row.createdAt),
@@ -1055,8 +1001,7 @@ export const createOperationsEngine = (
       browserProof: pending && row.browserProofHash ? await browserProofFor(token) : null,
       userCode: pending && row.userCodeHash ? await userCodeFor(token) : null,
       record: parseJson(row.outcome),
-      collect:
-        sealLive(row, now) && deliverMode(row) !== "reveal" ? (row.loopbackRedirect ? "redeem" : "poll") : null,
+      collect: sealLive(row, now) && deliverMode(row) !== "reveal" ? "poll" : null,
     };
   };
 
@@ -1088,7 +1033,6 @@ export const createOperationsEngine = (
           eq(operation.id, row.id),
           eq(operation.state, "completed"),
           eq(operation.sealedOutcome, sealed),
-          sql`${operation.loopbackRedirect} is null`,
           ...(opener ? [opener] : []),
         ),
       )
@@ -1137,7 +1081,7 @@ export const createOperationsEngine = (
    * asked — the default — rather than the least: removing a kind must never
    * release to a `read` key what the kind would have withheld from one.
    *
-   * Only the delivery paths (`poll`, `redeem`) reach the fallback; `approve`,
+   * Only the delivery path (`poll`) reaches the fallback; `approve`,
    * `complete` and `guard` refuse an unregistered kind outright.
    */
   const openerSqlForRow = (row: OperationRow, now: number): SQL | undefined => {
@@ -1174,7 +1118,7 @@ export const createOperationsEngine = (
   const dropUndeliverable = async (id: string, sealed: string, now: number): Promise<never> => {
     await db
       .update(operation)
-      .set({ sealedOutcome: null, redeemCodeHash: null, updatedAt: new Date(now) })
+      .set({ sealedOutcome: null, updatedAt: new Date(now) })
       .where(
         and(eq(operation.id, id), eq(operation.state, "completed"), eq(operation.sealedOutcome, sealed)),
       );
@@ -1263,7 +1207,6 @@ export const createOperationsEngine = (
       organizationId: string | null;
       /** Who decided it; SQL for one that may have been deleted meanwhile. */
       decidedByUserId: string | SQL | null;
-      redeemCodeHash: string | null;
       /** The execution claim the completion must still find, which it then clears. */
       claim?: string;
       now: number;
@@ -1286,7 +1229,6 @@ export const createOperationsEngine = (
         outcome: stored,
         sealedOutcome: sealed,
         sealedUntil,
-        redeemCodeHash: input.redeemCodeHash,
         decidedByUserId: input.decidedByUserId,
         executionClaim: null,
         updatedAt: new Date(input.now),
@@ -1324,7 +1266,7 @@ export const createOperationsEngine = (
         .where(and(eq(operation.state, "pending"), lte(operation.expiresAt, at))),
       db
         .update(operation)
-        .set({ sealedOutcome: null, sealedUntil: null, redeemCodeHash: null, updatedAt: at })
+        .set({ sealedOutcome: null, sealedUntil: null, updatedAt: at })
         .where(lte(operation.sealedUntil, at)),
       db.delete(operation).where(lte(operation.retainUntil, at)),
     ] as unknown as OperationSweepStatements;
@@ -1353,7 +1295,6 @@ export const createOperationsEngine = (
     if (!hasGrantAtLeast(opener.grant, openerGrant(kind))) throw grantInsufficient();
     const credentialId = opener.actor?.credentialId;
     if (!user || !credentialId) throw unauthorized();
-    if (isOrganizationExpired(organization)) throw organizationExpired();
     return {
       openerUserId: user.id,
       openerCredentialId: credentialId,
@@ -1468,12 +1409,6 @@ export const createOperationsEngine = (
           if (userAgent) meta.userAgent = userAgent;
         }
         const metaJson = Object.keys(meta).length > 0 ? JSON.stringify(meta) : null;
-        const loopback = input.client?.loopbackRedirect
-          ? normalizeLoopbackRedirect(input.client.loopbackRedirect)
-          : null;
-        if (loopback && !kind.browser) {
-          throw validationError("A loopback redirect needs a kind with a browser step");
-        }
 
         let openerUserId: string | null = null;
         let openerCredentialId: string | null = null;
@@ -1528,7 +1463,6 @@ export const createOperationsEngine = (
               : null,
             clientLabel: label,
             clientMeta: metaJson,
-            loopbackRedirect: loopback,
             payload,
             createdAt: new Date(now),
             updatedAt: new Date(now),
@@ -1612,7 +1546,6 @@ export const createOperationsEngine = (
           takesInput: kind.input !== undefined,
           createdAt: record.createdAt,
           expiresAt: record.expiresAt,
-          hasLoopbackRedirect: record.hasLoopbackRedirect,
           blockedBy:
             record.state === "pending" && kind.refusal
               ? await kind.refusal({ operation: record, payload: record.payload, viewer })
@@ -1674,7 +1607,6 @@ export const createOperationsEngine = (
                 403,
               );
             }
-            if (isOrganizationExpired(membership.organization)) throw organizationExpired();
             approverSql = credentialAuthoritySql(tables, {
               organizationId,
               userId,
@@ -1717,7 +1649,6 @@ export const createOperationsEngine = (
             })
           : { outcome: null };
 
-        const redeemCode = row.loopbackRedirect ? randomToken(32) : null;
         const completed = await commit(row, {
           outcome: result.outcome,
           seal: result.seal ?? false,
@@ -1726,26 +1657,12 @@ export const createOperationsEngine = (
           guard,
           organizationId,
           decidedByUserId: user?.id ?? null,
-          redeemCodeHash: redeemCode ? await sha256Hex(redeemCode) : null,
           now,
         });
         if (!completed) await explainRefusedWrite(row.id, now);
         await afterCommit(result.afterCommit);
 
-        let redirectUrl: string | null = null;
-        if (row.loopbackRedirect && redeemCode) {
-          const url = new URL(row.loopbackRedirect);
-          url.searchParams.set("code", redeemCode);
-          redirectUrl = url.toString();
-        }
-        return {
-          id: row.id,
-          kind: row.kind,
-          state: "completed",
-          organizationId,
-          redeemCode,
-          redirectUrl,
-        };
+        return { id: row.id, kind: row.kind, state: "completed", organizationId };
       },
 
       async deny(input) {
@@ -1773,70 +1690,6 @@ export const createOperationsEngine = (
           await explainRefusedWrite(row.id, now);
         }
         return { id: row.id, kind: row.kind, state: "denied" };
-      },
-
-      async redeem(input) {
-        requireEnabled();
-        const row = await rowForToken(input.id, input.token, admitInternal);
-        const now = Date.now();
-        switch (effectiveState(row, now)) {
-          case "pending":
-            throw operationPending();
-          case "denied":
-            throw operationDenied();
-          case "expired":
-          case "retired":
-            throw operationExpired();
-          case "completed":
-            break;
-        }
-        if (!row.redeemCodeHash || deliverMode(row) === "reveal") {
-          throw alreadyCompleted(
-            "This operation's outcome has already been collected or is no longer available",
-          );
-        }
-        const code = typeof input.redeemCode === "string" ? input.redeemCode : "";
-        if (!tokenPattern.test(code) || !timingSafeEqual(await sha256Hex(code), row.redeemCodeHash)) {
-          throw invalidProof("The redeem code does not match this operation");
-        }
-        const sealed = row.sealedOutcome;
-        if (sealed !== null && !sealLive(row, now)) {
-          throw operationExpired("This operation's outcome is no longer available");
-        }
-        if (sealed !== null) await assertDeliverable(row, now);
-        // Opened before anything is spent, so a seal that cannot be read is
-        // reported rather than consumed.
-        const answer = {
-          id: row.id,
-          kind: row.kind,
-          organizationId: row.organizationId,
-          outcome: sealed !== null ? await openSealed({ ...row, sealedOutcome: sealed }) : parseJson(row.outcome),
-        };
-        const opener = openerSqlForRow(row, now);
-        const openerGone = () =>
-          operationExpired("The credential that opened this operation is no longer valid");
-        if (deliverMode(row) === "window") {
-          if (opener && !(await holds(opener))) throw openerGone();
-          return answer;
-        }
-
-        const taken = await db
-          .update(operation)
-          .set({ redeemCodeHash: null, sealedOutcome: null, updatedAt: new Date(now) })
-          .where(
-            and(
-              eq(operation.id, row.id),
-              eq(operation.state, "completed"),
-              eq(operation.redeemCodeHash, row.redeemCodeHash),
-              ...(opener ? [opener] : []),
-            ),
-          )
-          .returning({ id: operation.id });
-        if (taken.length !== 1) {
-          if (opener && !(await holds(opener))) throw openerGone();
-          throw alreadyCompleted("This operation's outcome has already been collected");
-        }
-        return answer;
       },
 
       async lookupByUserCode(input) {
@@ -1882,7 +1735,6 @@ export const createOperationsEngine = (
           guard: and(stateSql(row.id, "pending", now), ...(opener ? [opener] : []))!,
           organizationId: row.organizationId,
           decidedByUserId: null,
-          redeemCodeHash: null,
           now,
         });
         if (!completed) await explainRefusedWrite(row.id, now);
@@ -1929,10 +1781,6 @@ export const createOperationsEngine = (
             const sealedUntil = new Date(now + settings.sealTtlMs);
             changes.sealedUntil = sealedUntil;
             changes.retainUntil = retainThrough(sealedUntil);
-            // A loopback redirect's redeem code went with the first outcome, so
-            // a new one is collected by polling instead.
-            changes.loopbackRedirect = null;
-            changes.redeemCodeHash = null;
           } else {
             changes.outcome = JSON.stringify(input.outcome ?? null);
           }
@@ -1962,7 +1810,6 @@ export const createOperationsEngine = (
             state: "retired",
             sealedOutcome: null,
             sealedUntil: null,
-            redeemCodeHash: null,
             updatedAt: new Date(),
           })
           .where(
@@ -2155,7 +2002,6 @@ export const createOperationsEngine = (
             // deleted mid-execution leaves it null rather than failing the
             // foreign key and, with it, a write its claim still covers.
             decidedByUserId: sql`(select ${tables.user.id} from ${tables.user} where ${tables.user.id} = ${executor.openerUserId})`,
-            redeemCodeHash: null,
             claim,
             now,
           });
@@ -2189,7 +2035,6 @@ export const createOperationsEngine = (
         if (!hasRoleAtLeast(membership.role, "admin")) {
           throw forbidden("Revealing needs the admin role or higher in this organization");
         }
-        if (isOrganizationExpired(membership.organization)) throw organizationExpired();
         const kind = kindOf(row.kind);
         if (kind.browser) {
           throw validationError(
@@ -2235,12 +2080,9 @@ export const createOperationsEngine = (
           nowMs: now,
         });
         const deliverable = deliverableSql(row, now);
-        // The organization exists and is not past its deadline, by either
-        // clock: `expires_at` is ISO text, read as epoch milliseconds here.
+        // The organization still exists when the outcome is taken.
         const organizationLive = sql`exists (select 1 from ${tables.organization} as ${sql.identifier("cf_auth_reveal_organization")}
-          where ${revealOrganization.id} = ${organizationId}
-            and (${revealOrganization.expiresAt} is null
-              or cast(unixepoch(${revealOrganization.expiresAt}, 'subsec') * 1000 as integer) > ${sqliteNowMs(now)}))`;
+          where ${revealOrganization.id} = ${organizationId})`;
         // Every condition rides on the write that takes the outcome — the
         // seal's deadline by the database's clock too — so of two reveals
         // racing only one hands it over, and nothing that stopped holding
@@ -2273,7 +2115,7 @@ export const createOperationsEngine = (
             // judge or to drop; the next reveal reads it afresh.
             throw conflict("This operation's outcome changed while it was being revealed; reveal it again");
           }
-          if (!(await holds(organizationLive))) throw organizationExpired();
+          if (!(await holds(organizationLive))) throw operationNotFound();
           if (deliverable && !(await holds(deliverable))) await dropUndeliverable(row.id, sealed, now);
           if (!(await holds(revealer))) {
             throw conflict("Your session or role changed before the outcome was revealed; sign in again");

@@ -35,10 +35,7 @@ describe("unified identities", () => {
       id: harness.identity.id,
       credentialId: harness.key.id,
     });
-    expect(state.organization).toMatchObject({
-      claimed: false,
-      expiresAt: null,
-    });
+    expect(state.organization).toMatchObject({ name: "Automation" });
     expect((await harness.client.execute("SELECT * FROM user_account")).rows).toHaveLength(0);
     expect((await harness.client.execute("SELECT * FROM user_session")).rows).toHaveLength(0);
     expect(() => requireUser(state)).toThrow();

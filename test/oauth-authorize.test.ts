@@ -1,29 +1,27 @@
 /**
  * OAuth authorization (step 10): the authorization request, Client ID
- * Metadata Documents, consent through both doors, the code exchange, and
+ * Metadata Documents, consent, the code exchange, and
  * the discovery documents.
  *
  * Everything that writes runs on libsql and on a real D1 (Miniflare, on
  * workerd), because each decision is one batch and the two drivers batch
  * differently. CIMD is exercised against a fake `fetch`, never the network.
  */
-import { sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createCfAuth, type CfAuth } from "../src/cf-auth.js";
 import type { CfAuthDatabase, OAuthConfig } from "../src/config.js";
 import { createOperationToken, randomToken } from "../src/crypto.js";
-import { guardedInsert } from "../src/guarded-insert.js";
 import {
   oauthAuthorizeKindName,
   type OAuthAuthorizationRecord,
   type OAuthAuthorizeResult,
-  type OAuthGuestProvisionContext,
 } from "../src/oauth/authorization.js";
 import { ClientMetadataRefusal, cimdMaxDocumentBytes, fetchClientMetadataDocument } from "../src/oauth/cimd.js";
 import { isAcceptableRedirectUri, redirectUriMatches } from "../src/oauth/redirect-uri.js";
 import type { OAuthTokenResponse, OAuthTokenResult } from "../src/oauth/service.js";
 import type { TestHuman } from "../src/testing.js";
 import type { AuthState } from "../src/types.js";
+import { loginKind } from "./fixtures/login-kind.js";
 import { createD1TestAuth, createTestAuth, testBaseUrl, testSecret } from "./helpers.js";
 
 const issuer = "https://console.example.com";
@@ -93,7 +91,7 @@ const pkce = async () => {
 // --- harnesses ------------------------------------------------------------------------------
 
 const oauthOptions = (oauth: Partial<OAuthConfig> = {}) => ({
-  operations: { enabled: true },
+  operations: { enabled: true, kinds: [loginKind] },
   oauth: { enabled: true, issuer, tokenPrefix, clients: [registered], cimd: { fetch: fakeFetch }, ...oauth },
 });
 
@@ -259,43 +257,6 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         actor: await h.actorFor(human.userId, human.organizationId),
         organizationId,
         grant,
-      });
-
-    /** A guest provisioning in the shape the gateway's will have: ids from the operation id, every row guarded. */
-    const provisionGuest = (calls: { count: number } = { count: 0 }) => (ctx: OAuthGuestProvisionContext) => {
-      calls.count += 1;
-      const userId = `svc-${ctx.operationId}`;
-      const organizationId = `acct-${ctx.operationId}`;
-      const at = new Date(ctx.now);
-      const iso = at.toISOString();
-      return {
-        userId,
-        organizationId,
-        statements: [
-          guardedInsert(ctx.db, ctx.tables.user, {
-            id: userId, name: "MCP service", email: null, kind: "service", emailVerified: false, createdAt: at, updatedAt: at,
-          }, ctx.guard),
-          guardedInsert(ctx.db, ctx.tables.organization, {
-            id: organizationId, name: "My account", createdByUserId: userId,
-            expiresAt: new Date(ctx.now + 30 * day).toISOString(), createdAt: iso, updatedAt: iso,
-          }, ctx.guard),
-          guardedInsert(ctx.db, ctx.tables.organizationUser, {
-            id: `member-${organizationId}`, organizationId, userId, role: "owner", status: "active", joinedAt: iso,
-          }, ctx.guard),
-        ],
-      };
-    };
-
-    const guest = (
-      flow: { id: string; proof: string },
-      options: { admit?: () => Promise<ReturnType<typeof sql> | null>; rateLimit?: () => Promise<void>; calls?: { count: number } } = {},
-    ) =>
-      h.cfAuth.oauth.approveGuestAuthorization({
-        id: flow.id,
-        proof: flow.proof,
-        admit: options.admit ?? (async () => null),
-        rateLimit: options.rateLimit ?? (async () => {}),
-        provision: provisionGuest(options.calls),
       });
 
     // --- the authorization request -----------------------------------------------------------
@@ -586,7 +547,6 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         expect([...sent.keys()]).toEqual(["code", "state", "iss"]);
         const record = await recordOf(flow.id);
         expect(record).toMatchObject({
-          door: "person",
           userId: member.userId,
           organizationId: owner.organizationId,
           grant: "read",
@@ -605,7 +565,7 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         expect(tokens.scope).toBe("read");
       });
 
-      it("refuses a non-member, an expired organization, an API key and nobody, and leaves the authorization pending", async () => {
+      it("refuses a non-member, an API key and nobody, and leaves the authorization pending", async () => {
         const person = await h.human();
         const stranger = await h.human();
         const flow = await start();
@@ -621,8 +581,6 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
           h.cfAuth.oauth.approveAuthorization({ ...flow, actor, organizationId: person.organizationId, grant: "admin" as never }),
           "validation_error",
         );
-        await h.exec("UPDATE organization SET expires_at = ? WHERE id = ?", new Date(Date.now() - minute).toISOString(), person.organizationId);
-        await expectCode(approveAs(flow, person), "organization_expired");
         expect((await operationRow(flow.id))!.state).toBe("pending");
       });
 
@@ -659,7 +617,6 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         const opener = await h.human();
         const flow = await start();
         const { redirect } = await approveAs(flow, victim);
-        await expectCode(guest(flow), "already_completed");
         await expectCode(approveAs(flow, opener), "already_completed");
         await expectCode(
           h.cfAuth.oauth.approveAuthorization({ ...flow, actor: null, organizationId: victim.organizationId, grant: "manage" }),
@@ -667,7 +624,7 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         );
         // The person who approved still gets it back, and the refusals wrote nothing.
         expect((await approveAs(flow, victim)).redirect).toBe(redirect);
-        expect(await recordOf(flow.id)).toMatchObject({ door: "person", userId: victim.userId, organizationId: victim.organizationId });
+        expect(await recordOf(flow.id)).toMatchObject({ userId: victim.userId, organizationId: victim.organizationId });
       });
 
       it("denies with an access_denied redirect, idempotently, and refuses approval afterwards", async () => {
@@ -682,7 +639,6 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         expect((await h.cfAuth.oauth.denyAuthorization(flow)).redirect).toBe(redirect);
         expect((await operationRow(flow.id))!.state).toBe("denied");
         await expectCode(approveAs(flow, person), "operation_denied");
-        await expectCode(guest(flow), "operation_denied");
       });
 
       it("refuses an approval past the pending deadline", async () => {
@@ -690,225 +646,8 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         const flow = await start();
         await h.exec("UPDATE operation SET expires_at = ? WHERE id = ?", Date.now() - 1, flow.id);
         await expectCode(approveAs(flow, person), "operation_expired");
-        await expectCode(guest(flow), "operation_expired");
       });
     });
-
-    // --- the guest door --------------------------------------------------------------------------
-
-    describe("the guest door", () => {
-      const accounts = (flowId: string) => h.exec("SELECT id FROM organization WHERE id = ?", `acct-${flowId}`);
-
-      it("stops at a refused admission without counting a rate limit or provisioning", async () => {
-        const flow = await start();
-        const rateLimit = vi.fn(async () => {});
-        const calls = { count: 0 };
-        await expect(
-          guest(flow, { admit: async () => { throw new Error("closed"); }, rateLimit, calls }),
-        ).rejects.toThrow("closed");
-        expect(rateLimit).not.toHaveBeenCalled();
-        expect(calls.count).toBe(0);
-        expect((await operationRow(flow.id))!.state).toBe("pending");
-      });
-
-      it("stops at the rate limit without provisioning", async () => {
-        const flow = await start();
-        const calls = { count: 0 };
-        await expect(
-          guest(flow, { rateLimit: async () => { throw new Error("slow down"); }, calls }),
-        ).rejects.toThrow("slow down");
-        expect(calls.count).toBe(0);
-        expect(await accounts(flow.id)).toHaveLength(0);
-      });
-
-      it("commits nothing when the admission condition fails inside the batch", async () => {
-        const flow = await start();
-        await expectCode(guest(flow, { admit: async () => sql`0 = 1` }), "conflict");
-        expect(await accounts(flow.id)).toHaveLength(0);
-        expect(await h.exec("SELECT id FROM user WHERE id = ?", `svc-${flow.id}`)).toHaveLength(0);
-        expect((await operationRow(flow.id))!.state).toBe("pending");
-      });
-
-      it("provisions under the guard and the admission, issues manage, and records what was asked", async () => {
-        const flow = await start({ scope: "read" });
-        const result = await guest(flow, { admit: async () => sql`1 = 1` });
-        expect(result.organizationId).toBe(`acct-${flow.id}`);
-        expect(params(result.redirect).get("iss")).toBe(issuer);
-        expect(await recordOf(flow.id)).toMatchObject({
-          door: "guest",
-          userId: `svc-${flow.id}`,
-          organizationId: `acct-${flow.id}`,
-          grant: "manage",
-          requestedGrant: "read",
-        });
-        const tokens = ok(await exchange(flow, params(result.redirect).get("code")!));
-        expect(tokens.scope).toBe("manage");
-        const state = await h.cfAuth.oauth.resolveAccessTokenAuthState(tokens.access_token, { source: "mcp" });
-        expect(state).toMatchObject({
-          authenticated: true,
-          credentialType: "oauth",
-          grant: "manage",
-          role: "owner",
-          user: { id: `svc-${flow.id}`, kind: "service" },
-        });
-      });
-
-      it("answers a repeat with a byte-equal redirect and one account, without admitting or counting again", async () => {
-        const flow = await start();
-        const first = await guest(flow);
-        const admit = vi.fn(async () => null);
-        const rateLimit = vi.fn(async () => {});
-        const calls = { count: 0 };
-        const second = await guest(flow, { admit, rateLimit, calls });
-        expect(second).toEqual(first);
-        expect(admit).not.toHaveBeenCalled();
-        expect(rateLimit).not.toHaveBeenCalled();
-        expect(calls.count).toBe(0);
-        expect(await accounts(flow.id)).toHaveLength(1);
-        ok(await exchange(flow, params(first.redirect).get("code")!));
-        expect(await guest(flow)).toEqual(first);
-      });
-
-      it("lets exactly one of two concurrent guest clicks provision", async () => {
-        const flow = await start();
-        const [a, b] = await Promise.all([guest(flow), guest(flow)]);
-        expect(a).toEqual(b);
-        expect(await accounts(flow.id)).toHaveLength(1);
-      });
-
-      it("answers a person and a guest racing with the winner's redirect, and refuses the other", async () => {
-        const person = await h.human();
-        const flow = await start();
-        const [byPerson, byGuest] = await Promise.allSettled([approveAs(flow, person), guest(flow)]);
-        const record = await recordOf(flow.id);
-        const [won, lost] = record.door === "person" ? [byPerson, byGuest] : [byGuest, byPerson];
-        expect(won.status).toBe("fulfilled");
-        expect(lost).toMatchObject({ status: "rejected", reason: { code: "already_completed" } });
-        expect(await accounts(flow.id)).toHaveLength(record.door === "guest" ? 1 : 0);
-        // And a person approving after a guest won is refused, without the guest's code.
-        const later = await start();
-        await guest(later);
-        await expectCode(approveAs(later, person), "already_completed");
-        expect((await recordOf(later.id)).door).toBe("guest");
-      });
-    });
-
-    // --- an empty deployment: an admission rule about the deployment's own state -------------------
-
-    describe("the guest door on an empty deployment", () => {
-      /** A deployment of its own, with no organization at all: the admission is "no account exists yet". */
-      const withEmptyDeployment = async (run: (e: Harness) => Promise<void>) => {
-        const e = await make();
-        try {
-          expect(await e.exec("SELECT id FROM organization")).toHaveLength(0);
-          await run(e);
-        } finally {
-          if (!perTest) await e.close();
-        }
-      };
-      const empty = (e: Harness) => async () =>
-        sql`not exists (select 1 from ${e.cfAuth.config.tables.organization})`;
-      const startOn = async (e: Harness) => {
-        const { verifier, challenge } = await pkce();
-        const search = query({}, challenge);
-        const consent = consentOf(await e.cfAuth.oauth.authorize({ query: search, rateLimitKey: rateKey() }));
-        return { ...consent, verifier, search };
-      };
-      const guestOn = (e: Harness, flow: { id: string; proof: string }) =>
-        e.cfAuth.oauth.approveGuestAuthorization({
-          id: flow.id,
-          proof: flow.proof,
-          admit: empty(e),
-          rateLimit: async () => {},
-          provision: provisionGuest(),
-        });
-
-      it("bootstraps under NOT EXISTS (organization), then refuses the next guest by the same rule", async () => {
-        await withEmptyDeployment(async (e) => {
-          const flow = await startOn(e);
-          const result = await guestOn(e, flow);
-          expect(result.organizationId).toBe(`acct-${flow.id}`);
-          expect(await e.exec("SELECT id FROM organization")).toEqual([{ id: `acct-${flow.id}` }]);
-          expect(await e.exec("SELECT id, kind FROM user WHERE id = ?", `svc-${flow.id}`)).toEqual([
-            { id: `svc-${flow.id}`, kind: "service" },
-          ]);
-          expect(await e.exec("SELECT role FROM organization_user WHERE user_id = ?", `svc-${flow.id}`)).toEqual([
-            { role: "owner" },
-          ]);
-          // The latch is spent with the completion.
-          expect((await e.exec("SELECT state, execution_claim FROM operation WHERE id = ?", flow.id))[0]).toEqual({
-            state: "completed",
-            execution_claim: null,
-          });
-          const tokens = ok(
-            await e.cfAuth.oauth.token({
-              body: new URLSearchParams({
-                grant_type: "authorization_code",
-                code: params(result.redirect).get("code")!,
-                redirect_uri: flow.search.get("redirect_uri")!,
-                client_id: registered.clientId,
-                code_verifier: flow.verifier,
-              }),
-            }),
-          );
-          expect(await e.exec("SELECT id FROM api_key WHERE organization_id = ? AND source = 'oauth'", `acct-${flow.id}`)).toHaveLength(1);
-          expect((await e.cfAuth.oauth.resolveAccessTokenAuthState(tokens.access_token, { source: "mcp" })).authenticated).toBe(true);
-
-          const next = await startOn(e);
-          await expectCode(guestOn(e, next), "conflict");
-          expect(await e.exec("SELECT id FROM organization")).toHaveLength(1);
-          expect(await e.exec("SELECT id FROM user WHERE id = ?", `svc-${next.id}`)).toHaveLength(0);
-          expect((await e.exec("SELECT state, execution_claim FROM operation WHERE id = ?", next.id))[0]).toEqual({
-            state: "pending",
-            execution_claim: null,
-          });
-        });
-      });
-
-      it("lets exactly one of two competing guest authorizations bootstrap it", async () => {
-        await withEmptyDeployment(async (e) => {
-          const [first, second] = [await startOn(e), await startOn(e)];
-          const results = await Promise.allSettled([guestOn(e, first), guestOn(e, second)]);
-          expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
-          const refused = results.find((result) => result.status === "rejected") as PromiseRejectedResult;
-          expect(refused.reason).toMatchObject({ code: "conflict" });
-          expect(await e.exec("SELECT id FROM organization")).toHaveLength(1);
-          expect(await e.exec("SELECT id FROM user WHERE kind = 'service'")).toHaveLength(1);
-        });
-      });
-
-      it("lets a person and a guest racing on one authorization yield one winner", async () => {
-        await withEmptyDeployment(async (e) => {
-          const flow = await startOn(e);
-          const person = await e.human();
-          const actor = await e.actorFor(person.userId, person.organizationId);
-          // The person's own organization now exists, so the admission refuses the guest: the
-          // person wins, and the guest is refused without the person's code.
-          const [byPerson, byGuest] = await Promise.allSettled([
-            e.cfAuth.oauth.approveAuthorization({
-              id: flow.id,
-              proof: flow.proof,
-              actor,
-              organizationId: person.organizationId,
-              grant: "manage",
-            }),
-            guestOn(e, flow),
-          ]);
-          expect(byPerson.status).toBe("fulfilled");
-          expect(byGuest.status).toBe("rejected");
-          expect(["already_completed", "conflict"]).toContain((byGuest as PromiseRejectedResult).reason.code);
-          const record = JSON.parse(
-            String((await e.exec("SELECT outcome FROM operation WHERE id = ?", flow.id))[0]!.outcome),
-          ) as OAuthAuthorizationRecord;
-          expect(record).toMatchObject({ door: "person", organizationId: person.organizationId });
-          expect(await e.exec("SELECT id FROM organization WHERE id = ?", `acct-${flow.id}`)).toHaveLength(0);
-          // A repeat of the guest door is refused too, without admitting.
-          await expectCode(guestOn(e, flow), "already_completed");
-        });
-      });
-    });
-
-    // --- the code exchange -----------------------------------------------------------------------
 
     describe("the code exchange", () => {
       const approved = async (overrides: Record<string, string | undefined> = {}) => {
@@ -1065,9 +804,9 @@ for (const [driver, { perTest, make }] of Object.entries(harnesses)) {
         expect((await connectionsOf(person.organizationId))[0]!.revoked_at).toBeNull();
       });
 
-      it("issues nothing when the account ended between approval and exchange", async () => {
+      it("issues nothing when the membership ended between approval and exchange", async () => {
         const { person, flow, code } = await approved();
-        await h.exec("UPDATE organization SET expires_at = ? WHERE id = ?", new Date(Date.now() - minute).toISOString(), person.organizationId);
+        await h.exec("DELETE FROM organization_user WHERE user_id = ? AND organization_id = ?", person.userId, person.organizationId);
         expect((await exchange(flow, code)).body).toMatchObject({ error: "invalid_grant" });
         expect(await connectionsOf(person.organizationId)).toHaveLength(0);
         expect((await recordOf(flow.id)).exchangedAt).toBeNull();
@@ -1393,7 +1132,6 @@ describe("OAuth authorization while OAuth is off", () => {
       oauth.authorize({ query: new URLSearchParams(), rateLimitKey: null }),
       oauth.authorizationDetails({ id: "x", proof: "y", viewer: null }),
       oauth.approveAuthorization({ id: "x", proof: "y", actor: null, organizationId: "o", grant: "manage" }),
-      oauth.approveGuestAuthorization({ id: "x", proof: "y", admit: async () => null, rateLimit: async () => {}, provision: () => ({ userId: "u", organizationId: "o", statements: [] }) }),
       oauth.denyAuthorization({ id: "x", proof: "y" }),
       oauth.token({ body: new URLSearchParams({ grant_type: "authorization_code" }) }),
     ]) {

@@ -7,8 +7,8 @@ import type { CfAuthTables } from "../schema.js";
  * Whether an OAuth connection may act, as one SQL condition: its row is an
  * OAuth connection (`credential_type = 'oauth'`), enabled, unrevoked, bound to
  * `issuer`, with an `expires_at` strictly in the future; its user's
- * membership in its organization is active; and the organization is inside
- * its deadline. Times are judged by the later of `nowMs` and the database's
+ * membership in its organization is active; and the organization exists.
+ * Times are judged by the later of `nowMs` and the database's
  * clock. Unlike the shared credential predicate there is no session branch
  * and no open-ended expiry: a connection always has a lifetime.
  *
@@ -39,25 +39,14 @@ export const oauthConnectionLiveSql = (
       and ${key.resource} = ${input.issuer}
       and ${key.expiresAt} is not null
       and ${key.expiresAt} > ${now}
-      and (${organization.expiresAt} is null
-        or cast(unixepoch(${organization.expiresAt}, 'subsec') * 1000 as integer) > ${now})
   )`;
 };
 
-/**
- * The organization exists and is inside its deadline when the statement runs,
- * by the later of `nowMs` and the database's clock: `expires_at` is ISO text,
- * read as epoch milliseconds, as the operation engine reads it.
- */
-export const oauthOrganizationLiveSql = (
-  tables: CfAuthTables,
-  input: { organizationId: string; nowMs: number },
-): SQL => {
+/** The organization exists when the statement runs. */
+export const oauthOrganizationLiveSql = (tables: CfAuthTables, input: { organizationId: string }): SQL => {
   const live = alias(tables.organization, "cf_auth_oauth_organization");
   return sql`exists (select 1 from ${tables.organization} as ${sql.identifier("cf_auth_oauth_organization")}
-    where ${live.id} = ${input.organizationId}
-      and (${live.expiresAt} is null
-        or cast(unixepoch(${live.expiresAt}, 'subsec') * 1000 as integer) > ${sqliteNowMs(input.nowMs)}))`;
+    where ${live.id} = ${input.organizationId})`;
 };
 
 /** The user's membership in the organization is active, at any role. */

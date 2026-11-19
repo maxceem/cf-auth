@@ -29,7 +29,6 @@ import { emitCfAuthEvent, toOAuthAuthState } from "../service.js";
 import {
   createEmptyAuthState,
   isCredentialGrant,
-  isOrganizationExpired,
   oauthActionSources,
   type AuthState,
   type CredentialGrant,
@@ -39,12 +38,20 @@ import {
   createOAuthAuthorization,
   createOAuthAuthorizeKind,
   type ApproveAuthorizationInput,
-  type ApproveGuestAuthorizationInput,
   type AuthorizationServerMetadata,
   type OAuthAuthorizationDetails,
   type OAuthAuthorizeResult,
+  type OAuthRoutePaths,
   type ProtectedResourceMetadata,
+  deviceCodeGrantType,
 } from "./authorization.js";
+import {
+  createOAuthDevice,
+  createOAuthDeviceKind,
+  type ApproveDeviceInput,
+  type OAuthDeviceAuthorizationResult,
+  type OAuthDeviceDetails,
+} from "./device.js";
 import { oauthConnectionLiveSql, oauthMembershipLiveSql, oauthOrganizationLiveSql } from "./authority.js";
 import { findOAuthAccess } from "./store.js";
 import { duplicateDescription, duplicatedParameter, formParams, type FormParams } from "./params.js";
@@ -67,10 +74,11 @@ export interface OAuthTokenResponse {
 }
 
 /**
- * The RFC 6749 §5.2 codes, RFC 8707's `invalid_target`, and `slow_down`,
- * named after RFC 8628 §3.5's: a valid refresh token presented within
- * {@link oauthRotationIntervalMs} of the last rotation. It is not
- * `invalid_grant`, which tells a client to drop its token and start over.
+ * The RFC 6749 §5.2 codes, RFC 8707's `invalid_target`, and RFC 8628's
+ * device-flow codes. `slow_down` is also answered, with 429, to a valid
+ * refresh token presented within {@link oauthRotationIntervalMs} of the
+ * last rotation. It is not `invalid_grant`, which tells a client to drop its
+ * token and start over.
  */
 export type OAuthErrorCode =
   | "invalid_request"
@@ -79,7 +87,10 @@ export type OAuthErrorCode =
   | "unsupported_grant_type"
   | "invalid_scope"
   | "invalid_target"
-  | "slow_down";
+  | "slow_down"
+  | "authorization_pending"
+  | "access_denied"
+  | "expired_token";
 
 /** An RFC 6749 §5.2 error body. */
 export interface OAuthErrorBody {
@@ -89,8 +100,9 @@ export interface OAuthErrorBody {
 
 /**
  * What `token` answers: 200 and the tokens; 400 (401 for `invalid_client`)
- * and the error; or 429 `slow_down`, a refresh refused only for its timing,
- * whose token stays good — send `retryAfterSeconds` as `Retry-After`.
+ * and the error, the device grant's `authorization_pending` and `slow_down`
+ * included; or 429 `slow_down`, a refresh refused only for its timing, whose
+ * token stays good — send `retryAfterSeconds` as `Retry-After`.
  */
 export type OAuthTokenResult =
   | { status: 200; body: OAuthTokenResponse }
@@ -141,8 +153,10 @@ export interface CfAuthOAuth {
    * `resource` is the URL it is published for.
    */
   protectedResourceMetadata(path?: string): ProtectedResourceMetadata;
-  /** `GET /.well-known/oauth-authorization-server`: the RFC 8414 document. */
+  /** `GET /.well-known/oauth-authorization-server<issuer path>`: the RFC 8414 document. */
   authorizationServerMetadata(): AuthorizationServerMetadata;
+  /** Every path to mount, on the issuer's host: the discovery documents and the endpoints. */
+  routePaths(): OAuthRoutePaths;
   /**
    * `GET /oauth/authorize`: validates the request and opens the pending
    * authorization. Answers the consent reference, an error redirect to the
@@ -163,18 +177,36 @@ export interface CfAuthOAuth {
    * it, and `409 already_completed` to anyone else.
    */
   approveAuthorization(input: ApproveAuthorizationInput): Promise<{ redirect: string }>;
-  /**
-   * "Continue without an account": proof, then the redirect of an
-   * authorization this door already completed (`409 already_completed` if
-   * the person door did), then `admit`, then `rateLimit`, then `provision`
-   * inside the batch that completes it.
-   */
-  approveGuestAuthorization(input: ApproveGuestAuthorizationInput): Promise<{ redirect: string; organizationId: string }>;
   /** The person declines: the `access_denied` redirect. */
   denyAuthorization(input: { id: string; proof: string }): Promise<{ redirect: string }>;
   /**
+   * `POST /oauth/device_authorization` (RFC 8628 §3.1), form-encoded: a
+   * registered client allowed the device flow asks for a device code and a
+   * user code. `rateLimitKey` is the client's address, for the pending cap.
+   * Send every answer with `Cache-Control: no-store`.
+   */
+  deviceAuthorization(input: { body: URLSearchParams; rateLimitKey: string | null }): Promise<OAuthDeviceAuthorizationResult>;
+  /**
+   * The pending device authorization a typed user code names, or null.
+   * `rateLimit` is the app's limit on guesses: called first, it throws when
+   * exceeded. Continue with `{ id, userCode }`.
+   */
+  lookupDevice(input: { userCode: string; rateLimit: () => Promise<void> }): Promise<{ id: string; expiresAt: string } | null>;
+  /** What the code-entry page shows. */
+  deviceDetails(input: { id: string; userCode: string; viewer: AuthState | null | undefined }): Promise<OAuthDeviceDetails>;
+  /**
+   * The signed-in person allows the client into one of their accounts, with
+   * the grant they chose. Idempotent for the same person; `409
+   * already_completed` to anyone else.
+   */
+  approveDevice(input: ApproveDeviceInput): Promise<{ state: "completed"; organizationId: string }>;
+  /** The person declines; the client's next poll answers `access_denied`. */
+  denyDevice(input: { id: string; userCode: string; actor?: AuthState | null }): Promise<{ state: "denied" }>;
+  /**
    * `POST /token`, form-encoded: `grant_type=authorization_code` exchanges a
-   * code for a new connection, once; `grant_type=refresh_token` rotates.
+   * code for a new connection, once; `grant_type=refresh_token` rotates;
+   * `grant_type=urn:ietf:params:oauth:grant-type:device_code` polls a device
+   * authorization and, once approved, issues its connection, once.
    */
   token(input: { body: URLSearchParams }): Promise<OAuthTokenResult>;
   /** `POST /revoke` (RFC 7009): either token ends the whole connection. */
@@ -189,7 +221,7 @@ export interface CfAuthOAuth {
   /**
    * Issues a connection and its first generation as statements for a batch of
    * the caller's own; `condition` is ANDed into the connection's guard with
-   * the user's active membership and the organization's deadline. A trusted
+   * the user's active membership and the organization's existence. A trusted
    * boundary, like `issueServiceApiKey`: the code exchange is its caller.
    */
   connectionStatements(
@@ -220,12 +252,19 @@ const maxClientIdLength = 2048;
 const maxClientNameLength = 200;
 
 /** The built-in kinds the OAuth service needs registered on the engine: none while it is off. */
-export const oauthBuiltInKinds = (config: ResolvedCfAuthConfig): OperationKind[] =>
-  config.oauth ? [createOAuthAuthorizeKind(config.oauth)] : [];
+export const oauthBuiltInKinds = (config: ResolvedCfAuthConfig): OperationKind[] => {
+  const oauth = config.oauth;
+  if (!oauth) return [];
+  const deviceFlow = oauth.deviceFlow;
+  return [
+    createOAuthAuthorizeKind(oauth),
+    ...(deviceFlow ? [createOAuthDeviceKind({ ...oauth, deviceFlow })] : []),
+  ];
+};
 
 /**
  * The OAuth service, on an engine of its own that registers
- * `cf-auth:oauth.authorize`. `createCfAuth` builds one engine for both
+ * `cf-auth:oauth.authorize` (and `cf-auth:oauth.device` with the device flow). `createCfAuth` builds one engine for both
  * `cfAuth.operations` and this service instead.
  */
 export const createOAuthService = (
@@ -337,11 +376,10 @@ export const createOAuthServiceForEngine = (
   const connectionLive = async (connection: Connection, now: number) => {
     if (!rowLive(connection, now)) return false;
     const membership = await repository.findMembership(connection.userId, connection.organizationId);
-    return membership !== null && !isOrganizationExpired(membership.organization, now);
+    return membership !== null;
   };
 
-  const organizationLiveSql = (organizationId: string, now: number): SQL =>
-    oauthOrganizationLiveSql(tables, { organizationId, nowMs: now });
+  const organizationLiveSql = (organizationId: string): SQL => oauthOrganizationLiveSql(tables, { organizationId });
 
   const membershipLiveSql = (userId: string, organizationId: string): SQL =>
     oauthMembershipLiveSql(tables, { userId, organizationId });
@@ -648,7 +686,7 @@ export const createOAuthServiceForEngine = (
     const guard = and(
       ...(input.condition ? [input.condition] : []),
       membershipLiveSql(userId, organizationId),
-      organizationLiveSql(organizationId, now),
+      organizationLiveSql(organizationId),
     )!;
 
     const statements = [
@@ -720,34 +758,64 @@ export const createOAuthServiceForEngine = (
     ] as unknown as BatchItem<"sqlite">[];
   };
 
+  /** The engine's door that admits internal kinds, read on use: there is none while OAuth is off. */
+  const engine = (): CfAuthOperations => {
+    if (!internalOperations) throw validationError("OAuth is disabled; set `oauth.enabled: true` to use it");
+    return internalOperations;
+  };
+  const connections = {
+    connectionStatements: (input: Parameters<typeof prepareConnection>[1]) => prepareConnection(settings(), input),
+    async revokeConnectionById(connectionId: string) {
+      const connection = await loadConnection(connectionId);
+      const now = Date.now();
+      if (connection && rowLive(connection, now)) {
+        await revokeConnection(connection, now, { requireAuthority: false });
+      }
+    },
+  };
   const authorization = createOAuthAuthorization({
     config,
     repository,
-    get operations(): CfAuthOperations {
-      if (!internalOperations) throw validationError("OAuth is disabled; set `oauth.enabled: true` to use it");
-      return internalOperations;
+    get operations() {
+      return engine();
     },
     settings,
-    connections: {
-      connectionStatements: (input) => prepareConnection(settings(), input),
-      async revokeConnectionById(connectionId) {
-        const connection = await loadConnection(connectionId);
-        const now = Date.now();
-        if (connection && rowLive(connection, now)) {
-          await revokeConnection(connection, now, { requireAuthority: false });
-        }
-      },
+    connections,
+  });
+  const device = createOAuthDevice({
+    config,
+    get operations() {
+      return engine();
     },
+    settings,
+    connections,
   });
 
   return {
     protectedResourceMetadata: (path) => authorization.protectedResourceMetadata(path),
     authorizationServerMetadata: () => authorization.authorizationServerMetadata(),
+    routePaths: () => authorization.routePaths(),
     authorize: (input) => authorization.authorize(input),
     authorizationDetails: (input) => authorization.authorizationDetails(input),
     approveAuthorization: (input) => authorization.approveAuthorization(input),
-    approveGuestAuthorization: (input) => authorization.approveGuestAuthorization(input),
     denyAuthorization: (input) => authorization.denyAuthorization(input),
+
+    async deviceAuthorization({ body, rateLimitKey }) {
+      settings();
+      const params = formParams(body);
+      if (!params) {
+        return { status: 400, body: { error: "invalid_request", error_description: "The request body must be form parameters" } };
+      }
+      const duplicated = duplicatedParameter(params);
+      if (duplicated !== null) {
+        return { status: 400, body: { error: "invalid_request", error_description: duplicateDescription(duplicated) } };
+      }
+      return device.deviceAuthorization(params, rateLimitKey ?? null);
+    },
+    lookupDevice: (input) => device.lookupDevice(input),
+    deviceDetails: (input) => device.deviceDetails(input),
+    approveDevice: (input) => device.approveDevice(input),
+    denyDevice: (input) => device.denyDevice(input),
 
     async token({ body }) {
       const oauth = settings();
@@ -759,7 +827,13 @@ export const createOAuthServiceForEngine = (
       if (!grantType) return fail("invalid_request", "grant_type is required");
       if (grantType === "refresh_token") return refresh(oauth, params);
       if (grantType === "authorization_code") return authorization.exchangeCode(oauth, params);
-      return fail("unsupported_grant_type", "grant_type must be authorization_code or refresh_token");
+      if (grantType === deviceCodeGrantType && oauth.deviceFlow) return device.exchangeDeviceCode(oauth, params);
+      return fail(
+        "unsupported_grant_type",
+        oauth.deviceFlow
+          ? `grant_type must be authorization_code, refresh_token or ${deviceCodeGrantType}`
+          : "grant_type must be authorization_code or refresh_token",
+      );
     },
 
     async revoke({ body }) {

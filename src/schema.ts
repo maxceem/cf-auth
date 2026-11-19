@@ -136,7 +136,6 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
   const organization = sqliteTable(t("organization"), {
     id: text("id").primaryKey(),
     name: text("name").notNull(),
-    expiresAt: text("expires_at"),
     createdByUserId: text("created_by_user_id")
       .notNull()
       .references(() => user.id),
@@ -301,10 +300,10 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
   // --- browser-approved operations ---------------------------------------------
   // One row per operation a client opened: what it asked for, who may approve
   // it, and what it achieved. Secrets are never stored in the clear: the
-  // client's token, the browser proof and the redeem code are SHA-256
-  // digests; the user code is a digest for lookup plus a sealed (AES-GCM) copy
-  // for display; and an outcome carrying a secret is sealed until it is
-  // collected or its window passes. Timestamps are epoch milliseconds so the
+  // client's token and the browser proof are SHA-256 digests; the user code
+  // is a digest for lookup plus a sealed (AES-GCM) copy for display; and an
+  // outcome carrying a secret is sealed until it is collected or its window
+  // passes. Timestamps are epoch milliseconds so the
   // guards inside a write can compare them with SQLite's own clock.
 
   const operation = sqliteTable(
@@ -332,8 +331,6 @@ export const createCfAuthTables = (options: CfAuthTablesOptions = {}) => {
       userCodeSealed: text("user_code_sealed"),
       clientLabel: text("client_label"),
       clientMeta: text("client_meta"),
-      loopbackRedirect: text("loopback_redirect"),
-      redeemCodeHash: text("redeem_code_hash"),
       /** What the operation achieved, kept in the clear; never a secret. */
       outcome: text("outcome"),
       sealedOutcome: text("sealed_outcome"),

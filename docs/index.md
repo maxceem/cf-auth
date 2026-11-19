@@ -162,15 +162,20 @@ existing key at `manage`, `0003_cf_auth_operation_execution_claim.sql` adds
 `oauth_token` table and the `client_id`, `resource` and `credential_type`
 columns of `api_key` (see [OAuth connections](#oauth-connections)), and
 `0005_cf_auth_organization_invitation.sql` adds the `organization_invitation`
-table (see [Invitations](#invitations)). Each is plain `CREATE` and
-`ALTER TABLE ... ADD`; none rebuilds a table. Copy them in, in order. The package's own tests apply these exact files, so
+table (see [Invitations](#invitations)), `0006_cf_auth_member_last_active.sql`
+adds `organization_user.last_active_at`, and `0007_cf_auth_1_0.sql` drops
+`organization.expires_at` and the `loopback_redirect` and `redeem_code_hash`
+columns of `operation`, which 1.0 no longer uses. Each is plain `CREATE`,
+`ALTER TABLE ... ADD` or `ALTER TABLE ... DROP COLUMN`; none rebuilds a
+table. Copy them in, in order. The package's own tests apply these exact files, so
 they cannot drift from the schema.
 
 **Upgrading from 0.7.0.** Apply `0002`, `0003` and `0004`, even with OAuth
 off. The other changes — `credentialType` on a custom repository's
 `ApiKeySummary`, a refused completion rolling back its batch, operations
 needing a batching database, the reserved `cf-auth:` kind namespace — are
-listed in [Upgrading to 0.8.0](../README.md#upgrading-to-080).
+listed in [Upgrading to 0.8.0](../README.md#upgrading-to-080). For 1.0, see
+[Upgrading to 1.0.0](../README.md#upgrading-to-100).
 
 ### Renaming the tables
 
@@ -627,8 +632,8 @@ authenticated with, which is what a CLI's `logout` does. Any other credential
 gets `403 api_key_required`.
 
 Every key records where it came from. `source` is a short word — `console`
-unless you pass another, `cli` for the keys the built-in `login` operation
-issues — and `label` is optional free text such as `CLI on mac-studio`. Both are
+unless you pass another — and `label` is optional free text such as `CLI on
+mac-studio`. Both are
 for display only; nothing authorizes on them. `oauth` is reserved: it is the
 provenance of an [OAuth connection](#oauth-connections), and no caller may
 issue a key with it. What a row authenticates as is its `credentialType`,
@@ -638,8 +643,7 @@ Session and API-key callers use the same membership role. Keys never acquire
 browser assurance, including keys belonging to a human. Applications expose
 their own authorized management routes around these server methods when needed.
 
-For a deployment-authorized bootstrap or approved claim exchange, server code
-can call `createServiceIdentity({ name, id? })`, create its organization/membership,
+For a deployment-authorized bootstrap, server code can call `createServiceIdentity({ name, id? })`, create its organization/membership,
 and call `issueServiceApiKey({ userId, organizationId, name, expiresAt?, enabled? })`.
 This trusted primitive is not an unrestricted management endpoint. Services have
 `kind: "service"`, null email, and no password/Google accounts or sessions.
@@ -678,14 +682,13 @@ owner still only reads.
 | An OAuth connection | the grant the person approved                  |
 
 A key gets its grant when it is issued and keeps it. `createApiKey` and
-`issueServiceApiKey` take `grant`, and so does the built-in `login` through its
-payload. Keys from before grants existed are `manage`, and `ApiKeySummary`
+`issueServiceApiKey` take `grant`. Keys from before grants existed are `manage`, and `ApiKeySummary`
 reports the grant of each.
 
 cf-auth enforces it itself:
 
 - Every write in the service needs `manage`: adding, re-roling and removing
-  members, creating and revoking keys, and claiming. A `read` credential gets
+  members, and creating and revoking keys. A `read` credential gets
   `403 grant_insufficient`. Listing members and keys needs only `read`.
 - A key may never be issued with more than the issuer holds, and a `read`
   credential issues no keys at all, not even `read` ones.
@@ -694,9 +697,7 @@ cf-auth enforces it itself:
 - `revokeOwnApiKey` needs no grant. A `read` key can always end itself.
 - Every credential but a session is held to its own organization before its
   grant is looked at, so a key naming another organization is told
-  `forbidden`, not `grant_insufficient`. A claim, which also needs a session,
-  refuses in that order too: another organization, then the grant, then
-  `session_required`.
+  `forbidden`, not `grant_insufficient`.
 - An operation kind a caller opens needs `grant` from the opener's credential;
   see [Your own kinds](#your-own-kinds).
 
@@ -705,51 +706,14 @@ Gate your own writes with `requireGrant(state, "manage")`. It throws
 whose grant is too narrow, and answers the state otherwise. It checks only the
 grant; pair it with `requireOrganization` for the role.
 
-### Provisional organizations
-
-An organization may carry an `expiresAt` deadline: it exists provisionally,
-usually because a machine identity created it and no person has taken it over
-yet. Past that instant nothing acts inside it — an API key for it stops
-authenticating, and a session resolves its other memberships instead. The
-organization is still listed in `memberships`, so a client can name it and
-explain why it is unavailable.
-
-`claimOrganization` is how a person takes one over:
-
-```ts
-await cfAuth.service.claimOrganization({
-  actor: c.get("authState"), // an interactive human session
-  organizationId,
-  provisioning: {
-    userId: serviceIdentityId,
-    credentialId: bootstrapKeyId,
-    revokeAccess: false, // true also retires that identity's keys and membership
-  },
-});
-```
-
-It promotes the person to `owner` and clears the deadline in one transaction,
-and refuses when somebody else already owns the organization, when the deadline
-has passed, or when the provisioning credential is no longer live. Repeating a
-claim that already landed settles on the same membership rather than failing,
-so a caller that lost its answer can simply ask again.
-
-When the claim is what an approval does, use
-`claimOrganizationStatements({ actor, organizationId, provisioning, condition })`
-instead. It returns `{ statements, afterCommit }` — the same guarded writes as
-drizzle builders, with `condition` added to their guard — so an operation
-kind's `approve` can return them and pass the operation's `guard` as
-`condition`. The ownership change then lands in the batch that completes the
-operation or not at all: a denial that commits first leaves the organization
-unclaimed. `afterCommit` emits `organization.claimed` if it landed.
-
 ---
 
 ## Operations approved in a browser
 
 Some things a command-line tool asks for should not happen until a person says
-so in a browser: logging the tool in, or a change you want someone to look at
-first. An **operation** is one of those requests. The tool opens it, a signed-in
+so in a browser: a change you want someone to look at first, say. An
+**operation** is one of those requests. (Signing a tool in is not one: it uses
+[OAuth](#signing-in-a-command-line-tool).) The tool opens it, a signed-in
 person approves or denies it on a page you serve, and the tool collects the
 outcome.
 
@@ -784,16 +748,16 @@ const { operations } = cfAuth;
 // 1. The tool asks. Answers with the id, and while it is pending, the proof
 //    for the approval link and a code to show in the terminal.
 const view = await operations.open({
-  kind: "login",
+  kind: "change.apply", // one of your own kinds
   token,
-  rateLimitKey: c.req.header("CF-Connecting-IP"), // what the pending cap counts
+  opener: c.get("authState"), // the tool's own credential, for a kind that is not public
+  rateLimitKey: c.req.header("CF-Connecting-IP"), // what the pending cap counts, for a public kind
   client: {
     label: "CLI on mac-studio",
     meta: { os: "darwin", ip: clientAddress, userAgent },
-    loopbackRedirect: "http://127.0.0.1:53682/callback", // optional
   },
 });
-// The tool opens `${appUrl}/cli/approve/${view.id}#${view.browserProof}`
+// The tool opens `${appUrl}/approve/${view.id}#${view.browserProof}`
 // and prints view.userCode, e.g. "KMXT-4R9Q".
 
 // 2. Your approval page reads what to show, with the proof from its fragment.
@@ -855,73 +819,21 @@ the token. An id already taken by another token is `409 conflict`.
 An outcome can be **sealed**: stored encrypted under a key derived from
 `secret`, handed to the tool once, and dropped as soon as it is collected or
 after 15 minutes (`operations.sealTtlMs`). A kind with `deliver: "window"`
-hands it to every `poll` or `redeem` that asks until those 15 minutes are up,
+hands it to every `poll` that asks until those 15 minutes are up,
 for a tool that may lose a response and must be able to ask again; the sweep
 drops it after. A kind with `deliver: "reveal"` never hands it to the tool at
 all: only [`reveal`](#reservations-and-reveals) releases it, to a person on a
 page. Collecting an outcome drops the outcome only; the seal window itself
 runs on until the sweep clears it. The answer that hands it over carries
 `outcome`; every answer carries `record`, the part kept in the clear, and
-`collect`, which says whether a sealed outcome is still waiting and how to get
-it. Rotating `secret` makes sealed outcomes still waiting unreadable, so the
+`collect`, which is `"poll"` while a sealed outcome is still waiting. Rotating `secret` makes sealed outcomes still waiting unreadable, so the
 tool has to ask again.
 
-When the tool registered a `loopbackRedirect`, polling never hands the outcome
-over. `approve` answers with `redirectUrl` — the redirect with a one-time
-`?code=` — and your page sends the browser there. The tool's local listener
-receives the code and exchanges it:
-
-```ts
-const { outcome } = await operations.redeem({ id, token, redeemCode });
-```
-
-It needs the token as well as the code, so a code caught in transit is useless
-on its own. Only `127.0.0.1` or `[::1]` with an explicit port is accepted as a
-redirect.
-
-For a kind a signed-in caller opened, `poll` and `redeem` check the credential
+For a kind a signed-in caller opened, `poll` checks the credential
 that opened it again before handing a sealed outcome over: revoke that key, and
 what it asked for is not delivered. A sealed outcome that can no longer be read
 because `secret` changed is `410 operation_expired`, and is left in place rather
 than spent.
-
-### The built-in `login`
-
-`login` is registered whenever operations are on, and needs `apiKeys`. Anyone
-may open one — the tool has no credential yet — and it needs `client.label`.
-The person approving must be a member of the organization they choose, with at
-least `operations.login.minRole`. That is `admin` unless you say otherwise —
-the same people who may create an API key in the console. Set
-`login: { minRole: "member" }` to let every member log a tool in. Approving
-creates an API key that belongs to them, in that organization, named after the
-label and marked `source: "cli"`. The tool gets it sealed:
-
-```ts
-{ credential: { token: "key_..." }, organizationId, apiKeyId }
-```
-
-A tool that only needs to read opens it with `payload: { grant: "read" }`;
-without a payload the key is `manage`. Anything else in the payload is
-`422 validation_error`. A login opened without a payload stores none, just as
-before grants existed, so a tool repeating that same `open` across an upgrade
-is answered rather than refused; no payload means `manage` wherever it is
-read. An explicit `{ grant: "manage" }` is a different request from an omitted
-one, and a repeat may not change the grant. `details` shows the payload
-always with the grant spelled out, `{ grant: "manage" }` for an omitted one,
-so your page can say what is being asked for, and the record kept in the
-clear is `{ organizationId, apiKeyId, grant }`.
-
-The key is written in the same batch that completes the operation, under a
-guard that re-reads the person's session and membership, so a person signed
-out or removed a moment earlier gets `409 conflict` rather than issuing a key.
-It is handed over only while it is still usable: revoke it before the tool
-collects it, and `poll` or `redeem` answer `410 operation_expired` and drop it.
-`details` reports `blockedBy: "session_required"` when nobody is signed in and
-`"no_eligible_organization"` when the viewer has nowhere they may log a tool in,
-so the page knows what to offer before anyone presses a button.
-
-Turn it off with `operations: { enabled: true, login: false }`; change its
-windows with `login: { minRole, pendingTtlMs, recordTtlMs }`.
 
 ### Your own kinds
 
@@ -969,8 +881,7 @@ createCfAuth({ /* ... */, operations: { enabled: true, realm, kinds: [rotateSecr
   throws. Returning `undefined` stores no payload, the same as a kind that
   takes none; the hooks then see `null`.
 - `showPayload(payload)` returns what `details` shows as `payload`, when the
-  stored form leaves a default implicit. `login` uses it to spell out
-  `manage`.
+  stored form leaves a default implicit.
 - `approve` returns `{ outcome, seal?, record?, statements?, afterCommit? }`.
   AND `guard` into each statement's `WHERE`: it holds only while the operation
   is pending and in time and both the approver's and the opener's authority are
@@ -999,14 +910,13 @@ createCfAuth({ /* ... */, operations: { enabled: true, realm, kinds: [rotateSecr
   with it, so the page and the answer never disagree.
 - `deliverable({ operation, record, tables, now })` may return a SQL condition
   a sealed outcome must still meet to be handed over — that the credential it
-  carries is still live, say. When it fails, `poll`, `redeem` and `reveal`
-  drop that outcome and answer `410 operation_expired`. `login` uses it for
-  its key.
-- `deliver` is `"once"` (default: to the first `poll` or `redeem`),
+  carries is still live, say. When it fails, `poll` and `reveal` drop that
+  outcome and answer `410 operation_expired`.
+- `deliver` is `"once"` (default: to the first `poll`),
   `"window"` (to every one until the seal window ends) or `"reveal"` (to
   nobody but a person calling `reveal`; `poll`, `findByToken` and a retried
-  `open` answer the record without the outcome, `redeem` answers `409
-  already_completed`, and none of them consumes it). `"reveal"` is for a kind
+  `open` answer the record without the outcome, and none of them consumes
+  it). `"reveal"` is for a kind
   without a browser step.
 - `userCode` adds a code to type; `requireClientLabel` makes `client.label`
   mandatory; `countsTowardPending` (see
@@ -1037,9 +947,7 @@ changes what the operation holds — renewing a key whose sealed copy lapsed, fo
 instance — in one batch with `statements`, guarded by
 `await operations.guard({ id, state: "completed" })` and your own `condition`.
 It answers whether the amendment landed, so of two racing renewals you know
-which one won. Sealing a new outcome on an operation that had a loopback
-redirect drops the redirect — its redeem code went with the first outcome — so
-the new one is collected by `poll`.
+which one won.
 
 ### Reservations and reveals
 
@@ -1128,9 +1036,8 @@ it is handed over, and a reveal after it — or after the outcome was spent any
 other way — is `409 already_revealed` inside the window and `410
 operation_expired` after it, as is one on an operation that sealed nothing.
 An outcome the kind's `deliverable` no longer accepts is `410
-operation_expired`, and dropped; an organization past its deadline is `403
-organization_expired`. The person's membership and session, the
-organization's deadline, `deliverable`, the seal deadline and the very
+operation_expired`, and dropped. The person's membership and session, that
+the organization still exists, `deliverable`, the seal deadline and the very
 ciphertext that was read are all judged in the write that takes the outcome;
 if `amend` sealed a new outcome meanwhile, the reveal answers `409 conflict`
 (or, when the old outcome was being dropped as undeliverable, `410
@@ -1138,8 +1045,8 @@ operation_expired`) and leaves the new one for the next reveal. Revealing
 does not end the replay: `execute` keeps answering the record until the
 window closes. It works on any completed operation of a kind without a
 browser step — executed, or completed with `seal: true` — and refuses a kind
-with one, such as `login`, with `422 validation_error`: its outcome is
-collected by its own client.
+with one with `422 validation_error`: its outcome is collected by its own
+client.
 
 #### What a tool adapter returns
 
@@ -1227,7 +1134,7 @@ none of them can be internal.
 `open` counts pending operations inside the insert itself, so two tools racing
 for the last slot cannot both take it. An organization may have 10 at once and
 one opener 5 (`operations.limits`). The opener is the signed-in caller, or, for
-a public kind like `login`, whatever you pass as `rateLimitKey` — the address
+a public kind, whatever you pass as `rateLimitKey` — the address
 your edge saw, say. Without one, public kinds are limited only by what you put
 in front of them. `client.meta` is never counted: it is what the client says
 about itself. Over either limit is `429 too_many_pending`.
@@ -1261,11 +1168,11 @@ which is 3 — for a batch of your own or a job that budgets its queries.
 | Code                  | Status | When                                                          |
 | --------------------- | ------ | ------------------------------------------------------------- |
 | `operation_not_found` | 404    | Unknown id — and a wrong token, which is answered the same way |
-| `invalid_proof`       | 403    | Wrong browser proof, user code or redeem code                 |
-| `operation_expired`   | 410    | Nobody answered in time or a reservation lapsed unexecuted, it was retired, a sealed outcome's window passed, it can no longer be read or is no longer deliverable, or (for `poll` and `redeem`) its opener's credential is gone |
+| `invalid_proof`       | 403    | Wrong browser proof or user code                              |
+| `operation_expired`   | 410    | Nobody answered in time or a reservation lapsed unexecuted, it was retired, a sealed outcome's window passed, it can no longer be read or is no longer deliverable, or (for `poll`) its opener's credential is gone |
 | `operation_denied`    | 409    | It was denied                                                  |
-| `operation_pending`   | 409    | Redeeming or revealing before it completed                     |
-| `already_completed`   | 409    | Approving or completing it again; redeeming a `once` outcome twice; executing it again once its seal window passed |
+| `operation_pending`   | 409    | Amending or revealing before it completed                      |
+| `already_completed`   | 409    | Approving or completing it again; executing it again once its seal window passed |
 | `operation_mismatch`  | 409    | Executing a handle reserved for another kind or in another organization |
 | `already_revealed`    | 409    | Revealing an outcome that was already revealed                  |
 | `conflict`            | 409    | The same token for a different request; a guarded write found its authority changed (its batch rolled back); executing a handle another call is executing; revealing after the person's session or role changed |
@@ -1289,25 +1196,28 @@ approves gets a **connection**: an `api_key` row with `credential_type =
 everything that binds a key binds it too. It belongs to one person in one
 organization, carries a grant, is listed by `listApiKeys` and ended by
 `revokeApiKey`. Its tokens are issued, rotated, revoked and resolved here.
-A client gets one through the authorization-code flow with PKCE: the
+A client gets one through the authorization-code flow with PKCE (the
 authorization request, a consent page where a person picks the account and
-the grant (or continues without an account), and the code exchange. Clients
-are registered in configuration or identify themselves with a Client ID
-Metadata Document. cf-auth mounts no routes: your app mounts the discovery
+the grant, and the code exchange) or, with no browser on its machine, through
+the [device flow](#signing-in-a-command-line-tool). Clients are registered in
+configuration, the command-line tool among them, or identify themselves with
+a Client ID Metadata Document. cf-auth mounts no routes: your app mounts the discovery
 documents, the authorization, token and revocation endpoints, the consent
 page and its API, and the bearer gate, and sends what these functions answer.
 
 ```ts
 oauth?: {
   enabled?: boolean;                  // default false; needs apiKeys, operations and a batching database
-  issuer: string;                     // the issuer and the one protected resource: an origin, no path
+  issuer: string;                     // the issuer and the one protected resource: an origin, optionally with a path
   resourcePaths?: string[];           // also accepted as `resource`; default ["/mcp"]
   accessTokenTtlMs?: number;          // default 10 minutes
   refreshTokenTtlMs?: number;         // default 30 days, restarted by each rotation
   connectionMaxAgeMs?: number | null; // absolute cap from creation; default null
   authorizationTtlMs?: number;        // default 10 minutes: a pending authorization, and a code from completion
   tokenPrefix: { access: string; refresh: string };
-  clients?: { clientId: string; name: string; redirectUris: string[] }[];
+  clients?: { clientId: string; name: string; redirectUris: string[]; deviceFlow?: boolean }[];
+  cli?: { clientId: string; name: string; redirectPath?: string }; // the command-line tool; redirectPath default "/callback"
+  deviceFlow?: false | { verificationUri: string; codeTtlMs?: number; intervalSeconds?: number }; // default off
   cimd?: false | { fetch?: typeof fetch; allowUrl?: (url: URL) => boolean | Promise<boolean> };
 }
 ```
@@ -1318,11 +1228,12 @@ oauth?: {
   database whose drizzle instance has no `batch` (D1 and libsql have one):
   the rotation, the revocation and the code exchange are each one atomic
   batch;
-- an `issuer` that is not exactly an origin — `https`, or `http` on
-  `127.0.0.1`, `[::1]`, `localhost` or a name under `.localhost` (reserved
-  for loopback use by RFC 6761 §6.3, though resolver support varies: Chrome,
-  Firefox and systemd-resolved treat it as loopback, Safari on macOS before 26
-  does not) — with no path, trailing slash, query, fragment or credentials;
+- an `issuer` that is not exactly an origin, or an origin and a path such as
+  `/v2` — `https`, or `http` on `127.0.0.1`, `[::1]`, `localhost` or a name
+  under `.localhost` (reserved for loopback use by RFC 6761 §6.3, though
+  resolver support varies: Chrome, Firefox and systemd-resolved treat it as
+  loopback, Safari on macOS before 26 does not) — with no trailing slash,
+  query, fragment or credentials, and no `.` or `..` segment;
 - a missing `tokenPrefix`; prefixes other than 1 to 32 letters, digits, `_`
   or `-`; equal access and refresh prefixes; either equal to
   `apiKeys.tokenPrefix`; or an access prefix an API key could begin with,
@@ -1332,8 +1243,13 @@ oauth?: {
 - a registered client without an id, a name or a redirect URI, an id given
   twice, or a redirect URI that is not absolute with no fragment and one of
   `https`, `http` on a loopback host, or a private-use scheme in reverse-DNS
-  form (`com.example.app:/cb`); a `cimd` that is neither `false` nor
-  `{ fetch?, allowUrl? }` of functions.
+  form (`com.example.app:/cb`); a client's `deviceFlow` that is not a
+  boolean, or `true` while `oauth.deviceFlow` is off; a `cli` without an id
+  or name, with an id another client has, or with a `redirectPath` that is
+  not a path; a `deviceFlow` whose `verificationUri` is not an absolute
+  `https` URL (or `http` on a loopback host) with no query or fragment, or a
+  lifetime or interval that is not positive; a `cimd` that is neither
+  `false` nor `{ fetch?, allowUrl? }` of functions.
 
 `cfAuth.config.oauth` is the resolved block, or `null` while it is off. Every
 function under `cfAuth.oauth` throws `422 validation_error` while it is off.
@@ -1440,8 +1356,8 @@ is on.
 **Where connection liveness is checked.** One predicate,
 `oauthConnectionLiveSql`, requires the row to be an OAuth connection,
 enabled, unrevoked, bound to this issuer, with an `expires_at` that is set
-and in the future; the membership to be active; and the organization to be
-inside its deadline — judged by the later of the request's clock and the
+and in the future; the membership to be active; and the organization to
+exist — times judged by the later of the request's clock and the
 database's. Unlike the shared `credentialAuthoritySql` it has no session
 branch and accepts no missing expiry. It applies in exactly four places:
 
@@ -1453,7 +1369,7 @@ branch and accepts no missing expiry. It applies in exactly four places:
 - the reuse revocation's guarded write.
 
 Issuance has no connection row to test yet: its guard checks the user's
-active membership and the organization's deadline on their own. A voluntary
+active membership and that the organization exists, on their own. A voluntary
 `revoke`, and the sweep, use row liveness only — `revoke` updates a row
 that is enabled, unrevoked and before `expires_at` by the database clock,
 and the sweep deletes the generations of rows revoked or past `expires_at`
@@ -1465,8 +1381,8 @@ membership or organization still being live.
 name, `client_id`, `resource` the issuer, `grant`, `expires_at`, and a
 `token_hash` digesting a value never revealed, so no API-key lookup can match
 it) and its first generation, as statements for a batch of yours, guarded by
-your `condition`, the user's active membership and the organization's
-deadline. `afterCommit` emits `api_key.created` with `credentialType:
+your `condition`, the user's active membership and that the organization
+exists. `afterCommit` emits `api_key.created` with `credentialType:
 "oauth"`. `createConnection` runs them on their own and throws `409
 connection_refused` if the guard refused.
 
@@ -1477,27 +1393,43 @@ deletes them.
 
 ### Authorization
 
-What your app mounts, all on the issuer's origin, and what answers each:
+What your app mounts, all on the issuer's host, and what answers each. For
+an issuer of `https://example.com/v2`, `<path>` is `/v2`; for a bare origin
+it is empty. The discovery documents put the issuer's path after the
+well-known part (RFC 8414 §3.1, RFC 9728 §3.1), and the endpoints sit under
+the issuer:
 
 | Route | Function |
 | ----- | -------- |
-| `GET /.well-known/oauth-protected-resource` | `protectedResourceMetadata("")` |
-| `GET /.well-known/oauth-protected-resource/mcp` | `protectedResourceMetadata("/mcp")` (one per `resourcePaths` entry) |
-| `GET /.well-known/oauth-authorization-server` | `authorizationServerMetadata()` |
-| `GET /oauth/authorize` | `authorize` |
-| `POST /oauth/token` | `token` |
-| `POST /oauth/revoke` | `revoke` |
-| Your consent page's API | `authorizationDetails`, `approveAuthorization`, `approveGuestAuthorization`, `denyAuthorization` |
+| `GET /.well-known/oauth-protected-resource<path>` | `protectedResourceMetadata("")` |
+| `GET /.well-known/oauth-protected-resource<path>/mcp` | `protectedResourceMetadata("/mcp")` (one per `resourcePaths` entry) |
+| `GET /.well-known/oauth-authorization-server<path>` | `authorizationServerMetadata()` |
+| `GET <path>/oauth/authorize` | `authorize` |
+| `POST <path>/oauth/token` | `token` |
+| `POST <path>/oauth/revoke` | `revoke` |
+| `POST <path>/oauth/device_authorization` | `deviceAuthorization`, while the device flow is on |
+| Your consent page's API | `authorizationDetails`, `approveAuthorization`, `denyAuthorization` |
+| Your code-entry page's API | `lookupDevice`, `deviceDetails`, `approveDevice`, `denyDevice` |
+
+`cfAuth.oauth.routePaths()` answers every one of these paths, so your app
+can mount them without spelling them out:
+
+```ts
+cfAuth.oauth.routePaths(): {
+  authorizationServerMetadata: string;                                 // "/.well-known/oauth-authorization-server/v2"
+  protectedResourceMetadata: { resourcePath: string; path: string }[]; // one per resource, "" first
+  authorize: string; token: string; revoke: string;                    // "/v2/oauth/authorize", ...
+  deviceAuthorization: string | null;                                  // null while the device flow is off
+};
+```
 
 The authorization server document names `<issuer>/oauth/authorize`,
-`/oauth/token` and `/oauth/revoke` (`oauthEndpointPaths`), so mount them
-there. What cf-auth decides: whether a request is valid and for which client,
+`/oauth/token`, `/oauth/revoke` and, while the device flow is on,
+`/oauth/device_authorization` (`oauthEndpointPaths`), so mount them there. What cf-auth decides: whether a request is valid and for which client,
 what a consent may do, when a code is good and what it issues. What your app
 decides: the HTTP layer (statuses, `Cache-Control: no-store` on token and
 revocation responses, CORS, `frame-ancestors 'none'` on the consent page,
-checking the consent API's `Origin`), the consent page itself, and for the
-guest door, the deployment's admission rule, the rate limit and what an
-account is.
+checking the consent API's `Origin`), and the consent page itself.
 
 ```ts
 cfAuth.oauth.protectedResourceMetadata(path?: string): ProtectedResourceMetadata;
@@ -1512,12 +1444,6 @@ cfAuth.oauth.authorizationDetails({ id, proof, viewer: AuthState | null }): Prom
   viewer: { user: AuthUser; memberships: OrganizationMembership[] } | null }>;
 cfAuth.oauth.approveAuthorization({ id, proof, actor: AuthState, organizationId: string, grant: "read" | "manage" }):
   Promise<{ redirect: string }>;
-cfAuth.oauth.approveGuestAuthorization({ id, proof,
-  admit: () => Promise<SQL | null>,
-  rateLimit: () => Promise<void>,
-  provision: (ctx: { operationId: string; guard: SQL; db; tables; now: number }) =>
-    { userId: string; organizationId: string; statements: unknown[] } | Promise<…> }):
-  Promise<{ redirect: string; organizationId: string }>;
 cfAuth.oauth.denyAuthorization({ id, proof }): Promise<{ redirect: string }>;
 ```
 
@@ -1571,61 +1497,19 @@ state is shown as nobody. The name is the client's own claim; the domain is
 what the fetch verified.
 
 **`approveAuthorization`** is the signed-in person's "allow": `actor` must be
-an interactive human session (`403 session_required` otherwise), an active
-member of `organizationId` at any role (`403 not_a_member`), in an
-organization inside its deadline (`403 organization_expired`); `grant` is
-the person's choice, `read` or `manage`, whatever the client asked for. The
-batch that completes the authorization re-reads that session, membership and
-deadline; if any has ended it is refused with `409 conflict` and nothing is
-written.
+an interactive human session (`403 session_required` otherwise) and an
+active member of `organizationId` at any role (`403 not_a_member`); `grant`
+is the person's choice, `read` or `manage`, whatever the client asked for.
+The batch that completes the authorization re-reads that session and
+membership; if either has ended it is refused with `409 conflict` and
+nothing is written.
 
-**`approveGuestAuthorization`** is "continue without an account", in exactly
-this order:
-
-1. the proof, or nothing else runs;
-2. an authorization already completed through the guest door answers its
-   redirect (and its `organizationId`) without calling anything below, so a
-   retry after a lost response is never admitted or counted again; one the
-   person door completed is `409 already_completed`;
-3. `admit()`: throw to refuse; answer `null`, or an SQL condition the
-   completing batch must satisfy (an emptiness rule such as `not exists
-   (select 1 from organization)`, say). A refusal never reaches the rate
-   limit;
-4. `rateLimit()`: throw when exceeded;
-5. `provision(ctx)`: answer the account's `userId` and `organizationId` and
-   the statements that create them — drizzle query builders, each guarded
-   with `ctx.guard`. Derive the ids from `ctx.operationId`, so a retry names
-   the same rows. cf-auth commits them in the batch that completes the
-   authorization:
-   - the batch's **first** write judges the admission condition, with the
-     engine's guard (the authorization still pending and in time), and
-     latches the judgement on the operation row by writing a random claim
-     of this call's own into its `execution_claim`, the column a
-     reservation's execution claims its row with;
-   - `ctx.guard` and every later statement ask for that claim, never the
-     admission again, so provisioning may change what the admission read —
-     the account's own organization makes an emptiness rule false, and
-     that must not undo it;
-   - the completion requires the claim, and `userId` an active member of
-     `organizationId`, which is inside its deadline, and clears the claim.
-     Otherwise the whole batch, the latch included, rolls back (`409
-     conflict`): of two guests bootstrapping an empty deployment, the
-     second one's latch finds the first one's organization and nothing of
-     it lands.
-
-A guest connection is always `manage`, since it is the account's only way
-in: the record keeps `requestedGrant` beside `grant` so the page can say
-so when the client asked for `read`.
-
-**Both approvals are idempotent for whoever approved**: two guest clicks,
-the same person approving twice, or a retry after the code was exchanged all
-answer the same redirect, byte for byte, and one account. Anyone else is
-refused with `409 already_completed` and gets no code: the guest door once a
-person approved, the person door once a guest did, and through the person
-door any other person, or nobody (`403 session_required`). The proof is not
-enough on its own, because whoever opened the authorization holds it too and
-may have sent the consent link to someone else; so of a person and a guest
-racing, the loser is refused. The redirect is `redirect_uri` with `code`,
+**Approving is idempotent for whoever approved**: the same person approving
+twice, or a retry after the code was exchanged, answers the same redirect,
+byte for byte. Anyone else is refused with `409 already_completed` and gets
+no code, and nobody gets `403 session_required`. The proof is not enough on
+its own, because whoever opened the authorization holds it too and may have
+sent the consent link to someone else. The redirect is `redirect_uri` with `code`,
 `state` when one was sent, and `iss`. How it is rebuilt: the code is 32
 random bytes made when the authorization opens; the operation's id is
 `oauth-` and the code's SHA-256 (hex), so the exchange finds it by the
@@ -1744,8 +1628,8 @@ A pending authorization is an operation of the built-in internal kind
 `cf-auth:oauth.authorize`, registered when `oauth.enabled` and refused by
 every entry point of `cfAuth.operations` (see
 [Internal kinds](#internal-kinds)). It is public, approved by the browser
-proof (the doors carry the person's or the guest's authority into the
-completing batch themselves), has no user code, counts toward
+proof (`approveAuthorization` carries the person's authority into the
+completing batch itself), has no user code, counts toward
 `pendingPerOpener` under `rateLimitKey`, is pending for
 `authorizationTtlMs` and is kept for a day from opening — longer only when
 `authorizationTtlMs` is over 12 hours, to twice it, so the record always
@@ -1754,7 +1638,7 @@ challenge, the requested grant, the `state`, the normalised resource and the
 sealed code. Its completion record, kept in the clear, is:
 
 ```ts
-{ door: "person" | "guest"; userId; organizationId; grant; requestedGrant;
+{ userId; organizationId; grant; requestedGrant;
   client: { id, name, domain, source }; redirectUri; codeChallenge; resource;
   codeExpiresAt: number;            // completion + authorizationTtlMs, epoch ms
   exchangedAt: number | null;       // set by the exchange
@@ -1763,6 +1647,107 @@ sealed code. Its completion record, kept in the clear, is:
 
 It needs no migration. The operation sweep deletes it a day after it
 opened, after which its code is unknown.
+
+### Signing in a command-line tool
+
+A command-line tool signs in through the same OAuth server as an MCP client,
+and ends up with the same kind of connection: one person, one organization,
+a grant, and a refresh token that rotates. Declare it once:
+
+```ts
+oauth: {
+  enabled: true,
+  issuer: "https://api.example.com/v2",
+  tokenPrefix: { access: "agw_oat_", refresh: "agw_ort_" },
+  cli: { clientId: "agw-cli", name: "agw" },
+  deviceFlow: { verificationUri: "https://console.example.com/v2/device" },
+}
+```
+
+`cli` registers a public client whose redirect URIs are
+`http://127.0.0.1/callback` and `http://[::1]/callback` (`redirectPath`
+changes the path). A loopback redirect matches on any port (RFC 8252 §7.3),
+so the tool listens on whatever port is free. `localhost` is not on the list,
+since it can resolve elsewhere. `cfAuth.config.oauth.cliClientId` names the
+client, so the console can tell the tool's connections from MCP ones in
+`listApiKeys` by `clientId`. Ending one is `revokeApiKey`, and the tool's own
+`logout` is `revoke`.
+
+**With a browser on the machine**, the tool uses the authorization-code flow
+above: it opens `<issuer>/oauth/authorize` with its `client_id`, a loopback
+`redirect_uri` and a PKCE challenge, the person approves on the consent
+page, and the browser brings the code back to the tool.
+
+**Without one** (over SSH, on a server), it uses the device flow (RFC 8628),
+on while `deviceFlow` is set. Only registered clients with `deviceFlow:
+true` may use it; `cli` gets it whenever the device flow is on.
+
+```ts
+cfAuth.oauth.deviceAuthorization({ body: URLSearchParams, rateLimitKey: string | null }): Promise<
+  | { status: 200; body: { device_code; user_code; verification_uri; verification_uri_complete; expires_in; interval } }
+  | { status: 400 | 401 | 429; body: { error; error_description } }>;
+cfAuth.oauth.lookupDevice({ userCode, rateLimit: () => Promise<void> }): Promise<{ id; expiresAt } | null>;
+cfAuth.oauth.deviceDetails({ id, userCode, viewer }): Promise<{
+  id; state; client; requestedGrant; userCode; expiresAt; viewer }>;
+cfAuth.oauth.approveDevice({ id, userCode, actor, organizationId, grant }): Promise<{ state: "completed"; organizationId }>;
+cfAuth.oauth.denyDevice({ id, userCode, actor? }): Promise<{ state: "denied" }>;
+```
+
+1. The tool posts `client_id`, and optionally `scope` (`read` or `manage`,
+   default `manage`) and `resource`, to `<issuer>/oauth/device_authorization`.
+   It gets a device code, which it keeps, and a user code such as
+   `KMXT-4R9Q`, which it shows beside `verification_uri`.
+   `verification_uri_complete` carries the code as `?user_code=`. An unknown
+   client is `401 invalid_client`; a client not allowed the device flow,
+   `unauthorized_client`; too many waiting from `rateLimitKey`, `429
+   slow_down`. Send every answer with `Cache-Control: no-store`.
+2. The person opens your code-entry page in any browser and signs in. The
+   page calls `lookupDevice` with the code as typed (case and dashes do not
+   matter) and your rate limit, then `deviceDetails` to show the client and
+   the grant it asked for, then `approveDevice` with the account and grant the
+   person picks, or `denyDevice`. The id from `lookupDevice` and the user code
+   travel together after that.
+3. Meanwhile the tool polls `<issuer>/oauth/token` with
+   `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `device_code`
+   and `client_id`, at most once every `interval` seconds (5 by default; a
+   poll up to 1 s early is still accepted). It is answered
+   `authorization_pending` while the person has not answered, `slow_down`
+   when it polls too soon, `access_denied` once they decline, and
+   `expired_token` once the code has lapsed (10 minutes by default,
+   `codeTtlMs`). Once approved, the next poll issues the connection, once:
+   a device code presented again revokes the connection it issued, as a
+   replayed authorization code does.
+
+**Guessing limits.** A user code is eight characters from a 31-letter
+alphabet, valid only while the request is pending, and unique among pending
+requests. It is stored as an HMAC under a subkey of `secret` for lookup, and
+sealed for display, so reading the table does not let anyone try codes
+offline. `lookupDevice` calls your `rateLimit` before it looks anything up
+and refuses to run without one: key it on the browser's address or the
+signed-in person, and throw when exceeded. Approving and denying need the id
+as well as the code, so only `lookupDevice` can be used to guess. The device
+code itself is 32 random bytes; only its SHA-256 is stored.
+
+**Approving** needs an interactive human session and an active membership,
+at any role, in the chosen organization, both re-read in the batch that
+completes it (`409 conflict` if either ended). It is idempotent for the same
+person; anyone else gets `409 already_completed`. Declining needs nobody
+signed in.
+
+A pending device authorization is an operation of the built-in internal kind
+`cf-auth:oauth.device`, registered while the device flow is on. It is public
+(counted toward `pendingPerOpener` under `rateLimitKey`), has a user code, is
+pending for `codeTtlMs` and is kept for a day. Its id is `oauth-device-` and
+the device code's SHA-256 (hex). Its completion record, kept in the clear,
+is:
+
+```ts
+{ userId; organizationId; grant; requestedGrant;
+  client: { id, name, domain: null, source: "registered" }; resource;
+  codeExpiresAt: number;            // approval + codeTtlMs, epoch ms
+  exchangedAt: number | null;       // set by the exchange
+  connectionId: string | null }     // the connection the exchange issued
+```
 
 ### Storage
 
@@ -1797,12 +1782,16 @@ Send every token and revocation response with `Cache-Control: no-store`.
 | `error`                  | Status | When                                                                 |
 | ------------------------ | ------ | -------------------------------------------------------------------- |
 | `invalid_request`        | 400    | A parameter given twice, a required one missing, a body that is not form parameters, a malformed `code_verifier` |
+| `authorization_pending`  | 400    | Device grant: the person has not answered yet; poll again after `interval` |
+| `access_denied`          | 400    | Device grant: the person declined |
+| `expired_token`          | 400    | Device grant: the device code lapsed before approval, or its exchange came too late |
 | `invalid_client`         | 401    | `client_id` is not the client the connection was issued to; nothing changes |
-| `invalid_grant`          | 400    | An unknown refresh token; a dead connection; reuse, which revokes the connection. An unknown, unapproved, expired or swept code; a `client_id`, `redirect_uri` or verifier that is not the authorization's; a code already exchanged, which revokes the connection it issued |
+| `invalid_grant`          | 400    | An unknown refresh token; a dead connection; reuse, which revokes the connection. An unknown, unapproved, expired or swept code; a `client_id`, `redirect_uri` or verifier that is not the authorization's; a code already exchanged, which revokes the connection it issued. An unknown device code, one presented by another client, or one already exchanged, which revokes the connection it issued |
 | `invalid_scope`          | 400    | `scope` is not exactly the connection's grant                        |
 | `invalid_target`         | 400    | `resource` is not the issuer or one of its paths, or not the connection's |
-| `unsupported_grant_type` | 400    | A `grant_type` other than `authorization_code` and `refresh_token`  |
+| `unsupported_grant_type` | 400    | A `grant_type` other than `authorization_code`, `refresh_token` and, while the device flow is on, the device grant |
 | `slow_down`              | 429    | A valid refresh token presented within 5 s of the last rotation; nothing changes and the token stays good. The result carries `retryAfterSeconds` for `Retry-After`. Named after RFC 8628 §3.5 |
+| `slow_down`              | 400    | Device grant: polled sooner than `interval` after the last poll |
 
 The authorization endpoint answers its own errors, never thrown:
 
@@ -1817,13 +1806,14 @@ The authorization endpoint answers its own errors, never thrown:
 | Redirect      | `invalid_scope`             | `scope` is not `read` or `manage` |
 | Redirect      | `access_denied`             | `denyAuthorization` |
 
-The consent functions throw `CfAuthError`s: `invalid_proof` (403),
-`operation_not_found` (404), `session_required` (403), `not_a_member`
-(403), `organization_expired` (403), `operation_denied` (409),
+The consent and code-entry functions throw `CfAuthError`s: `invalid_proof`
+(403, a wrong proof or user code), `operation_not_found` (404),
+`session_required` (403), `not_a_member` (403), `operation_denied` (409),
 `operation_expired` (410), `already_completed` (409, denying a completed
-authorization), `conflict` (409, the completing batch found its authority
-or admission gone and rolled back) and `validation_error` (422). Whatever
-`admit`, `rateLimit` or `provision` throws is passed through.
+authorization, or approving one someone else approved), `conflict` (409,
+the completing batch found its authority gone and rolled back) and
+`validation_error` (422). Whatever `lookupDevice`'s `rateLimit` throws is
+passed through.
 
 ---
 

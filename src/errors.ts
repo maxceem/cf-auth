@@ -49,15 +49,6 @@ export const grantInsufficient = (
   message = "This credential's grant does not allow this action; use a session or a key with the manage grant",
 ) => new CfAuthError("grant_insufficient", message, 403);
 
-/**
- * The organization exists, but its provisional deadline has passed, so nothing
- * may act inside it. Distinct from {@link forbidden}: no role or credential
- * change would help.
- */
-export const organizationExpired = (
-  message = "This organization's deadline has passed",
-) => new CfAuthError("organization_expired", message, 403);
-
 export const validationError = (message: string) =>
   new CfAuthError("validation_error", message, 422);
 

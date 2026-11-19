@@ -1,4 +1,3 @@
-import type { SQL } from "drizzle-orm";
 import type { ResolvedCfAuthConfig } from "./config.js";
 import { generateApiKeyToken, hashApiKeyToken, randomToken, sha256Hex } from "./crypto.js";
 import {
@@ -6,7 +5,6 @@ import {
   conflict,
   forbidden,
   grantInsufficient,
-  organizationExpired,
   unauthorized,
   validationError,
 } from "./errors.js";
@@ -20,7 +18,6 @@ import {
   createEmptyAuthState,
   hasGrantAtLeast,
   isApiKeyActionSource,
-  isOrganizationExpired,
   type ActionSource,
   type ApiKeySummary,
   type AuthState,
@@ -118,10 +115,6 @@ export const emitCfAuthEvent = async (config: ResolvedCfAuthConfig, event: CfAut
  * one matching `currentOrganizationId` when the user is still a member of it,
  * otherwise the first membership (organizations are ordered by creation time,
  * so this is the user's oldest org).
- *
- * An organization past its deadline is never the current one, exactly as it is
- * never one an API key can authenticate into. It stays in `memberships` so a
- * client can still name it and say why it is unavailable.
  */
 export const toSessionAuthState = (
   user: AuthUser,
@@ -129,12 +122,9 @@ export const toSessionAuthState = (
   currentOrganizationId: string | null,
   sessionId: string | null = null,
 ): AuthState => {
-  const usable = memberships.filter(
-    (membership) => !isOrganizationExpired(membership.organization),
-  );
   const current =
-    usable.find((membership) => membership.organization.id === currentOrganizationId) ??
-    usable[0] ??
+    memberships.find((membership) => membership.organization.id === currentOrganizationId) ??
+    memberships[0] ??
     null;
 
   if (user.kind !== "human") return createEmptyAuthState();
@@ -241,26 +231,10 @@ export interface IssueIdentityApiKeyInput {
   grant?: CredentialGrant;
 }
 
-export interface ClaimOrganizationInput {
-  /** An interactive human session. The person taking the organization over. */
-  actor: AuthState;
-  organizationId: string;
-  /**
-   * The machine identity that provisioned the organization, and the credential
-   * it asked for the claim with. The claim only counts while that credential is
-   * still live, and `revokeAccess` says whether it survives the claim.
-   */
-  provisioning?: {
-    userId: string;
-    credentialId: string;
-    revokeAccess: boolean;
-  };
-}
-
 export interface CfAuthService {
   getIdentity(userId: string): Promise<AuthUser | null>;
   createServiceIdentity(input: { name: string; id?: string }): Promise<AuthUser>;
-  /** Trusted bootstrap/claim boundary only; never expose as an unrestricted management route. */
+  /** Trusted bootstrap boundary only; never expose as an unrestricted management route. */
   issueServiceApiKey(input: IssueIdentityApiKeyInput): Promise<CreatedApiKey>;
   /**
    * Activates a service key issued with `enabled: false`, once the exchange
@@ -311,22 +285,6 @@ export interface CfAuthService {
   createOrganization(userId: string, name: string): Promise<OrganizationMembership>;
   /** Switches the active organization, verifying membership first. Session-only. */
   selectOrganization(actor: AuthState, organizationId: string): Promise<AuthState>;
-  /**
-   * Hands an organization no person owns yet to the actor, clearing its
-   * provisional deadline in the same transaction. Idempotent.
-   */
-  claimOrganization(input: ClaimOrganizationInput): Promise<OrganizationMembership>;
-  /**
-   * The same claim as guarded drizzle statements, for a batch of your own —
-   * an operation's approval, whose `guard` goes in `condition` so the
-   * ownership change lands in the batch that completes the operation or not
-   * at all. `afterCommit` emits `organization.claimed` if the claim landed.
-   * Shaped to spread into an operation kind's `approve` result.
-   */
-  claimOrganizationStatements(input: ClaimOrganizationInput & { condition?: SQL }): {
-    statements: unknown[];
-    afterCommit: () => Promise<void>;
-  };
   listOrganizationMembers(input: {
     actor: AuthState;
     organizationId: string;
@@ -505,17 +463,6 @@ export const createAuthService = (
   const requireOwnOrganization = (state: AuthState, organizationId: string) => {
     if (state.credentialType !== "session" && state.organization?.id !== organizationId)
       throw forbidden("This API key is restricted to another organization");
-  };
-  /**
-   * The refusals a claim owes a credential before asking whether it is a
-   * session, in {@link requireActor}'s order: a credential naming another
-   * organization is told so first, then a narrow one about its grant — which
-   * it can do something about — before being told it is not a session.
-   */
-  const refuseClaimCredential = (state: AuthState, organizationId: string) => {
-    if (!state.authenticated) return;
-    requireOwnOrganization(state, organizationId);
-    if (!hasGrantAtLeast(state.grant, "manage")) throw grantInsufficient();
   };
   const requireInteractive = (state: AuthState): string => {
     if (
@@ -853,10 +800,6 @@ export const createAuthService = (
         throw forbidden("You are not a member of this organization");
       }
 
-      if (isOrganizationExpired(membership.organization)) {
-        throw organizationExpired();
-      }
-
       const memberships = await repository.listOrganizationsForUser(user.id);
       return toSessionAuthState(
         user,
@@ -864,63 +807,6 @@ export const createAuthService = (
         membership.organization.id,
         actor.actor?.credentialId ?? null,
       );
-    },
-
-    claimOrganizationStatements(input) {
-      refuseClaimCredential(input.actor, input.organizationId);
-      const { userId, sessionId } = requireInteractiveSession(input.actor);
-      const statements = repository.claimOrganizationStatements({
-        organizationId: input.organizationId,
-        userId,
-        sessionId,
-        ...(input.provisioning ? { provisioning: input.provisioning } : {}),
-        ...(input.condition ? { condition: input.condition } : {}),
-      });
-      return {
-        statements,
-        afterCommit: async () => {
-          const membership = await repository.findMembership(userId, input.organizationId);
-          if (membership?.role === "owner" && membership.organization.expiresAt === null) {
-            await emit({ type: "organization.claimed", userId, organizationId: input.organizationId });
-          }
-        },
-      };
-    },
-
-    async claimOrganization(input) {
-      refuseClaimCredential(input.actor, input.organizationId);
-      const userId = requireInteractive(input.actor);
-      const sessionId = input.actor.actor?.credentialId;
-
-      if (!sessionId) {
-        throw new CfAuthError(
-          "session_required",
-          "An interactive human session is required",
-          403,
-        );
-      }
-
-      const membership = await repository.claimOrganization({
-        organizationId: input.organizationId,
-        userId,
-        sessionId,
-        ...(input.provisioning ? { provisioning: input.provisioning } : {}),
-      });
-
-      if (!membership) {
-        throw conflict(
-          "This organization can no longer be claimed",
-          "not_claimable",
-        );
-      }
-
-      await emit({
-        type: "organization.claimed",
-        userId,
-        organizationId: input.organizationId,
-      });
-
-      return membership;
     },
 
     async listOrganizationMembers(input) {
@@ -1108,7 +994,6 @@ export const createAuthService = (
     async createInvitation(input) {
       const actorUserId = requireActor(input.actor, input.organizationId, "manage");
       const actorMembership = await requireManager(actorUserId, input.organizationId);
-      if (isOrganizationExpired(actorMembership.organization)) throw organizationExpired();
       if (input.role === "owner") {
         requireInteractive(input.actor);
         requireOwnerToActOnOwner(actorMembership.role, "invite an owner");
@@ -1155,7 +1040,6 @@ export const createAuthService = (
     async resendInvitation(input) {
       const actorUserId = requireActor(input.actor, input.organizationId, "manage");
       const actorMembership = await requireManager(actorUserId, input.organizationId);
-      if (isOrganizationExpired(actorMembership.organization)) throw organizationExpired();
       const now = new Date();
       const existing = await repository.findInvitation(input.invitationId, input.organizationId, now);
       if (!existing) throw invitationNotFound();
@@ -1241,7 +1125,6 @@ export const createAuthService = (
       }
       const organization = await repository.findOrganization(preview.organization.id);
       if (!organization) throw invitationNotFound();
-      if (isOrganizationExpired(organization)) throw organizationExpired();
 
       const accepted = await repository.acceptInvitation({
         invitationId: preview.id,
@@ -1317,13 +1200,7 @@ export const createAuthService = (
       if (!stored) return createEmptyAuthState();
       const user = await repository.findUserById(stored.userId);
       const membership = await repository.findMembership(stored.userId, stored.organizationId);
-      if (
-        !user ||
-        !membership ||
-        (membership.organization.expiresAt &&
-          new Date(membership.organization.expiresAt).getTime() <= Date.now())
-      )
-        return createEmptyAuthState();
+      if (!user || !membership) return createEmptyAuthState();
       return toApiKeyAuthState(user, membership, stored.id, source, stored.grant);
     },
 

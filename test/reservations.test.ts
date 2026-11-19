@@ -16,6 +16,7 @@ import {
   type OperationKind,
 } from "../src/operations.js";
 import { createEmptyAuthState, type AuthState } from "../src/types.js";
+import { loginKind } from "./fixtures/login-kind.js";
 import { createTestAuth, holdReveal, type TestAuth, type TestOverrides } from "./helpers.js";
 
 const expectCode = async (promise: Promise<unknown>, code: string) => {
@@ -71,7 +72,7 @@ const approveWrites = defineOperationKind({
   approverMinRole: null,
   approve: ({ guard }) => ({ outcome: { ok: true }, statements: approveStatements(guard) }),
 });
-const kinds: OperationKind[] = [createApp, report, bootstrap, change, keyIssue, brief, approveWrites];
+const kinds: OperationKind[] = [loginKind, createApp, report, bootstrap, change, keyIssue, brief, approveWrites];
 
 /** Built-in kinds only cf-auth's own flows drive. */
 const internalTask = defineOperationKind({
@@ -752,17 +753,6 @@ describe("reveal", () => {
         expect(await operations.reveal({ id: reserved.id, actor: ownerActor })).toMatchObject({ outcome: { key: "secret-for-app_1" } });
       });
 
-      it("refuses once the organization's deadline passed meanwhile", async () => {
-        const { harness, reserved, revealing } = await raced(at, async ({ harness, owner }) => {
-          await harness.client.execute({
-            sql: "UPDATE organization SET expires_at = ? WHERE id = ?",
-            args: [new Date(Date.now() - 1_000).toISOString(), owner.organizationId],
-          });
-        });
-        await expectCode(revealing, "organization_expired");
-        expect((await row(harness, reserved.id)).sealed_outcome).not.toBeNull();
-      });
-
       it("leaves alone an outcome amend sealed meanwhile", async () => {
         const { harness, operations, ownerActor, reserved, revealing } = await raced(at, async ({ operations, reserved }) => {
           expect(await operations.amend({ id: reserved.id, outcome: { key: "renewed" }, seal: true })).toBe(true);
@@ -830,10 +820,6 @@ describe("delivery", () => {
       expect(found).toMatchObject({ collect: null });
       expect(found).not.toHaveProperty("outcome");
     }
-    await expectCode(
-      operations.redeem({ id: reserved.id, token: reserved.handle, redeemCode: createOperationToken() }),
-      "already_completed",
-    );
     expect((await row(harness, reserved.id)).sealed_outcome).not.toBeNull();
     expect(await operations.reveal({ id: reserved.id, actor: ownerActor })).toMatchObject({
       outcome: { key: "secret-for-app_1" },
@@ -983,10 +969,6 @@ describe("internal kinds", () => {
     await expectCode(operations.details({ id: page.id, userCode: page.userCode! }), "operation_not_found");
     await expectCode(operations.approve({ id: page.id, proof: page.browserProof! }), "operation_not_found");
     await expectCode(operations.deny({ id: page.id, proof: page.browserProof! }), "operation_not_found");
-    await expectCode(
-      operations.redeem({ id: page.id, token: pageToken, redeemCode: createOperationToken() }),
-      "operation_not_found",
-    );
     await expectCode(operations.complete({ id: reserved.id, outcome: {} }), "operation_not_found");
     await expectCode(operations.amend({ id: reserved.id, record: {} }), "operation_not_found");
     await expectCode(operations.guard({ id: reserved.id }), "operation_not_found");

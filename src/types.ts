@@ -99,9 +99,6 @@ export interface AuthSession {
 }
 
 export interface OrganizationSummary {
-  /** True when the organization has a human owner membership. */
-  claimed: boolean;
-  expiresAt: string | null;
   id: string;
   name: string;
   createdAt: string;
@@ -259,7 +256,6 @@ export type CfAuthEvent =
       role: OrganizationRole;
       name: string;
     }
-  | { type: "organization.claimed"; userId: string; organizationId: string }
   | { type: "organization.renamed"; actorUserId: string; organizationId: string; name: string }
   | { type: "user.email_verified"; userId: string; email: string }
   | {
@@ -339,22 +335,6 @@ const roleRank: Record<OrganizationRole, number> = {
   owner: 3,
   admin: 2,
   member: 1,
-};
-
-/**
- * True once an organization's provisional deadline has passed.
- *
- * `expiresAt` marks a tenant that exists only provisionally — a trial, or an
- * account a person has not claimed yet. Past it, the organization is not
- * somewhere anyone can act, whichever credential they hold, so both the API-key
- * and the session paths refuse to resolve it as the current organization.
- */
-export const isOrganizationExpired = (
-  organization: Pick<OrganizationSummary, "expiresAt"> | null | undefined,
-  now: number = Date.now(),
-): boolean => {
-  const expiresAt = organization?.expiresAt;
-  return expiresAt !== null && expiresAt !== undefined && Date.parse(expiresAt) <= now;
 };
 
 /** True when the role may administer the organization (owner or admin). */

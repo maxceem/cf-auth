@@ -1,31 +1,25 @@
 /**
- * The built-in `login` operation: a CLI that holds nothing asks for access, a
- * person approves it in a browser, and the CLI receives an API key of its own
- * in the organization the person chose.
- *
- * The key belongs to the approving person, carries `source: "cli"`, the
- * client's label and the grant the client asked for (`manage` unless its
- * payload says `{ grant: "read" }`), and is created by the same batch that
- * completes the operation, under a guard that re-reads the approver's session
- * and membership — so a key exists exactly when an approval landed.
+ * A test kind shaped like the `login` operation cf-auth shipped before 1.0: a
+ * CLI that holds nothing asks for access, a person approves it in a browser,
+ * and the CLI receives an API key of its own. The engine's generic behaviour
+ * (user codes, sealed outcomes, pending caps, idempotent opens, grants) is
+ * tested through it.
  */
 
 import { sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/sqlite-core";
-import { sqliteNowMs } from "./authority.js";
-import type { LoginOperationConfig, ResolvedCfAuthConfig } from "./config.js";
-import { generateApiKeyToken } from "./crypto.js";
-import { grantInsufficient, validationError } from "./errors.js";
-import { guardedInsert } from "./guarded-insert.js";
-import type { OperationKind } from "./operations.js";
-import { emitCfAuthEvent } from "./service.js";
+import { sqliteNowMs } from "../../src/authority.js";
+import { generateApiKeyToken } from "../../src/crypto.js";
+import { grantInsufficient, validationError } from "../../src/errors.js";
+import { guardedInsert } from "../../src/guarded-insert.js";
+import type { OperationKind } from "../../src/operations.js";
 import {
   hasGrantAtLeast,
   hasRoleAtLeast,
   isCredentialGrant,
-  isOrganizationExpired,
   type CredentialGrant,
-} from "./types.js";
+  type OrganizationRole,
+} from "../../src/types.js";
 
 /** What a completed `login` hands the CLI, once. Never log `credential.token`. */
 export interface LoginOperationOutcome {
@@ -86,9 +80,8 @@ const requestedGrant = (payload: unknown): CredentialGrant => {
   return grant === undefined ? "manage" : isCredentialGrant(grant) ? grant : "read";
 };
 
-export const createLoginOperationKind = (
-  config: ResolvedCfAuthConfig,
-  login: Required<LoginOperationConfig>,
+export const createLoginKind = (
+  login: { minRole?: OrganizationRole; pendingTtlMs?: number; recordTtlMs?: number } = {},
 ): OperationKind => ({
   name: loginOperationKindName,
   payload: parseLoginPayload,
@@ -97,9 +90,9 @@ export const createLoginOperationKind = (
   browser: true,
   userCode: true,
   requireClientLabel: true,
-  approverMinRole: login.minRole,
-  pendingTtlMs: login.pendingTtlMs,
-  recordTtlMs: login.recordTtlMs,
+  approverMinRole: login.minRole ?? "admin",
+  pendingTtlMs: login.pendingTtlMs ?? 15 * 60_000,
+  recordTtlMs: login.recordTtlMs ?? 90 * 86_400_000,
 
   // The key is handed over only while it could still be used: one revoked
   // between approval and collection is withdrawn, not delivered.
@@ -126,15 +119,13 @@ export const createLoginOperationKind = (
       return "session_required";
     const eligible = viewer.memberships.some(
       (membership) =>
-        hasRoleAtLeast(membership.role, login.minRole) &&
-        !isOrganizationExpired(membership.organization),
+        hasRoleAtLeast(membership.role, login.minRole ?? "admin"),
     );
     return eligible ? null : "no_eligible_organization";
   },
 
   approve: async ({ operation, payload, actor, user, organizationId, guard, db, tables, now }) => {
-    // `login` is approved by a person (the default approver mode) and names an
-    // approver role, so the engine always hands it both.
+    // Approved by a person with an approver role, so the engine hands both.
     const approver = user!;
     const organization = organizationId!;
     const label = operation.client.label!;
@@ -142,7 +133,7 @@ export const createLoginOperationKind = (
     // The approver hands on no more than they hold. A session holds `manage`,
     // so this never refuses today; it keeps the issuance rule in one shape.
     if (!hasGrantAtLeast(actor?.grant, grant)) throw grantInsufficient();
-    const token = await generateApiKeyToken(config.apiKeys.tokenPrefix);
+    const token = await generateApiKeyToken("key_");
     const apiKeyId = crypto.randomUUID();
     const outcome: LoginOperationOutcome = {
       credential: { token: token.plaintext },
@@ -179,14 +170,9 @@ export const createLoginOperationKind = (
           guard,
         ),
       ],
-      afterCommit: () =>
-        emitCfAuthEvent(config, {
-          type: "api_key.created",
-          actorUserId: approver.id,
-          organizationId: organization,
-          apiKeyId,
-          name: label,
-        }),
     };
   },
 });
+
+/** The kind as the tests register it by default. */
+export const loginKind = createLoginKind();
